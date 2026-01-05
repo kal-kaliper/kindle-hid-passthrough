@@ -4,7 +4,7 @@
 
 FROM arm32v7/python:3.10-slim-bullseye
 
-# Install build dependencies with retry for flaky network under QEMU
+# Install build dependencies with retry for flaky network
 RUN for i in 1 2 3; do \
         apt-get update && \
         apt-get install -y --no-install-recommends \
@@ -27,9 +27,16 @@ RUN pip install --no-cache-dir \
 ENV CCACHE_DIR=/ccache
 ENV PATH="/usr/lib/ccache:${PATH}"
 
-# ARM-specific fix: -mword-relocations fixes "conditional branch out of range" error
-# that occurs with large generated code (like bumble.hci module)
-ENV CFLAGS="-mword-relocations"
+# ARM-specific fixes for "conditional branch out of range" error
+# that occurs with large generated code (like bumble.hci module):
+# - -mword-relocations: enables word-sized relocations for ARM
+# - -ffunction-sections -fdata-sections: split code/data into smaller sections
+# - -O2: reduced optimization (O3 creates functions too large for ARM branches)
+# CCFLAGS overrides Nuitka's default -O3 optimization level
+# The linker will use --gc-sections to remove unused sections
+ENV CFLAGS="-mword-relocations -ffunction-sections -fdata-sections"
+ENV CCFLAGS="-O2"
+ENV LDFLAGS="-Wl,--gc-sections"
 
 # Set working directory
 WORKDIR /build
@@ -40,9 +47,9 @@ COPY kindle_hid_passthrough/config.ini /build/kindle_hid_passthrough/
 
 # Build with Nuitka
 # --mode=onefile creates a single executable
-# --lto=no disables link-time optimization (faster for QEMU emulation)
+# --lto=no disables link-time optimization (faster build, avoids issues)
 # --low-memory reduces memory usage during compilation
-# -mword-relocations passed via CFLAGS fixes ARM branch range issues
+# CFLAGS/CCFLAGS/LDFLAGS env vars handle ARM branch range issues
 RUN python3 -m nuitka \
     --mode=onefile \
     --jobs=$(nproc) \
