@@ -49,7 +49,7 @@ RUN cd /tmp && \
     wget --no-check-certificate https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz && \
     tar xzf openssl-${OPENSSL_VERSION}.tar.gz && \
     cd openssl-${OPENSSL_VERSION} && \
-    ./config --prefix=/usr/local/ssl --openssldir=/usr/local/ssl shared zlib no-ec_nistp_64_gcc_128 && \
+    ./Configure linux-generic32 --prefix=/usr/local/ssl --openssldir=/usr/local/ssl shared zlib && \
     make -j$(nproc) && \
     make install && \
     echo "/usr/local/ssl/lib" > /etc/ld.so.conf.d/openssl.conf && \
