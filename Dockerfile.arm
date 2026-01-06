@@ -4,16 +4,14 @@
 
 FROM arm32v7/python:3.10-slim-bullseye
 
-# Install build dependencies with retry for flaky network under QEMU
-RUN for i in 1 2 3; do \
-        apt-get update && \
-        apt-get install -y --no-install-recommends \
-            build-essential \
-            patchelf \
-            ccache \
-            libffi-dev \
-        && break || sleep 5; \
-    done && rm -rf /var/lib/apt/lists/*
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        patchelf \
+        ccache \
+        libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install Python build tools and dependencies
 RUN pip install --no-cache-dir \
@@ -27,8 +25,7 @@ RUN pip install --no-cache-dir \
 ENV CCACHE_DIR=/ccache
 ENV PATH="/usr/lib/ccache:${PATH}"
 
-# ARM-specific fix: -mword-relocations fixes "conditional branch out of range" error
-# that occurs with large generated code (like bumble.hci module)
+# ARM-specific compiler flags for large code generation
 ENV CFLAGS="-mword-relocations"
 
 # Set working directory
@@ -40,9 +37,10 @@ COPY kindle_hid_passthrough/config.ini /build/kindle_hid_passthrough/
 
 # Build with Nuitka
 # --mode=onefile creates a single executable
-# --lto=no disables link-time optimization (faster for QEMU emulation)
+# --lto=no disables link-time optimization (faster builds)
 # --low-memory reduces memory usage during compilation
-# -mword-relocations passed via CFLAGS fixes ARM branch range issues
+# --include-package=bumble + --nofollow-import-to=bumble: include bumble as bytecode
+#   (not compiled to C) to avoid ARM branch range errors from large generated code
 RUN python3 -m nuitka \
     --mode=onefile \
     --jobs=$(nproc) \
@@ -51,6 +49,8 @@ RUN python3 -m nuitka \
     --show-progress \
     --output-filename=kindle-hid-passthrough \
     --include-package=kindle_hid_passthrough \
+    --include-package=bumble \
+    --nofollow-import-to=bumble \
     --include-data-file=kindle_hid_passthrough/config.ini=kindle_hid_passthrough/config.ini \
     --nofollow-import-to=pytest \
     --nofollow-import-to=unittest \
