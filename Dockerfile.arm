@@ -1,8 +1,8 @@
 # Dockerfile for building Kindle HID Passthrough ARM binary
-# Uses Python 3.10 to match Kindle runtime
+# Uses Debian Stretch (glibc 2.24) - closest available to Kindle's glibc 2.20
 # Target: ARMv7 hard-float (armhf)
 
-FROM arm32v7/python:3.10-slim-bullseye
+FROM arm32v7/python:3.9-slim-stretch
 
 # Install build dependencies
 RUN apt-get update && \
