@@ -1,9 +1,9 @@
 # Dockerfile for building Kindle HID Passthrough ARM binary
-# Uses Debian Buster (glibc 2.28) with Python 3.7
+# Uses Debian Buster (glibc 2.28) with Python 3.8
 # Note: Kindle has glibc 2.20 - this may have compatibility issues
 # Target: ARMv7 hard-float (armhf)
 
-FROM arm32v7/python:3.7-slim-buster
+FROM arm32v7/python:3.8-slim-buster
 
 # Fix archived Buster repositories
 RUN sed -i 's|deb.debian.org/debian|archive.debian.org/debian|g' /etc/apt/sources.list && \
@@ -20,12 +20,11 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python build tools and dependencies
-# Note: Using older bumble version compatible with Python 3.7
 RUN pip install --no-cache-dir \
-    nuitka==2.4.8 \
+    nuitka \
     ordered-set \
     zstandard \
-    "bumble>=0.0.193,<0.1" \
+    bumble>=0.0.193 \
     aiofiles>=23.0.0
 
 # Enable ccache for faster C compilation
