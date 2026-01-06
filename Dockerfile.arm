@@ -35,8 +35,12 @@ RUN apt-get update && \
 # Build patchelf 0.12 from source (compatible with older GCC, not in Jessie repos)
 RUN cd /tmp && \
     curl -kL -o patchelf-0.12.tar.bz2 https://github.com/NixOS/patchelf/releases/download/0.12/patchelf-0.12.tar.bz2 && \
-    bunzip2 patchelf-0.12.tar.bz2 && \
-    tar xf patchelf-0.12.tar && \
+    echo "=== Downloaded file ===" && ls -lh patchelf-0.12.tar.bz2 && \
+    echo "=== Decompressing ===" && bunzip2 -v patchelf-0.12.tar.bz2 && \
+    echo "=== After bunzip2 ===" && ls -lh && \
+    echo "=== Listing tar contents ===" && tar tf patchelf-0.12.tar | head -20 && \
+    echo "=== Extracting ===" && tar xvf patchelf-0.12.tar && \
+    echo "=== After extraction ===" && ls -lh && \
     cd patchelf-0.12 && \
     ./configure --prefix=/usr/local && \
     make -j$(nproc) && \
