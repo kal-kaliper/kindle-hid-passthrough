@@ -1,23 +1,19 @@
 # Dockerfile for building Kindle HID Passthrough ARM binary
-# Uses Debian Buster (glibc 2.28) with Python 3.8
-# Note: Kindle has glibc 2.20 - this may have compatibility issues
+# Uses manylinux2014 (glibc 2.17) for Kindle compatibility (glibc 2.20)
 # Target: ARMv7 hard-float (armhf)
 
-FROM arm32v7/python:3.8-slim-buster
+FROM quay.io/pypa/manylinux2014_armv7l
 
-# Fix archived Buster repositories
-RUN sed -i 's|deb.debian.org/debian|archive.debian.org/debian|g' /etc/apt/sources.list && \
-    sed -i 's|security.debian.org|archive.debian.org|g' /etc/apt/sources.list && \
-    sed -i '/buster-updates/d' /etc/apt/sources.list
-
-# Install build dependencies
+# Install build dependencies (manylinux armv7l uses Debian)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        build-essential \
         patchelf \
         ccache \
         libffi-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Use Python 3.10 from manylinux
+ENV PATH="/opt/python/cp310-cp310/bin:${PATH}"
 
 # Install Python build tools and dependencies
 RUN pip install --no-cache-dir \
