@@ -36,11 +36,11 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 # Build patchelf from source (not available in Jessie)
-# Use version 0.14.5 which doesn't require C++17
+# Use version 0.12 which works with C++11 (GCC 4.9 compatible)
 RUN cd /tmp && \
     git clone https://github.com/NixOS/patchelf.git && \
     cd patchelf && \
-    git checkout 0.14.5 && \
+    git checkout 0.12 && \
     ./bootstrap.sh && \
     ./configure && \
     make && \
