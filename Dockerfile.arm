@@ -27,10 +27,23 @@ RUN apt-get update && \
         liblzma-dev \
         libffi-dev \
         uuid-dev \
-        patchelf \
         ccache \
         perl \
+        git \
+        autoconf \
+        automake \
+        libtool \
     && rm -rf /var/lib/apt/lists/*
+
+# Build patchelf from source (not available in Jessie)
+RUN cd /tmp && \
+    git clone https://github.com/NixOS/patchelf.git && \
+    cd patchelf && \
+    ./bootstrap.sh && \
+    ./configure && \
+    make && \
+    make install && \
+    cd / && rm -rf /tmp/patchelf
 
 # Build OpenSSL 1.1.1 from source (required for Python 3.10)
 ENV OPENSSL_VERSION=1.1.1w
