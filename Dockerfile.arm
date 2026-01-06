@@ -1,53 +1,20 @@
 # Dockerfile for building Kindle HID Passthrough ARM binary
-# Uses CentOS 7 (glibc 2.17) for compatibility with Kindle (glibc 2.20)
+# Uses PyInstaller which may handle glibc dependencies better than Nuitka
 # Target: ARMv7 hard-float (armhf)
 
-FROM arm32v7/centos:7
+FROM arm32v7/python:3.10-slim-bullseye
 
-# Update to use vault repos since CentOS 7 is EOL
-RUN sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-* && \
-    sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*
-
-# Install development tools and dependencies (including SSL)
-RUN yum install -y \
-        gcc \
-        make \
-        wget \
-        openssl-devel \
-        bz2-devel \
-        libffi-devel \
-        zlib-devel \
-        sqlite-devel \
-        readline-devel \
-        xz-devel \
-    && yum clean all
-
-# Build Python 3.10 from source with SSL support
-RUN cd /tmp && \
-    wget https://www.python.org/ftp/python/3.10.13/Python-3.10.13.tgz && \
-    tar xzf Python-3.10.13.tgz && \
-    cd Python-3.10.13 && \
-    ./configure \
-        --enable-shared \
-        --prefix=/usr/local \
-        --with-openssl=/usr \
-        --enable-optimizations && \
-    make -j$(nproc) && \
-    make altinstall && \
-    cd / && \
-    rm -rf /tmp/Python-3.10.13*
-
-# Configure linker to find libpython
-RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/python3.10.conf && ldconfig
-
-# Install pip
-RUN wget https://bootstrap.pypa.io/get-pip.py && \
-    /usr/local/bin/python3.10 get-pip.py && \
-    rm get-pip.py
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        binutils \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
-RUN /usr/local/bin/python3.10 -m pip install --no-cache-dir \
+RUN pip install --no-cache-dir \
     pyinstaller \
+    staticx \
     bumble>=0.0.193 \
     aiofiles>=23.0.0
 
@@ -61,9 +28,9 @@ COPY kindle_hid_passthrough/config.ini /build/kindle_hid_passthrough/
 # Build with PyInstaller
 # --onefile creates a single executable
 # --hidden-import ensures bumble modules are included
-RUN /usr/local/bin/python3.10 -m PyInstaller \
+RUN python3 -m PyInstaller \
     --onefile \
-    --name kindle-hid-passthrough \
+    --name kindle-hid-passthrough-base \
     --add-data "kindle_hid_passthrough/config.ini:kindle_hid_passthrough" \
     --hidden-import bumble \
     --hidden-import bumble.hci \
@@ -71,5 +38,8 @@ RUN /usr/local/bin/python3.10 -m PyInstaller \
     --hidden-import bumble.transport \
     --hidden-import aiofiles \
     kindle_hid_passthrough/main.py
+
+# Wrap with staticx for static linking (may help with glibc compatibility)
+RUN staticx dist/kindle-hid-passthrough-base dist/kindle-hid-passthrough
 
 # Output will be at /build/dist/kindle-hid-passthrough
