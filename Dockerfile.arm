@@ -1,32 +1,55 @@
 # Dockerfile for building Kindle HID Passthrough ARM binary
-# Uses Python 3.10 on Bullseye with standalone mode for better compatibility
+# Uses CentOS 7 (glibc 2.17) for compatibility with Kindle (glibc 2.20)
 # Target: ARMv7 hard-float (armhf)
 
-FROM arm32v7/python:3.10-slim-bullseye
+FROM arm32v7/centos:7
 
-# Install build dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        build-essential \
-        patchelf \
-        ccache \
-        libffi-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Update to use vault repos since CentOS 7 is EOL
+RUN sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-* && \
+    sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*
 
-# Install Python build tools and dependencies
-RUN pip install --no-cache-dir \
-    nuitka \
-    ordered-set \
-    zstandard \
+# Install development tools and dependencies (including SSL)
+RUN yum install -y \
+        gcc \
+        make \
+        wget \
+        openssl-devel \
+        bz2-devel \
+        libffi-devel \
+        zlib-devel \
+        sqlite-devel \
+        readline-devel \
+        xz-devel \
+    && yum clean all
+
+# Build Python 3.10 from source with SSL support
+RUN cd /tmp && \
+    wget https://www.python.org/ftp/python/3.10.13/Python-3.10.13.tgz && \
+    tar xzf Python-3.10.13.tgz && \
+    cd Python-3.10.13 && \
+    ./configure \
+        --enable-shared \
+        --prefix=/usr/local \
+        --with-openssl=/usr \
+        --enable-optimizations && \
+    make -j$(nproc) && \
+    make altinstall && \
+    cd / && \
+    rm -rf /tmp/Python-3.10.13*
+
+# Configure linker to find libpython
+RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/python3.10.conf && ldconfig
+
+# Install pip
+RUN wget https://bootstrap.pypa.io/get-pip.py && \
+    /usr/local/bin/python3.10 get-pip.py && \
+    rm get-pip.py
+
+# Install Python dependencies
+RUN /usr/local/bin/python3.10 -m pip install --no-cache-dir \
+    pyinstaller \
     bumble>=0.0.193 \
     aiofiles>=23.0.0
-
-# Enable ccache for faster C compilation
-ENV CCACHE_DIR=/ccache
-ENV PATH="/usr/lib/ccache:${PATH}"
-
-# ARM-specific compiler flags for large code generation
-ENV CFLAGS="-mword-relocations"
 
 # Set working directory
 WORKDIR /build
@@ -35,26 +58,18 @@ WORKDIR /build
 COPY kindle_hid_passthrough/*.py /build/kindle_hid_passthrough/
 COPY kindle_hid_passthrough/config.ini /build/kindle_hid_passthrough/
 
-# Build with Nuitka
-# --mode=onefile creates a single executable
-# --lto=no disables link-time optimization (faster builds)
-# --low-memory reduces memory usage during compilation
-# --include-package=bumble + --nofollow-import-to=bumble: include bumble as bytecode
-#   (not compiled to C) to avoid ARM branch range errors from large generated code
-RUN python3 -m nuitka \
-    --mode=onefile \
-    --jobs=$(nproc) \
-    --lto=no \
-    --low-memory \
-    --show-progress \
-    --output-filename=kindle-hid-passthrough \
-    --include-package=kindle_hid_passthrough \
-    --include-package=bumble \
-    --nofollow-import-to=bumble \
-    --include-data-file=kindle_hid_passthrough/config.ini=kindle_hid_passthrough/config.ini \
-    --nofollow-import-to=pytest \
-    --nofollow-import-to=unittest \
-    --nofollow-import-to=setuptools \
+# Build with PyInstaller
+# --onefile creates a single executable
+# --hidden-import ensures bumble modules are included
+RUN /usr/local/bin/python3.10 -m PyInstaller \
+    --onefile \
+    --name kindle-hid-passthrough \
+    --add-data "kindle_hid_passthrough/config.ini:kindle_hid_passthrough" \
+    --hidden-import bumble \
+    --hidden-import bumble.hci \
+    --hidden-import bumble.host \
+    --hidden-import bumble.transport \
+    --hidden-import aiofiles \
     kindle_hid_passthrough/main.py
 
-# Output will be at /build/kindle-hid-passthrough
+# Output will be at /build/dist/kindle-hid-passthrough
