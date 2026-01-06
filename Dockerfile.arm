@@ -9,6 +9,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
         binutils \
+        zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
