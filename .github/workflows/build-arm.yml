@@ -24,7 +24,9 @@ jobs:
       - name: Build ARMv7 binary with Docker
         run: |
           # Build using arm32v7 container - runs natively on ARM64
+          # --platform ensures correct 32-bit ARM image is pulled
           docker build \
+            --platform linux/arm/v7 \
             -f Dockerfile.arm \
             -t kindle-hid-passthrough-builder \
             .

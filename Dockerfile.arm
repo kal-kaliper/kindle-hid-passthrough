@@ -31,11 +31,11 @@ ENV PATH="/usr/lib/ccache:${PATH}"
 # that occurs with large generated code (like bumble.hci module):
 # - -mword-relocations: enables word-sized relocations for ARM
 # - -ffunction-sections -fdata-sections: split code/data into smaller sections
-# - -O2: reduced optimization (O3 creates functions too large for ARM branches)
+# - -O1: minimal optimization (O2/O3 create functions too large for ARM branches)
 # CCFLAGS overrides Nuitka's default -O3 optimization level
 # The linker will use --gc-sections to remove unused sections
 ENV CFLAGS="-mword-relocations -ffunction-sections -fdata-sections"
-ENV CCFLAGS="-O2"
+ENV CCFLAGS="-O1"
 ENV LDFLAGS="-Wl,--gc-sections"
 
 # Set working directory
