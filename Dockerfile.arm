@@ -1,81 +1,20 @@
 # Dockerfile for building Kindle HID Passthrough ARM binary
-# Uses Debian Jessie (glibc 2.19) for Kindle compatibility (glibc 2.20)
-# Builds OpenSSL 1.1.1 and Python 3.10 from source
+# Uses Python 3.10 on Bullseye with standalone mode for better compatibility
 # Target: ARMv7 hard-float (armhf)
 
-FROM arm32v7/debian:jessie
-
-# Use archived Debian Jessie repositories (disable GPG verification for expired keys)
-RUN echo "deb [trusted=yes] http://archive.debian.org/debian jessie main" > /etc/apt/sources.list && \
-    echo "deb [trusted=yes] http://archive.debian.org/debian-security jessie/updates main" >> /etc/apt/sources.list && \
-    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
+FROM arm32v7/python:3.10-slim-bullseye
 
 # Install build dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
-        wget \
-        ca-certificates \
-        zlib1g-dev \
-        libncurses5-dev \
-        libncursesw5-dev \
-        libreadline-dev \
-        libsqlite3-dev \
-        libgdbm-dev \
-        libbz2-dev \
-        libexpat1-dev \
-        liblzma-dev \
-        libffi-dev \
-        uuid-dev \
+        patchelf \
         ccache \
-        perl \
-        git \
-        autoconf \
-        automake \
-        libtool \
+        libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Build patchelf from source (not available in Jessie)
-# Use version 0.12 which works with C++11 (GCC 4.9 compatible)
-RUN cd /tmp && \
-    git clone https://github.com/NixOS/patchelf.git && \
-    cd patchelf && \
-    git checkout 0.12 && \
-    ./bootstrap.sh && \
-    ./configure && \
-    make && \
-    make install && \
-    cd / && rm -rf /tmp/patchelf
-
-# Build OpenSSL 1.1.1 from source (required for Python 3.10)
-ENV OPENSSL_VERSION=1.1.1w
-RUN cd /tmp && \
-    wget --no-check-certificate https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz && \
-    tar xzf openssl-${OPENSSL_VERSION}.tar.gz && \
-    cd openssl-${OPENSSL_VERSION} && \
-    ./config --prefix=/usr/local/ssl --openssldir=/usr/local/ssl shared zlib && \
-    make -j$(nproc) && \
-    make install && \
-    echo "/usr/local/ssl/lib" > /etc/ld.so.conf.d/openssl.conf && \
-    ldconfig && \
-    cd / && rm -rf /tmp/openssl-${OPENSSL_VERSION}*
-
-# Build Python 3.10 from source
-ENV PYTHON_VERSION=3.10.14
-ENV LDFLAGS="-L/usr/local/ssl/lib"
-ENV CPPFLAGS="-I/usr/local/ssl/include"
-ENV PKG_CONFIG_PATH="/usr/local/ssl/lib/pkgconfig"
-RUN cd /tmp && \
-    wget --no-check-certificate https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz && \
-    tar xzf Python-${PYTHON_VERSION}.tgz && \
-    cd Python-${PYTHON_VERSION} && \
-    ./configure --enable-optimizations --with-ensurepip=install --with-openssl=/usr/local/ssl && \
-    make -j$(nproc) && \
-    make install && \
-    cd / && rm -rf /tmp/Python-${PYTHON_VERSION}*
-
 # Install Python build tools and dependencies
-RUN pip3 install --no-cache-dir \
+RUN pip install --no-cache-dir \
     nuitka \
     ordered-set \
     zstandard \
