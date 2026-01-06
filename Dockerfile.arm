@@ -33,7 +33,7 @@ RUN apt-get update && \
 
 # Build patchelf 0.12 from source (compatible with older GCC, not in Jessie repos)
 RUN cd /tmp && \
-    wget --no-check-certificate https://github.com/NixOS/patchelf/releases/download/0.12/patchelf-0.12.tar.bz2 && \
+    wget -O patchelf-0.12.tar.bz2 --max-redirect=50 --no-check-certificate https://github.com/NixOS/patchelf/releases/download/0.12/patchelf-0.12.tar.bz2 && \
     tar xjf patchelf-0.12.tar.bz2 && \
     cd patchelf-0.12 && \
     ./configure --prefix=/usr/local && \
