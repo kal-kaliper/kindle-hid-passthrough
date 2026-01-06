@@ -15,6 +15,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
         wget \
+        curl \
         ca-certificates \
         zlib1g-dev \
         libncurses5-dev \
@@ -33,7 +34,7 @@ RUN apt-get update && \
 
 # Build patchelf 0.12 from source (compatible with older GCC, not in Jessie repos)
 RUN cd /tmp && \
-    wget -O patchelf-0.12.tar.bz2 --max-redirect=50 --no-check-certificate https://github.com/NixOS/patchelf/releases/download/0.12/patchelf-0.12.tar.bz2 && \
+    curl -kL -o patchelf-0.12.tar.bz2 https://github.com/NixOS/patchelf/releases/download/0.12/patchelf-0.12.tar.bz2 && \
     tar xjf patchelf-0.12.tar.bz2 && \
     cd patchelf-0.12 && \
     ./configure --prefix=/usr/local && \
