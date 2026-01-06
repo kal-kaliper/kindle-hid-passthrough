@@ -31,7 +31,7 @@ jobs:
       - name: Extract binary
         run: |
           CONTAINER_ID=$(docker create kindle-hid-passthrough-builder)
-          docker cp "$CONTAINER_ID:/build/dist/kindle-hid-passthrough" ./kindle-hid-passthrough
+          docker cp "$CONTAINER_ID:/build/kindle-hid-passthrough" ./kindle-hid-passthrough
           docker rm "$CONTAINER_ID"
 
       - name: Show binary info

@@ -1,27 +1,32 @@
 # Dockerfile for building Kindle HID Passthrough ARM binary
-# Uses Alpine Linux with musl libc to avoid glibc version conflicts
+# Uses Nuitka with bumble excluded (avoids ARM branch range errors)
 # Target: ARMv7 hard-float (armhf)
 
-FROM arm32v7/alpine:3.18
+FROM arm32v7/python:3.10-slim-bullseye
 
-# Install Python and build dependencies
-RUN apk add --no-cache \
-    python3 \
-    python3-dev \
-    py3-pip \
-    gcc \
-    musl-dev \
-    linux-headers \
-    libffi-dev \
-    openssl-dev \
-    zlib-dev \
-    binutils
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        patchelf \
+        ccache \
+        libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-RUN pip3 install --no-cache-dir --break-system-packages \
-    pyinstaller \
+# Install Python build tools and dependencies
+RUN pip install --no-cache-dir \
+    nuitka \
+    ordered-set \
+    zstandard \
     bumble>=0.0.193 \
     aiofiles>=23.0.0
+
+# Enable ccache for faster C compilation
+ENV CCACHE_DIR=/ccache
+ENV PATH="/usr/lib/ccache:${PATH}"
+
+# ARM-specific compiler flags for large code generation
+ENV CFLAGS="-mword-relocations"
 
 # Set working directory
 WORKDIR /build
@@ -30,18 +35,28 @@ WORKDIR /build
 COPY kindle_hid_passthrough/*.py /build/kindle_hid_passthrough/
 COPY kindle_hid_passthrough/config.ini /build/kindle_hid_passthrough/
 
-# Build with PyInstaller
-# --onefile creates a single executable
-# --hidden-import ensures bumble modules are included
-RUN python3 -m PyInstaller \
-    --onefile \
-    --name kindle-hid-passthrough \
-    --add-data "kindle_hid_passthrough/config.ini:kindle_hid_passthrough" \
-    --hidden-import bumble \
-    --hidden-import bumble.hci \
-    --hidden-import bumble.host \
-    --hidden-import bumble.transport \
-    --hidden-import aiofiles \
+# Build with Nuitka
+# --mode=onefile creates single self-extracting executable
+# --onefile-tempdir-spec extracts to /mnt/us/tmp on Kindle (avoiding /var/tmp space issues)
+# --lto=no disables link-time optimization (faster builds)
+# --low-memory reduces memory usage during compilation
+# --include-package=bumble + --nofollow-import-to=bumble: include bumble as bytecode
+#   (not compiled to C) to avoid ARM branch range errors from large generated code
+RUN python3 -m nuitka \
+    --mode=onefile \
+    --onefile-tempdir-spec=/mnt/us/tmp/nuitka-{pid}-{time} \
+    --jobs=$(nproc) \
+    --lto=no \
+    --low-memory \
+    --show-progress \
+    --output-filename=kindle-hid-passthrough \
+    --include-package=kindle_hid_passthrough \
+    --include-package=bumble \
+    --nofollow-import-to=bumble \
+    --include-data-file=kindle_hid_passthrough/config.ini=kindle_hid_passthrough/config.ini \
+    --nofollow-import-to=pytest \
+    --nofollow-import-to=unittest \
+    --nofollow-import-to=setuptools \
     kindle_hid_passthrough/main.py
 
-# Output will be at /build/dist/kindle-hid-passthrough
+# Output will be at /build/kindle-hid-passthrough
