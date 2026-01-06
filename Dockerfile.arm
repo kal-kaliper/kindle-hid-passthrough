@@ -44,7 +44,7 @@ COPY kindle_hid_passthrough/config.ini /build/kindle_hid_passthrough/
 #   (not compiled to C) to avoid ARM branch range errors from large generated code
 RUN python3 -m nuitka \
     --mode=onefile \
-    --onefile-tempdir-spec=/mnt/us/tmp/nuitka-{pid}-{time} \
+    --onefile-tempdir-spec=/mnt/us/tmp \
     --jobs=$(nproc) \
     --lto=no \
     --low-memory \
