@@ -16,7 +16,6 @@ RUN apt-get update && \
 # Install Python dependencies
 RUN pip install --no-cache-dir \
     pyinstaller \
-    staticx \
     bumble>=0.0.193 \
     aiofiles>=23.0.0
 
@@ -32,7 +31,7 @@ COPY kindle_hid_passthrough/config.ini /build/kindle_hid_passthrough/
 # --hidden-import ensures bumble modules are included
 RUN python3 -m PyInstaller \
     --onefile \
-    --name kindle-hid-passthrough-base \
+    --name kindle-hid-passthrough \
     --add-data "kindle_hid_passthrough/config.ini:kindle_hid_passthrough" \
     --hidden-import bumble \
     --hidden-import bumble.hci \
@@ -40,8 +39,5 @@ RUN python3 -m PyInstaller \
     --hidden-import bumble.transport \
     --hidden-import aiofiles \
     kindle_hid_passthrough/main.py
-
-# Wrap with staticx for static linking (may help with glibc compatibility)
-RUN staticx dist/kindle-hid-passthrough-base dist/kindle-hid-passthrough
 
 # Output will be at /build/dist/kindle-hid-passthrough
