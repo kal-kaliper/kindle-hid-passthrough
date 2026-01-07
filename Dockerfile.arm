@@ -65,7 +65,7 @@ RUN cd /tmp && \
     wget --no-check-certificate https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz && \
     tar xzf Python-${PYTHON_VERSION}.tgz && \
     cd Python-${PYTHON_VERSION} && \
-    ./configure --enable-optimizations --with-ensurepip=install --with-openssl=/usr/local/ssl && \
+    ./configure --with-ensurepip=install --with-openssl=/usr/local/ssl && \
     make -j$(nproc) && \
     make install && \
     cd / && rm -rf /tmp/Python-${PYTHON_VERSION}*
@@ -96,7 +96,6 @@ COPY kindle_hid_passthrough/config.ini /build/kindle_hid_passthrough/
 # --mode=onefile creates single self-extracting executable
 # --onefile-tempdir-spec extracts to /mnt/us/tmp on Kindle (avoiding /var/tmp space issues)
 # --lto=no disables link-time optimization (faster builds)
-# --low-memory reduces memory usage during compilation
 # --include-package=bumble + --nofollow-import-to=bumble: include bumble as bytecode
 #   (not compiled to C) to avoid ARM branch range errors from large generated code
 RUN python3 -m nuitka \
@@ -104,7 +103,6 @@ RUN python3 -m nuitka \
     --onefile-tempdir-spec=/mnt/us/tmp \
     --jobs=$(nproc) \
     --lto=no \
-    --low-memory \
     --show-progress \
     --output-filename=kindle-hid-passthrough \
     --include-package=kindle_hid_passthrough \
