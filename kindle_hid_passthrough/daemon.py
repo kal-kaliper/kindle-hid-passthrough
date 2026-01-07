@@ -19,8 +19,8 @@ import sys
 
 sys.path.insert(0, '/mnt/us/kindle_hid_passthrough')
 
-from config import config, create_host
-from logging_utils import setup_daemon_logging
+from kindle_hid_passthrough.config import config, create_host
+from kindle_hid_passthrough.logging_utils import setup_daemon_logging
 
 logger = logging.getLogger(__name__)
 

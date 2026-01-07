@@ -15,9 +15,9 @@ import asyncio
 import logging
 from typing import Optional, List, Dict
 
-from bumble.device import Device, Peer
-from bumble.hci import Address, HCI_Reset_Command
-from bumble.gatt import (
+from vendor.bumble.device import Device, Peer
+from vendor.bumble.hci import Address, HCI_Reset_Command
+from vendor.bumble.gatt import (
     GATT_GENERIC_ACCESS_SERVICE,
     GATT_DEVICE_NAME_CHARACTERISTIC,
     GATT_HUMAN_INTERFACE_DEVICE_SERVICE,
@@ -30,13 +30,13 @@ from bumble.gatt import (
     GATT_BOOT_KEYBOARD_INPUT_REPORT_CHARACTERISTIC,
     GATT_BOOT_KEYBOARD_OUTPUT_REPORT_CHARACTERISTIC,
 )
-from bumble.transport import open_transport
-from bumble.core import AdvertisingData, InvalidStateError, ProtocolError
+from vendor.bumble.transport import open_transport
+from vendor.bumble.core import AdvertisingData, InvalidStateError, ProtocolError
 
-from config import config
-from logging_utils import log
-from device_cache import DeviceCache
-from pairing import create_pairing_config, create_keystore
+from kindle_hid_passthrough.config import config
+from kindle_hid_passthrough.logging_utils import log
+from kindle_hid_passthrough.device_cache import DeviceCache
+from kindle_hid_passthrough.pairing import create_pairing_config, create_keystore
 
 __all__ = ['BLEHIDHost', '__version__']
 

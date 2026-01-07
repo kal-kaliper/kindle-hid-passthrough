@@ -16,12 +16,13 @@ RUN for i in 1 2 3; do \
     done && rm -rf /var/lib/apt/lists/*
 
 # Install Python build tools and dependencies
+# Note: bumble is vendored in vendor/ directory, not installed from pip
 RUN pip install --no-cache-dir \
     nuitka \
     ordered-set \
     zstandard \
-    bumble>=0.0.193 \
-    aiofiles>=23.0.0
+    aiofiles>=23.0.0 \
+    typing_extensions
 
 # Enable ccache for faster C compilation
 ENV CCACHE_DIR=/ccache
@@ -38,6 +39,9 @@ WORKDIR /build
 COPY kindle_hid_passthrough/*.py /build/kindle_hid_passthrough/
 COPY kindle_hid_passthrough/config.ini /build/kindle_hid_passthrough/
 
+# Copy vendored bumble package (stripped version)
+COPY vendor/ /build/vendor/
+
 # Build with Nuitka
 # --mode=onefile creates a single executable
 # --lto=no disables link-time optimization (faster for QEMU emulation)
@@ -51,10 +55,12 @@ RUN python3 -m nuitka \
     --show-progress \
     --output-filename=kindle-hid-passthrough \
     --include-package=kindle_hid_passthrough \
+    --include-package=vendor.bumble \
     --include-data-file=kindle_hid_passthrough/config.ini=kindle_hid_passthrough/config.ini \
     --nofollow-import-to=pytest \
     --nofollow-import-to=unittest \
     --nofollow-import-to=setuptools \
+    --nofollow-import-to=vendor.bumble.hci \
     kindle_hid_passthrough/main.py
 
 # Output will be at /build/kindle-hid-passthrough

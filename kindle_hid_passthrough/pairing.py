@@ -9,10 +9,10 @@ userspace SMP.
 Author: Lucas Zampieri <lzampier@redhat.com>
 """
 
-from bumble.pairing import PairingConfig, PairingDelegate
-from bumble.keys import JsonKeyStore
+from vendor.bumble.pairing import PairingConfig, PairingDelegate
+from vendor.bumble.keys import JsonKeyStore
 
-from logging_utils import log
+from kindle_hid_passthrough.logging_utils import log
 
 __all__ = [
     'AutoAcceptPairingDelegate',

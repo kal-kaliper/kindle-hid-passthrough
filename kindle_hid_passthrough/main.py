@@ -23,8 +23,8 @@ import os
 # Add current directory to path for imports
 sys.path.insert(0, '/mnt/us/kindle_hid_passthrough')
 
-from config import config, Protocol, create_host
-from logging_utils import log
+from kindle_hid_passthrough.config import config, Protocol, create_host
+from kindle_hid_passthrough.logging_utils import log
 
 
 async def pair_mode(protocol: Protocol):

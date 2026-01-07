@@ -15,39 +15,39 @@ import asyncio
 import logging
 from typing import Optional, List, Dict
 
-from bumble.device import Device
-from bumble.hci import (
+from vendor.bumble.device import Device
+from vendor.bumble.hci import (
     Address,
     HCI_Reset_Command,
     HCI_Write_Scan_Enable_Command,
     HCI_Write_Class_Of_Device_Command,
     HCI_Write_Local_Name_Command,
 )
-from bumble.transport import open_transport
-from bumble.hid import (
+from vendor.bumble.transport import open_transport
+from vendor.bumble.hid import (
     Host as HIDHost,
     Message,
     HID_CONTROL_PSM,
     HID_INTERRUPT_PSM,
 )
-from bumble.core import (
+from vendor.bumble.core import (
     DeviceClass,
     BT_BR_EDR_TRANSPORT,
     BT_HUMAN_INTERFACE_DEVICE_SERVICE,
     InvalidStateError,
     ProtocolError,
 )
-from bumble.sdp import (
+from vendor.bumble.sdp import (
     Client as SDPClient,
     SDP_SERVICE_RECORD_HANDLE_ATTRIBUTE_ID,
     SDP_SERVICE_CLASS_ID_LIST_ATTRIBUTE_ID,
     SDP_PROTOCOL_DESCRIPTOR_LIST_ATTRIBUTE_ID,
 )
 
-from config import config
-from logging_utils import log
-from pairing import create_pairing_config, create_keystore
-from device_cache import DeviceCache
+from kindle_hid_passthrough.config import config
+from kindle_hid_passthrough.logging_utils import log
+from kindle_hid_passthrough.pairing import create_pairing_config, create_keystore
+from kindle_hid_passthrough.device_cache import DeviceCache
 
 __all__ = ['ClassicHIDHost', '__version__']
 

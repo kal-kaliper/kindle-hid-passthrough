@@ -1,0 +1,104 @@
+# Dockerfile for building Kindle HID Passthrough with old glibc
+# Uses Ubuntu 14.04 (glibc 2.19) for Kindle compatibility (glibc 2.20)
+# Builds Python 3.10 from source, then uses Nuitka
+# Target: ARMv7 hard-float (armhf)
+
+FROM arm32v7/ubuntu:14.04
+
+# Fix repositories - 14.04 is EOL
+RUN sed -i 's/archive.ubuntu.com/old-releases.ubuntu.com/g' /etc/apt/sources.list && \
+    sed -i 's/security.ubuntu.com/old-releases.ubuntu.com/g' /etc/apt/sources.list
+
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y \
+        build-essential \
+        wget \
+        libssl-dev \
+        zlib1g-dev \
+        libffi-dev \
+        libsqlite3-dev \
+        libbz2-dev \
+        libreadline-dev \
+        libncurses5-dev \
+        libgdbm-dev \
+        liblzma-dev \
+        ccache \
+        autoconf \
+        automake
+
+# Build patchelf from source (use 0.9 which works with older g++)
+WORKDIR /tmp/patchelf-src
+RUN wget https://github.com/NixOS/patchelf/archive/refs/tags/0.9.tar.gz && \
+    tar xzf 0.9.tar.gz && \
+    cd patchelf-0.9 && \
+    ./bootstrap.sh && \
+    ./configure --prefix=/usr/local && \
+    make && \
+    make install
+
+# Build OpenSSL 1.1.1 from source (Ubuntu 14.04 has 1.0.1 which is too old for Python 3.10)
+WORKDIR /tmp/openssl-src
+RUN wget https://www.openssl.org/source/openssl-1.1.1w.tar.gz && \
+    tar xzf openssl-1.1.1w.tar.gz && \
+    cd openssl-1.1.1w && \
+    ./config --prefix=/usr/local/openssl --openssldir=/usr/local/openssl shared && \
+    make -j$(nproc) && \
+    make install && \
+    echo "/usr/local/openssl/lib" > /etc/ld.so.conf.d/openssl.conf && \
+    ldconfig
+
+# Build Python 3.10.16 from source (without optimizations for speed)
+WORKDIR /tmp/python-src
+RUN wget https://www.python.org/ftp/python/3.10.16/Python-3.10.16.tar.xz && \
+    tar xf Python-3.10.16.tar.xz && \
+    cd Python-3.10.16 && \
+    ./configure \
+        --prefix=/usr/local \
+        --enable-shared \
+        --with-openssl=/usr/local/openssl \
+        LDFLAGS="-Wl,-rpath=/usr/local/lib -L/usr/local/openssl/lib" \
+        CPPFLAGS="-I/usr/local/openssl/include" && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig
+
+# Enable C99 mode for old gcc (needed for zstandard and other packages)
+ENV CFLAGS="-std=gnu99 -mword-relocations"
+
+# Upgrade pip
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+# Install Nuitka and dependencies
+RUN python3 -m pip install \
+    nuitka \
+    ordered-set \
+    zstandard \
+    aiofiles>=23.0.0 \
+    typing_extensions
+ENV CCACHE_DIR=/ccache
+
+WORKDIR /build
+
+# Copy sources
+COPY kindle_hid_passthrough/ /build/kindle_hid_passthrough/
+COPY vendor/ /build/vendor/
+
+# Build with Nuitka
+RUN python3 -m nuitka \
+    --mode=onefile \
+    --jobs=$(nproc) \
+    --lto=no \
+    --low-memory \
+    --show-progress \
+    --output-filename=kindle-hid-passthrough \
+    --include-package=kindle_hid_passthrough \
+    --include-package=vendor.bumble \
+    --include-data-file=kindle_hid_passthrough/config.ini=kindle_hid_passthrough/config.ini \
+    --nofollow-import-to=pytest \
+    --nofollow-import-to=unittest \
+    --nofollow-import-to=setuptools \
+    --nofollow-import-to=vendor.bumble.hci \
+    kindle_hid_passthrough/main.py
+
+# Output at /build/kindle-hid-passthrough

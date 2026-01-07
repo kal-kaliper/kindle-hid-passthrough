@@ -14,7 +14,7 @@ from typing import Optional
 
 # Try to import Bumble colors, fall back to no-op if not available
 try:
-    from bumble.colors import color as bumble_color
+    from vendor.bumble.colors import color as bumble_color
 except ImportError:
     def bumble_color(text, _color):
         return text

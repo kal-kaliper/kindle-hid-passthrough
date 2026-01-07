@@ -25,13 +25,13 @@ Usage:
     await host.run(device_address)
 """
 
-from host import BLEHIDHost, __version__
-from config import config, Protocol, create_host
-from logging_utils import log
-from device_cache import DeviceCache
+from kindle_hid_passthrough.host import BLEHIDHost, __version__
+from kindle_hid_passthrough.config import config, Protocol, create_host
+from kindle_hid_passthrough.logging_utils import log
+from kindle_hid_passthrough.device_cache import DeviceCache
 
 try:
-    from classic_host import ClassicHIDHost
+    from kindle_hid_passthrough.classic_host import ClassicHIDHost
 except ImportError:
     ClassicHIDHost = None
 
