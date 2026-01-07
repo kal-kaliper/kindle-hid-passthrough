@@ -16,19 +16,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build ARMv7 binary with Docker
+      - name: Build ARMv7 binary with cross-compilation
         run: |
           docker build \
-            --platform linux/arm/v7 \
-            -f Dockerfile.arm \
+            -f Dockerfile.cross \
             -t kindle-hid-passthrough-builder \
             --load \
             .
