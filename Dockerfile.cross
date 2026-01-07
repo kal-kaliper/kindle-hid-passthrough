@@ -29,9 +29,9 @@ RUN apt-get update && \
 # Download pre-built ARM Python from python-build-standalone
 # This avoids the long Python compilation step
 ENV PYTHON_VERSION=3.10.14
-ENV PYTHON_RELEASE=20240224
+ENV PYTHON_RELEASE=20240726
 RUN cd /opt && \
-    wget https://github.com/indygreg/python-build-standalone/releases/download/${PYTHON_RELEASE}/cpython-${PYTHON_VERSION}+${PYTHON_RELEASE}-armv7-unknown-linux-gnueabihf-install_only.tar.gz && \
+    wget https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_RELEASE}/cpython-${PYTHON_VERSION}+${PYTHON_RELEASE}-armv7-unknown-linux-gnueabihf-install_only.tar.gz && \
     tar xzf cpython-${PYTHON_VERSION}+${PYTHON_RELEASE}-armv7-unknown-linux-gnueabihf-install_only.tar.gz && \
     rm cpython-${PYTHON_VERSION}+${PYTHON_RELEASE}-armv7-unknown-linux-gnueabihf-install_only.tar.gz
 
