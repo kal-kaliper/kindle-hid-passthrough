@@ -16,38 +16,52 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build ARMv7 binary with cross-compilation
+      - name: Build ARMv7 zipapp with Docker
         run: |
           docker build \
-            -f Dockerfile.cross \
+            --platform linux/arm/v7 \
+            -f Dockerfile.zipapp \
             -t kindle-hid-passthrough-builder \
             --load \
             .
 
-      - name: Extract binary
+      - name: Extract artifacts
         run: |
           CONTAINER_ID=$(docker create kindle-hid-passthrough-builder)
-          docker cp "$CONTAINER_ID:/build/kindle-hid-passthrough" ./kindle-hid-passthrough
+          mkdir -p dist
+          docker cp "$CONTAINER_ID:/build/dist/." ./dist/
           docker rm "$CONTAINER_ID"
 
-      - name: Show binary info
+      - name: Show artifacts info
         run: |
-          file kindle-hid-passthrough
-          ls -lh kindle-hid-passthrough
+          echo "=== Zipapp info ==="
+          file dist/kindle-hid-passthrough.pyz
+          ls -lh dist/kindle-hid-passthrough.pyz
+          echo ""
+          echo "=== Wrapper script ==="
+          file dist/kindle-hid-passthrough
+          ls -lh dist/kindle-hid-passthrough
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: kindle-hid-passthrough-armv7
-          path: kindle-hid-passthrough
+          path: dist/*
 
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v1
         with:
-          files: kindle-hid-passthrough
+          files: |
+            dist/kindle-hid-passthrough.pyz
+            dist/kindle-hid-passthrough
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

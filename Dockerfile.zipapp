@@ -1,0 +1,81 @@
+# Dockerfile for creating ARM zipapp with pre-built Python
+# Uses Alpine Linux (musl-based, small footprint)
+# Creates self-contained .pyz archive with dependencies
+# No Python/C compilation - just packaging!
+
+FROM arm32v7/python:3.10-alpine
+
+# Install build dependencies
+RUN apk add --no-cache \
+    gcc \
+    musl-dev \
+    libffi-dev \
+    make
+
+# Install shiv for creating zipapp and runtime dependencies
+RUN pip install --no-cache-dir \
+    shiv==1.0.6 \
+    bumble>=0.0.193 \
+    aiofiles>=23.0.0
+
+WORKDIR /build
+
+# Copy source code
+COPY kindle_hid_passthrough/*.py /build/kindle_hid_passthrough/
+COPY kindle_hid_passthrough/config.ini /build/kindle_hid_passthrough/
+
+# Create a minimal setup.py for the package
+RUN cat > /build/setup.py <<'EOF'
+from setuptools import setup, find_packages
+
+setup(
+    name="kindle-hid-passthrough",
+    version="1.0.0",
+    packages=find_packages(),
+    include_package_data=True,
+    package_data={
+        "kindle_hid_passthrough": ["config.ini"],
+    },
+    install_requires=[
+        "bumble>=0.0.193",
+        "aiofiles>=23.0.0",
+    ],
+    entry_points={
+        "console_scripts": [
+            "kindle-hid-passthrough=kindle_hid_passthrough.main:main",
+        ],
+    },
+)
+EOF
+
+# Create __init__.py if it doesn't exist
+RUN touch /build/kindle_hid_passthrough/__init__.py
+
+# Create output directory
+RUN mkdir -p /build/dist
+
+# Create zipapp with shiv
+# This bundles Python code + dependencies into single .pyz file
+RUN shiv \
+    --output-file /build/dist/kindle-hid-passthrough.pyz \
+    --entry-point kindle_hid_passthrough.main:main \
+    --compile-pyc \
+    --compressed \
+    bumble aiofiles .
+
+# Make zipapp executable
+RUN chmod +x /build/dist/kindle-hid-passthrough.pyz
+
+# Create a wrapper script that uses system Python
+RUN cat > /build/dist/kindle-hid-passthrough <<'EOF'
+#!/bin/sh
+# Wrapper script to execute the zipapp
+# Assumes Python 3 is available on the Kindle
+exec python3 "$(dirname "$0")/kindle-hid-passthrough.pyz" "$@"
+EOF
+
+RUN chmod +x /build/dist/kindle-hid-passthrough
+
+# Output will be at:
+# /build/dist/kindle-hid-passthrough.pyz (Python zipapp)
+# /build/dist/kindle-hid-passthrough (wrapper script)
