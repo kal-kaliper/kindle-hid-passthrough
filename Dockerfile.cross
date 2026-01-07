@@ -39,15 +39,12 @@ RUN cd /opt && \
 ENV ARM_PYTHON=/opt/python
 ENV ARM_PYTHON_BIN=${ARM_PYTHON}/bin/python3
 
-# Install Nuitka and build tools on host Python
+# Install Nuitka, build tools, and runtime dependencies on host Python
+# Nuitka will compile these and bundle them into the binary
 RUN pip3 install --no-cache-dir \
     nuitka \
     ordered-set \
-    zstandard
-
-# Install runtime dependencies into ARM Python
-# Use pip install with --python flag pointing to ARM Python
-RUN ${ARM_PYTHON_BIN} -m pip install --no-cache-dir \
+    zstandard \
     bumble>=0.0.193 \
     aiofiles>=23.0.0
 
