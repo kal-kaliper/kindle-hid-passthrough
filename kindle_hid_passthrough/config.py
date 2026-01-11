@@ -12,7 +12,7 @@ import os
 from typing import Optional
 from enum import Enum
 
-__all__ = ['config', 'Config', 'Protocol']
+__all__ = ['config', 'Config', 'Protocol', 'create_host', 'create_scanner']
 
 
 class Protocol(Enum):
@@ -216,6 +216,19 @@ def create_host(protocol: Protocol = None, transport_spec: str = None):
     else:
         from host import BLEHIDHost
         return BLEHIDHost(transport_spec)
+
+
+def create_scanner(transport_spec: str = None):
+    """Factory function to create a unified BLE+Classic scanner.
+
+    Args:
+        transport_spec: HCI transport specification (default: from config)
+
+    Returns:
+        UnifiedScanner instance
+    """
+    from unified_scanner import UnifiedScanner
+    return UnifiedScanner(transport_spec)
 
 
 # Global singleton instance

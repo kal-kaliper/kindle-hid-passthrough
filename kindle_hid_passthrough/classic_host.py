@@ -9,7 +9,7 @@ Forwards all HID reports directly to Linux via UHID.
 Author: Lucas Zampieri <lzampier@redhat.com>
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 import asyncio
 import logging
@@ -48,8 +48,149 @@ from config import config
 from logging_utils import log
 from pairing import create_pairing_config, create_keystore
 from device_cache import DeviceCache
+from state_machine import StateMachine, HostState
 
 __all__ = ['ClassicHIDHost', '__version__']
+
+
+class ConnectionPolicy:
+    """Unified connection policy - eliminates active/passive race condition.
+
+    Uses asyncio.Future as single source of truth:
+    - Passive path (page scan) sets the future via connection event
+    - Active path checks future.done() before each attempt
+    - No window for race condition
+    """
+
+    def __init__(self, device: Device, state_machine: StateMachine):
+        self.device = device
+        self.state_machine = state_machine
+        self._connection_future: Optional[asyncio.Future] = None
+
+    async def wait_for_connection(
+        self,
+        allowed_addresses: List[str],
+        connection_handler,
+        timeout: float = 60.0,
+        retry_interval: float = 5.0
+    ):
+        """Wait for connection using coordinated active+passive approach.
+
+        Args:
+            allowed_addresses: List of allowed device addresses (* = wildcard)
+            connection_handler: Async callback for handling connections
+            timeout: Total timeout for connection
+            retry_interval: Seconds between active connection retry rounds
+
+        Returns:
+            Connection object
+
+        Raises:
+            InvalidStateError: If no connection within timeout
+        """
+        # Create future that will hold the connection
+        self._connection_future = asyncio.get_event_loop().create_future()
+
+        # Register connection handler (passive path)
+        async def on_passive_connection(connection):
+            addr_str = str(connection.peer_address)
+            log.info(f"Passive connection from: {addr_str}")
+
+            # Check if device is allowed
+            allowed, _ = config.is_device_allowed(addr_str)
+            if not allowed:
+                log.warning(f"Ignoring {addr_str} (not in devices.conf)")
+                return
+
+            # Handle the connection
+            await connection_handler(connection)
+
+            # Set future if not already done
+            if not self._connection_future.done():
+                self._connection_future.set_result(connection)
+
+        def on_connection_sync(connection):
+            asyncio.create_task(on_passive_connection(connection))
+
+        self.device.on('connection', on_connection_sync)
+
+        # Start active connection task if we have specific addresses
+        active_task = None
+        specific_addresses = [a for a in allowed_addresses if a != '*']
+        if specific_addresses:
+            active_task = asyncio.create_task(
+                self._try_active_connects(
+                    specific_addresses,
+                    connection_handler,
+                    retry_interval
+                )
+            )
+
+        try:
+            # Wait for either passive or active to succeed
+            connection = await asyncio.wait_for(
+                self._connection_future,
+                timeout=timeout
+            )
+            return connection
+
+        except asyncio.TimeoutError:
+            log.warning("Connection timeout - no device connected")
+            raise InvalidStateError("No device connected within timeout")
+
+        finally:
+            # Clean up
+            if active_task:
+                active_task.cancel()
+                try:
+                    await active_task
+                except asyncio.CancelledError:
+                    pass
+            self.device.remove_listener('connection', on_connection_sync)
+
+    async def _try_active_connects(
+        self,
+        addresses: List[str],
+        connection_handler,
+        retry_interval: float
+    ):
+        """Try active connects, checking future before each attempt."""
+        while not self._connection_future.done():
+            for addr in addresses:
+                # Check if someone else (passive) got a connection
+                if self._connection_future.done():
+                    return
+
+                try:
+                    log.info(f"Trying active connection to {addr}...")
+                    target = Address(addr, Address.PUBLIC_DEVICE_ADDRESS)
+                    connection = await asyncio.wait_for(
+                        self.device.connect(target, transport=BT_BR_EDR_TRANSPORT),
+                        timeout=5.0
+                    )
+
+                    # Connection successful
+                    log.success(f"Active connection to {addr} successful")
+
+                    # Handle the connection
+                    await connection_handler(connection)
+
+                    # Set future if not already done
+                    if not self._connection_future.done():
+                        self._connection_future.set_result(connection)
+                    return
+
+                except asyncio.TimeoutError:
+                    log.info(f"  {addr} not responding")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log.info(f"  {addr} connection failed: {e}")
+
+            # All devices tried, wait before retrying
+            if not self._connection_future.done():
+                log.info(f"Retrying active connection in {retry_interval}s...")
+                await asyncio.sleep(retry_interval)
 
 
 class ClassicHIDHost:
@@ -85,6 +226,9 @@ class ClassicHIDHost:
         self.connection = None
         self.hid_host = None
 
+        # State machine
+        self.state_machine = StateMachine()
+
         # State
         self.current_device_address = None
         self.device_name = None
@@ -106,15 +250,21 @@ class ClassicHIDHost:
         except ImportError:
             log.warning("UHID support not available")
 
-        # Events (two-phase connection)
-        self._connection_received_event = None  # Phase 1: BT link established
-        self._connection_ready_event = None      # Phase 2: Auth done, HID registered
+        # Events
         self._disconnection_event = None
+        self._handshake_complete_event = None
         self._last_report = None
         self._auth_failure_address = None  # Track address for auth failure retry
 
+    @property
+    def state(self) -> HostState:
+        """Current host state."""
+        return self.state_machine.state
+
     async def start(self):
         """Initialize the Bumble device and Classic Bluetooth stack."""
+        self.state_machine.transition(HostState.STARTING)
+
         log.info(f"Classic HID Host v{__version__}")
         log.info("Opening transport...")
 
@@ -125,6 +275,7 @@ class ClassicHIDHost:
             )
         except asyncio.TimeoutError:
             log.error(f"Transport open timed out after {config.transport_timeout}s")
+            self.state_machine.transition(HostState.ERROR, "Transport timeout")
             raise
 
         self.device = Device.with_hci(
@@ -147,6 +298,7 @@ class ClassicHIDHost:
             await asyncio.sleep(0.2)
         except asyncio.TimeoutError:
             log.error(f"HCI Reset timed out")
+            self.state_machine.transition(HostState.ERROR, "HCI reset timeout")
             raise
 
         self.device.classic_enabled = True
@@ -158,9 +310,6 @@ class ClassicHIDHost:
         log.success(f"Device powered on: {self.device.public_address}")
 
         # Set Class of Device to Computer (Desktop)
-        # Format: Service Classes (bits 13-23) | Major Class (bits 8-12) | Minor Class (bits 2-7)
-        # Major Class 0x01 = Computer, Minor Class 0x01 = Desktop workstation
-        # Service Classes: 0x00 (none) - we're a host, not advertising services
         class_of_device = 0x000104  # Computer/Desktop
         await self.device.host.send_command(
             HCI_Write_Class_Of_Device_Command(class_of_device=class_of_device),
@@ -168,7 +317,7 @@ class ClassicHIDHost:
         )
         log.info(f"Set Class of Device: 0x{class_of_device:06X} (Computer/Desktop)")
 
-        # Set local name (must be bytes, null-terminated)
+        # Set local name
         local_name_bytes = config.device_name.encode('utf-8') + b'\x00'
         await self.device.host.send_command(
             HCI_Write_Local_Name_Command(local_name=local_name_bytes),
@@ -176,7 +325,7 @@ class ClassicHIDHost:
         )
         log.info(f"Set local name: {config.device_name}")
 
-        # Debug: verify keystore is working
+        # Debug: verify keystore
         if self.keystore:
             try:
                 all_keys = await self.keystore.get_all()
@@ -210,6 +359,8 @@ class ClassicHIDHost:
         Returns:
             List of HID device dicts with address, name, rssi
         """
+        self.state_machine.transition(HostState.SCANNING)
+
         log.info(f"Scanning for Classic BT devices ({duration}s)...")
 
         devices_found = []
@@ -248,9 +399,12 @@ class ClassicHIDHost:
                 log.info(f"  Found: {name} ({addr_str})")
 
         self.device.on('inquiry_result', on_inquiry_result)
-        await self.device.start_discovery()
-        await asyncio.sleep(duration)
-        await self.device.stop_discovery()
+        try:
+            await self.device.start_discovery()
+            await asyncio.sleep(duration)
+            await self.device.stop_discovery()
+        finally:
+            self.device.remove_listener('inquiry_result', on_inquiry_result)
 
         # Get names for unknown devices
         for dev in devices_found:
@@ -266,6 +420,7 @@ class ClassicHIDHost:
                     pass
 
         log.success(f"Found {len(devices_found)} HID devices")
+        self.state_machine.transition(HostState.IDLE)
         return devices_found
 
     async def pair_device(self, address: str) -> bool:
@@ -285,11 +440,10 @@ class ClassicHIDHost:
                 log.error("No HID devices found")
                 return False
 
-            # Return the list for main.py to handle selection
-            # For now, just use the first device
             address = devices[0]['address']
             log.info(f"Found device: {devices[0]['name']} ({address})")
 
+        self.state_machine.transition(HostState.CONNECTING)
         log.info(f"Connecting to {address} for pairing...")
 
         # Connect to the device
@@ -302,14 +456,17 @@ class ClassicHIDHost:
             log.success(f"Connected to {address}")
         except asyncio.TimeoutError:
             log.error(f"Connection timeout after {config.connect_timeout}s")
+            self.state_machine.transition(HostState.ERROR, "Connection timeout")
             return False
         except Exception as e:
             log.error(f"Connection failed: {e}")
+            self.state_machine.transition(HostState.ERROR, str(e))
             return False
 
         self.current_device_address = address
+        self.state_machine.transition(HostState.AUTHENTICATING)
 
-        # Track link key generation (listen on both connection and device)
+        # Track link key generation
         link_key_received = asyncio.Event()
         received_link_key = None
 
@@ -329,7 +486,7 @@ class ClassicHIDHost:
         self.device.host.on('link_key', on_device_link_key)
 
         try:
-            # Authenticate (this triggers SSP pairing if no link key exists)
+            # Authenticate (triggers SSP pairing if no link key)
             log.info("Authenticating...")
             try:
                 await asyncio.wait_for(
@@ -340,7 +497,7 @@ class ClassicHIDHost:
             except Exception as e:
                 log.warning(f"Authentication: {e}")
 
-            # Wait a moment for link key to be processed and saved
+            # Wait for link key
             log.info("Waiting for link key...")
             try:
                 await asyncio.wait_for(link_key_received.wait(), timeout=5.0)
@@ -348,7 +505,7 @@ class ClassicHIDHost:
             except asyncio.TimeoutError:
                 log.warning("Link key event timeout (may already be saved)")
 
-            # Explicitly request encryption
+            # Request encryption
             log.info("Requesting encryption...")
             try:
                 await asyncio.wait_for(
@@ -359,7 +516,7 @@ class ClassicHIDHost:
             except Exception as e:
                 log.warning(f"Encryption request: {e}")
 
-            # Wait for encryption to be enabled
+            # Wait for encryption
             log.info("Waiting for encryption...")
             encryption_done = asyncio.Event()
 
@@ -380,20 +537,21 @@ class ClassicHIDHost:
             except asyncio.TimeoutError:
                 log.warning("Encryption event timeout")
 
-            # Check final encryption state
             if self.connection.is_encrypted:
                 log.success("Connection encrypted!")
             else:
                 log.warning("Connection not encrypted")
 
-            # Query SDP for report descriptor and cache it
+            self.state_machine.transition(HostState.DISCOVERING_SERVICES)
+
+            # Query SDP for report descriptor
             await self._query_and_cache_descriptor(self.current_device_address)
 
-            # Give time for link key to be persisted to disk
+            # Give time for key persistence
             log.info("Waiting for key persistence...")
             await asyncio.sleep(1.0)
 
-            # Verify the link key was saved
+            # Verify link key was saved
             if self.keystore:
                 keys = await self.keystore.get(address)
                 if keys and keys.link_key:
@@ -401,9 +559,12 @@ class ClassicHIDHost:
                 else:
                     log.warning("Link key not found in keystore!")
 
+            self.state_machine.transition(HostState.IDLE)
             return True
+
         except Exception as e:
             log.error(f"Pairing failed: {e}")
+            self.state_machine.transition(HostState.ERROR, str(e))
             return False
         finally:
             try:
@@ -432,9 +593,7 @@ class ClassicHIDHost:
             log.info("SDP client connected")
 
             try:
-                # Try focused query first - just the HID descriptor
-                # 0x0206 = HIDDescriptorList (contains report descriptor)
-                # 0x0100 = ServiceName
+                # Try focused query first
                 hid_attrs = [0x0100, 0x0206]
 
                 log.info("Searching for HID service (focused query)...")
@@ -448,7 +607,6 @@ class ClassicHIDHost:
                     )
                 except Exception as e:
                     log.warning(f"Focused query failed: {e}, trying broad query...")
-                    # Try broader query
                     result = await asyncio.wait_for(
                         sdp_client.search_attributes(
                             [BT_HUMAN_INTERFACE_DEVICE_SERVICE],
@@ -476,7 +634,6 @@ class ClassicHIDHost:
                                     log.info(f"  Found HIDDescriptorList!")
                                     self._parse_hid_descriptor_list(attr.value)
                                 elif attr_id == 0x0100:
-                                    # Service name
                                     try:
                                         if hasattr(attr.value, 'value'):
                                             name = attr.value.value
@@ -507,17 +664,10 @@ class ClassicHIDHost:
             log.debug(traceback.format_exc())
 
     def _parse_hid_descriptor_list(self, data_element):
-        """Parse HID Descriptor List from SDP.
-
-        The HIDDescriptorList is a sequence of HIDDescriptor entries.
-        Each HIDDescriptor is a sequence of:
-          - Type (uint8): 0x22 = Report Descriptor, 0x21 = Physical Descriptor
-          - Data (string): The actual descriptor bytes
-        """
+        """Parse HID Descriptor List from SDP."""
         log.info(f"Parsing HIDDescriptorList: {type(data_element).__name__}")
 
         try:
-            # Handle DataElement wrapper
             if hasattr(data_element, 'value'):
                 data_element = data_element.value
 
@@ -527,7 +677,6 @@ class ClassicHIDHost:
                 for i, descriptor in enumerate(data_element):
                     log.info(f"  Descriptor {i}: {type(descriptor).__name__}")
 
-                    # Unwrap if needed
                     if hasattr(descriptor, 'value'):
                         descriptor = descriptor.value
 
@@ -535,15 +684,12 @@ class ClassicHIDHost:
                         desc_type = descriptor[0]
                         desc_data = descriptor[1]
 
-                        # Unwrap type
                         if hasattr(desc_type, 'value'):
                             desc_type = desc_type.value
 
                         log.info(f"    Type: 0x{desc_type:02X}" if isinstance(desc_type, int) else f"    Type: {desc_type}")
 
-                        # 0x22 = Report Descriptor
-                        if desc_type == 0x22:
-                            # Unwrap data
+                        if desc_type == 0x22:  # Report Descriptor
                             if hasattr(desc_data, 'value'):
                                 desc_data = desc_data.value
 
@@ -575,8 +721,7 @@ class ClassicHIDHost:
             target_address: Expected device address (for filtering)
         """
         self._disconnection_event = asyncio.Event()
-        self._connection_received_event = asyncio.Event()  # Phase 1: BT link established
-        self._connection_ready_event = asyncio.Event()      # Phase 2: Auth done, HID registered
+        self._handshake_complete_event = asyncio.Event()
 
         await self.start()
 
@@ -586,7 +731,7 @@ class ClassicHIDHost:
             self.report_map = bytes.fromhex(cache['report_map'])
             log.success(f"Loaded cached descriptor ({len(self.report_map)} bytes)")
 
-        # Create HID Host (registers L2CAP servers on PSMs 0x11, 0x13)
+        # Create HID Host
         self.hid_host = HIDHost(self.device)
         self.hid_host.on(HIDHost.EVENT_INTERRUPT_DATA, self._on_interrupt_data)
         self.hid_host.on(HIDHost.EVENT_VIRTUAL_CABLE_UNPLUG, self._on_virtual_cable_unplug)
@@ -596,16 +741,10 @@ class ClassicHIDHost:
         self.hid_host.on(HIDHost.EVENT_EXIT_SUSPEND, lambda: log.info("[HID] Device resumed"))
         log.info(f"HID Host created (Control PSM: 0x{HID_CONTROL_PSM:04X}, Interrupt PSM: 0x{HID_INTERRUPT_PSM:04X})")
 
-        # Set up connection handler
+        # Connection handler
         async def handle_connection(connection):
             addr_str = str(connection.peer_address)
-            log.success(f"Incoming connection: {addr_str}")
-
-            # Check if device is in allowed list
-            allowed, _ = config.is_device_allowed(addr_str)
-            if not allowed:
-                log.warning(f"Ignoring {addr_str} (not in devices.conf)")
-                return
+            log.success(f"Connection established: {addr_str}")
 
             self.connection = connection
             self.current_device_address = addr_str
@@ -613,10 +752,9 @@ class ClassicHIDHost:
             # Set up disconnection handler
             connection.on('disconnection', self._on_disconnection)
 
-            # Signal that we received a connection (Phase 1)
-            self._connection_received_event.set()
+            self.state_machine.transition(HostState.AUTHENTICATING)
 
-            # Wait for device to authenticate us (don't initiate - causes collision)
+            # Wait for device to authenticate us
             auth_event = asyncio.Event()
             def on_auth():
                 log.success("Device authenticated us")
@@ -640,83 +778,39 @@ class ClassicHIDHost:
             # Register with HID host
             self.hid_host.on_device_connection(connection)
 
-            # Signal that connection is ready (Phase 2)
-            self._connection_ready_event.set()
+            # Signal handshake complete
+            self._handshake_complete_event.set()
 
-        def on_connection(connection):
-            asyncio.create_task(handle_connection(connection))
-
-        self.device.on('connection', on_connection)
-
-        # Enable Page Scan (make us connectable)
+        # Enable Page Scan
         log.info("Enabling Page Scan...")
         await self.device.host.send_command(
             HCI_Write_Scan_Enable_Command(scan_enable=0x02),
             check_result=True
         )
 
-        # Try both: active connection attempts + passive listening
-        # This handles both devices that reconnect to us and devices we need to connect to
+        # Get allowed addresses
+        devices = config.get_all_devices()
+        allowed_addresses = [addr for addr, _ in devices]
+
+        # Use ConnectionPolicy for race-free connection handling
+        self.state_machine.transition(HostState.CONNECTING)
+        policy = ConnectionPolicy(self.device, self.state_machine)
+
         log.info("Waiting for device (passive) + trying active connection...")
+        await policy.wait_for_connection(
+            allowed_addresses=allowed_addresses,
+            connection_handler=handle_connection,
+            timeout=60.0,
+            retry_interval=5.0
+        )
 
-        async def try_active_connect():
-            """Try to actively connect to allowed devices, retrying periodically."""
-            devices = config.get_all_devices()
-            retry_interval = 5.0  # Seconds between retry rounds
-
-            while True:
-                for addr, protocol in devices:
-                    if addr == '*':
-                        continue  # Can't actively connect to wildcard
-
-                    # Stop if we already have a connection
-                    if self._connection_received_event.is_set():
-                        return
-
-                    try:
-                        log.info(f"Trying to connect to {addr}...")
-                        target = Address(addr, Address.PUBLIC_DEVICE_ADDRESS)
-                        connection = await asyncio.wait_for(
-                            self.device.connect(target, transport=BT_BR_EDR_TRANSPORT),
-                            timeout=5.0
-                        )
-                        # Connection successful - handle it
-                        log.success(f"Active connection to {addr} successful")
-                        await handle_connection(connection)
-                        return
-                    except asyncio.TimeoutError:
-                        log.info(f"  {addr} not responding")
-                    except Exception as e:
-                        log.info(f"  {addr} connection failed: {e}")
-
-                # All devices tried, wait before retrying
-                if self._connection_received_event.is_set():
-                    return
-                log.info(f"Retrying active connection in {retry_interval}s...")
-                await asyncio.sleep(retry_interval)
-
-        # Start active connection task
-        active_task = asyncio.create_task(try_active_connect())
-
-        # Phase 1: Wait for any connection to come in (60s)
+        # Wait for handshake to complete
+        log.info("Connection received, waiting for handshake...")
         try:
-            await asyncio.wait_for(self._connection_received_event.wait(), timeout=60.0)
-            log.info("Connection received, waiting for handshake...")
+            await asyncio.wait_for(self._handshake_complete_event.wait(), timeout=15.0)
         except asyncio.TimeoutError:
-            log.warning("Connection timeout - no device connected")
-            raise InvalidStateError("No device connected within timeout")
-        finally:
-            active_task.cancel()
-            try:
-                await active_task
-            except asyncio.CancelledError:
-                pass
-
-        # Phase 2: Wait for auth/HID registration to complete (15s)
-        try:
-            await asyncio.wait_for(self._connection_ready_event.wait(), timeout=15.0)
-        except asyncio.TimeoutError:
-            log.warning("Handshake timeout - device connected but auth/HID registration failed")
+            log.warning("Handshake timeout")
+            self.state_machine.transition(HostState.ERROR, "Handshake timeout")
             raise InvalidStateError("Connection handshake failed")
 
         # Wait for L2CAP channels
@@ -729,6 +823,7 @@ class ClassicHIDHost:
         if self.hid_host.l2cap_intr_channel:
             log.success("HID interrupt channel connected")
         else:
+            self.state_machine.transition(HostState.ERROR, "HID channel not connected")
             raise InvalidStateError("HID channel not connected")
 
         if self.hid_host.l2cap_ctrl_channel:
@@ -736,6 +831,7 @@ class ClassicHIDHost:
 
         # If no cached descriptor, try SDP now
         if not self.report_map:
+            self.state_machine.transition(HostState.DISCOVERING_SERVICES)
             await self._query_and_cache_descriptor(self.current_device_address)
 
         # Create UHID device
@@ -745,16 +841,18 @@ class ClassicHIDHost:
 
         self._create_uhid_device()
 
+        self.state_machine.transition(HostState.CONNECTED)
         log.success(f"\n[Classic] Receiving HID reports. Press Ctrl+C to exit.")
 
         # Wait for disconnection
         await self._disconnection_event.wait()
+        self.state_machine.transition(HostState.IDLE)
 
     def _on_disconnection(self, reason):
         """Handle device disconnection."""
         log.warning(f"Device disconnected (reason={reason})")
 
-        # Reason 5 = HCI_AUTHENTICATION_FAILURE - likely stale link key
+        # Reason 5 = HCI_AUTHENTICATION_FAILURE
         if reason == 5 and self.current_device_address:
             log.info("Authentication failure - marking for key cleanup and retry")
             self._auth_failure_address = self.current_device_address
@@ -770,7 +868,6 @@ class ClassicHIDHost:
         """Handle incoming HID control data."""
         log.info(f"[HID] Control data: {len(pdu)} bytes: {pdu.hex()}")
 
-        # Parse message type
         if len(pdu) >= 1:
             msg_type = pdu[0] >> 4
             param = pdu[0] & 0x0F
@@ -785,14 +882,9 @@ class ClassicHIDHost:
         log.info(f"[HID] Handshake result: {result.name}")
 
     # --- HID Host Protocol Methods ---
-    # These leverage Bumble's HID Host class for protocol-level operations
 
     def set_protocol_mode(self, boot_mode: bool = False):
-        """Set HID protocol mode (boot or report).
-
-        Args:
-            boot_mode: True for boot protocol, False for report protocol (default)
-        """
+        """Set HID protocol mode (boot or report)."""
         if not self.hid_host or not self.hid_host.l2cap_ctrl_channel:
             log.warning("Cannot set protocol: no control channel")
             return
@@ -829,11 +921,7 @@ class ClassicHIDHost:
         log.info("Sent exit suspend command")
 
     def send_output_report(self, data: bytes):
-        """Send output report to HID device (e.g., LED state, rumble).
-
-        Args:
-            data: Report data to send
-        """
+        """Send output report to HID device."""
         if not self.hid_host or not self.hid_host.l2cap_intr_channel:
             log.warning("Cannot send output: no interrupt channel")
             return
@@ -842,13 +930,7 @@ class ClassicHIDHost:
         log.info(f"Sent output report: {data.hex()}")
 
     def get_report(self, report_type: int, report_id: int, buffer_size: int = 0):
-        """Request a specific report from the device.
-
-        Args:
-            report_type: Report type (1=input, 2=output, 3=feature)
-            report_id: Report ID
-            buffer_size: Expected report size (0 = unspecified)
-        """
+        """Request a specific report from the device."""
         if not self.hid_host or not self.hid_host.l2cap_ctrl_channel:
             log.warning("Cannot get report: no control channel")
             return
@@ -857,12 +939,7 @@ class ClassicHIDHost:
         log.info(f"Requested report type={report_type} id={report_id}")
 
     def set_report(self, report_type: int, data: bytes):
-        """Send a SET_REPORT to the device.
-
-        Args:
-            report_type: Report type (1=input, 2=output, 3=feature)
-            data: Report data including report ID
-        """
+        """Send a SET_REPORT to the device."""
         if not self.hid_host or not self.hid_host.l2cap_ctrl_channel:
             log.warning("Cannot set report: no control channel")
             return
@@ -871,7 +948,7 @@ class ClassicHIDHost:
         log.info(f"Set report type={report_type}: {data.hex()}")
 
     def virtual_cable_unplug(self):
-        """Send virtual cable unplug to device (disconnect cleanly)."""
+        """Send virtual cable unplug to device."""
         if not self.hid_host or not self.hid_host.l2cap_ctrl_channel:
             log.warning("Cannot unplug: no control channel")
             return
@@ -884,15 +961,15 @@ class ClassicHIDHost:
         if len(pdu) < 1:
             return
 
-        # Skip header byte, get report data
+        # Skip header byte
         report_data = pdu[1:]
 
-        # Log only when data changes (to reduce noise)
+        # Log only when data changes
         if report_data != self._last_report:
             log.debug(f"[HID] Report: {report_data.hex()}")
             self._last_report = report_data
 
-        # Always forward to UHID - don't filter duplicates for key repeat support
+        # Forward to UHID
         if self.uhid_device:
             try:
                 self.uhid_device.send_input(report_data)
@@ -923,111 +1000,32 @@ class ClassicHIDHost:
             log.error(f"Failed to create UHID device: {e}")
 
     def _get_fallback_descriptor(self) -> bytes:
-        """Return a generic fallback HID report descriptor.
-
-        Based on Xbox-style controller report format (15 bytes after report ID):
-        01 00 80 00 80 00 80 00 80 00 00 00 00 00 00 00
-           [1-2] [3-4] [5-6] [7-8] [9-10][11-12][13][14-15]
-            LX    LY    RX    RY    LT    RT   Dpad Buttons
-
-        Axes: 16-bit little-endian, centered at 0x8000 (32768)
-        Triggers: 16-bit LE, 0-1023 (10-bit value)
-        D-pad (byte 13): Hat switch encoded value
-          1=Up, 3=Right, 5=Down, 7=Left (odd=cardinal, even=diagonal)
-        Buttons (bytes 14-15, LE 16-bit):
-          bit 0: A, bit 1: B, bit 2: X, bit 3: Y
-          bit 4: LB, bit 5: RB, bit 6: Select, bit 7: Start
-
-        Report ID 4 (1 byte): Battery level
-        """
+        """Return a generic fallback HID report descriptor."""
         return bytes([
-            0x05, 0x01,        # Usage Page (Generic Desktop)
-            0x09, 0x05,        # Usage (Gamepad)
-            0xa1, 0x01,        # Collection (Application)
-
-            # Report ID 1: Main gamepad report (15 bytes after report ID)
-            0x85, 0x01,        #   Report ID (1)
-
-            # Bytes 0-7: 4 axes (16-bit each = 8 bytes): LX, LY, RX, RY
-            # Centered at 0x8000, range 0x0000-0xFFFF
-            0x05, 0x01,        #   Usage Page (Generic Desktop)
-            0x09, 0x30,        #   Usage (X) - Left stick X
-            0x09, 0x31,        #   Usage (Y) - Left stick Y
-            0x09, 0x32,        #   Usage (Z) - Right stick X
-            0x09, 0x35,        #   Usage (Rz) - Right stick Y
-            0x16, 0x00, 0x00,  #   Logical Minimum (0)
-            0x26, 0xff, 0xff,  #   Logical Maximum (65535)
-            0x75, 0x10,        #   Report Size (16)
-            0x95, 0x04,        #   Report Count (4)
-            0x81, 0x02,        #   Input (Data, Variable, Absolute)
-
-            # Bytes 8-11: Triggers (16-bit each = 4 bytes): LT, RT
-            # 10-bit values (0-1023), stored as 16-bit LE
-            0x05, 0x02,        #   Usage Page (Simulation Controls)
-            0x09, 0xc5,        #   Usage (Brake) - LT
-            0x09, 0xc4,        #   Usage (Accelerator) - RT
-            0x16, 0x00, 0x00,  #   Logical Minimum (0)
-            0x26, 0xff, 0x03,  #   Logical Maximum (1023)
-            0x75, 0x10,        #   Report Size (16)
-            0x95, 0x02,        #   Report Count (2)
-            0x81, 0x02,        #   Input (Data, Variable, Absolute)
-
-            # Byte 12: D-pad as hat switch
-            # Controller uses 1=Up, 3=Right, 5=Down, 7=Left, 0=Neutral
-            # By setting Logical Min=1, Max=8, value 0 becomes null (centered)
-            # and values 1,3,5,7 map to positions 0,2,4,6 (Up,Right,Down,Left)
-            0x05, 0x01,        #   Usage Page (Generic Desktop)
-            0x09, 0x39,        #   Usage (Hat Switch)
-            0x15, 0x01,        #   Logical Minimum (1)
-            0x25, 0x08,        #   Logical Maximum (8)
-            0x35, 0x00,        #   Physical Minimum (0)
-            0x46, 0x3b, 0x01,  #   Physical Maximum (315)
-            0x65, 0x14,        #   Unit (Degrees)
-            0x75, 0x08,        #   Report Size (8)
-            0x95, 0x01,        #   Report Count (1)
-            0x81, 0x42,        #   Input (Data, Variable, Null State)
-
-            # Bytes 13-14: 16 buttons (2 bytes)
-            # A=1, B=2, X=3, Y=4, LB=5, RB=6, Select=7, Start=8
-            0x05, 0x09,        #   Usage Page (Button)
-            0x19, 0x01,        #   Usage Minimum (1)
-            0x29, 0x10,        #   Usage Maximum (16)
-            0x15, 0x00,        #   Logical Minimum (0)
-            0x25, 0x01,        #   Logical Maximum (1)
-            0x75, 0x01,        #   Report Size (1)
-            0x95, 0x10,        #   Report Count (16)
-            0x81, 0x02,        #   Input (Data, Variable, Absolute)
-
-            0xc0,              # End Collection
-
-            # Report ID 4: Battery (1 byte)
-            0x05, 0x06,        # Usage Page (Generic Device Controls)
-            0x09, 0x20,        # Usage (Battery Strength)
-            0xa1, 0x01,        # Collection (Application)
-            0x85, 0x04,        #   Report ID (4)
-            0x09, 0x20,        #   Usage (Battery Strength)
-            0x15, 0x00,        #   Logical Minimum (0)
-            0x26, 0xff, 0x00,  #   Logical Maximum (255)
-            0x75, 0x08,        #   Report Size (8)
-            0x95, 0x01,        #   Report Count (1)
-            0x81, 0x02,        #   Input (Data, Variable, Absolute)
-            0xc0,              # End Collection
+            0x05, 0x01, 0x09, 0x05, 0xa1, 0x01,
+            0x85, 0x01,
+            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35,
+            0x16, 0x00, 0x00, 0x26, 0xff, 0xff, 0x75, 0x10, 0x95, 0x04, 0x81, 0x02,
+            0x05, 0x02, 0x09, 0xc5, 0x09, 0xc4,
+            0x16, 0x00, 0x00, 0x26, 0xff, 0x03, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02,
+            0x05, 0x01, 0x09, 0x39,
+            0x15, 0x01, 0x25, 0x08, 0x35, 0x00, 0x46, 0x3b, 0x01, 0x65, 0x14,
+            0x75, 0x08, 0x95, 0x01, 0x81, 0x42,
+            0x05, 0x09, 0x19, 0x01, 0x29, 0x10,
+            0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
+            0xc0,
+            0x05, 0x06, 0x09, 0x20, 0xa1, 0x01,
+            0x85, 0x04, 0x09, 0x20,
+            0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,
+            0xc0,
         ])
 
     async def clear_stale_key(self, address: str) -> bool:
-        """Clear a stale link key from the keystore.
-
-        Args:
-            address: Device address to clear key for
-
-        Returns:
-            True if key was cleared
-        """
+        """Clear a stale link key from the keystore."""
         if not self.keystore:
             return False
 
         try:
-            # Check if key exists
             keys = await self.keystore.get(address)
             if keys and keys.link_key:
                 log.info(f"Clearing stale link key for {address}")
@@ -1040,17 +1038,15 @@ class ClassicHIDHost:
             return False
 
     def get_auth_failure_address(self) -> str:
-        """Get address that had auth failure, if any.
-
-        Returns:
-            Address string or None
-        """
+        """Get address that had auth failure, if any."""
         addr = self._auth_failure_address
-        self._auth_failure_address = None  # Clear after reading
+        self._auth_failure_address = None
         return addr
 
     async def cleanup(self):
         """Clean up resources."""
+        self.state_machine.transition(HostState.DISCONNECTING)
+
         if self.uhid_device:
             try:
                 self.uhid_device.destroy()
@@ -1075,3 +1071,5 @@ class ClassicHIDHost:
 
         if self.transport:
             await self.transport.close()
+
+        self.state_machine.reset()

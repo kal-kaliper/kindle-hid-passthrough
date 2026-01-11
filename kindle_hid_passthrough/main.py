@@ -8,7 +8,7 @@ Forwards all HID reports to Linux via UHID.
 
 Usage:
     main.py                    # Run normally (connect to configured device)
-    main.py --pair             # Interactive pairing mode
+    main.py --pair             # Interactive pairing mode (scans BLE + Classic)
     main.py --daemon           # Run as daemon with auto-reconnect
     main.py --address XX:XX:XX:XX:XX:XX  # Connect to specific address
 
@@ -23,20 +23,97 @@ import os
 # Add current directory to path for imports
 sys.path.insert(0, '/mnt/us/kindle_hid_passthrough')
 
-from config import config, Protocol, create_host
+from config import config, Protocol, create_host, create_scanner
 from logging_utils import log
 
 
-async def pair_mode(protocol: Protocol):
-    """Interactive pairing mode - scan and pair with a device."""
-    log.info(f"Pairing mode ({protocol.value})")
+async def pair_mode(protocol_override: Protocol = None):
+    """Interactive pairing mode - scan BLE and Classic, then pair.
 
+    Args:
+        protocol_override: If set, only scan for this protocol (legacy mode)
+    """
+    if protocol_override:
+        log.info(f"Pairing mode ({protocol_override.value} only)")
+        await _pair_mode_legacy(protocol_override)
+    else:
+        log.info("Pairing mode (scanning BLE + Classic)")
+        await _pair_mode_unified()
+
+
+async def _pair_mode_unified():
+    """Unified pairing - scans both BLE and Classic simultaneously."""
+    scanner = create_scanner()
+
+    try:
+        await scanner.start()
+
+        log.info("Put your device in pairing mode...")
+        devices = []
+        while not devices:
+            devices = await scanner.scan(duration=10.0)
+            if not devices:
+                log.warning("No HID devices found. Scanning again...")
+                await asyncio.sleep(2)
+
+        # Show device list with protocol tags
+        print("\nFound devices:")
+        for i, dev in enumerate(devices):
+            proto_tag = "[BLE]" if dev.protocol == Protocol.BLE else "[Classic]"
+            print(f"  {i+1}. {proto_tag} {dev.name} ({dev.address})")
+
+        # Get user choice
+        selected = None
+        while True:
+            try:
+                choice = input("\nSelect device (number): ").strip()
+                idx = int(choice) - 1
+                if 0 <= idx < len(devices):
+                    selected = devices[idx]
+                    break
+                print("Invalid selection")
+            except ValueError:
+                print("Enter a number")
+            except (EOFError, KeyboardInterrupt):
+                print("\nCancelled")
+                return
+
+        log.info(f"Selected: {selected.name} ({selected.address}) [{selected.protocol.value}]")
+
+    finally:
+        await scanner.cleanup()
+
+    # Now create the appropriate host for pairing
+    host = create_host(selected.protocol)
+
+    try:
+        await host.start()
+
+        # Pair with the device
+        success = await host.pair_device(selected.address)
+
+        if success:
+            log.success(f"Paired with {selected.name}")
+
+            # Offer to save to devices.conf
+            save = input("\nSave to devices.conf? [Y/n]: ").strip().lower()
+            if save != 'n':
+                save_device_config(selected.address, selected.protocol)
+                log.success("Saved! Run without --pair to connect.")
+        else:
+            log.error("Pairing failed")
+
+    finally:
+        await host.cleanup()
+
+
+async def _pair_mode_legacy(protocol: Protocol):
+    """Legacy pairing mode - single protocol only."""
     host = create_host(protocol)
 
     try:
         await host.start()
 
-        # Both Classic and BLE use scan-and-select flow
         log.info("Put your device in pairing mode...")
         devices = []
         while not devices:
@@ -152,35 +229,39 @@ def main():
         description='Kindle HID Passthrough - Userspace Bluetooth HID host'
     )
     parser.add_argument('--pair', action='store_true',
-                        help='Interactive pairing mode')
+                        help='Interactive pairing mode (scans BLE + Classic)')
     parser.add_argument('--daemon', action='store_true',
                         help='Run as daemon with auto-reconnect')
     parser.add_argument('--address', type=str,
                         help='Device address (overrides devices.conf)')
     parser.add_argument('--protocol', type=str, choices=['ble', 'classic'],
-                        help='Bluetooth protocol (default: from config)')
+                        help='Bluetooth protocol (for --pair: scan only this; for run: override config)')
 
     args = parser.parse_args()
 
     log.info(f"Config base path: {config.base_path}")
 
-    # Determine protocol
+    # Determine protocol override
+    protocol_override = None
     if args.protocol:
-        protocol = Protocol.CLASSIC if args.protocol == 'classic' else Protocol.BLE
-    else:
-        protocol = config.protocol
+        protocol_override = Protocol.CLASSIC if args.protocol == 'classic' else Protocol.BLE
 
     # Pair mode
     if args.pair:
-        asyncio.run(pair_mode(protocol))
+        asyncio.run(pair_mode(protocol_override))
         return
 
-    # Get device address
+    # Get device address and protocol for run/daemon modes
     address = args.address
+    protocol = protocol_override or config.protocol
+
     if not address:
         device_config = config.get_device_config()
         if device_config:
             address, protocol = device_config
+            # Protocol override takes precedence
+            if protocol_override:
+                protocol = protocol_override
             log.info(f"Using device from {config.devices_config_file}: {address}")
         else:
             log.error("No device address specified. Use --address or create devices.conf")

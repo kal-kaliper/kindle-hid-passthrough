@@ -5,12 +5,14 @@ Kindle HID Passthrough - Daemon
 Persistent connection manager for Bluetooth HID devices.
 Maintains connection with auto-reconnect.
 
+Uses StateMachine for explicit state tracking.
+
 For use with init scripts / systemd.
 
 Author: Lucas Zampieri <lzampier@redhat.com>
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 import asyncio
 import logging
@@ -21,18 +23,24 @@ sys.path.insert(0, '/mnt/us/kindle_hid_passthrough')
 
 from config import config, create_host
 from logging_utils import setup_daemon_logging
+from state_machine import HostState
 
 logger = logging.getLogger(__name__)
 
 
 class HIDDaemon:
-    """Daemon that maintains persistent connection to an HID device."""
+    """Daemon that maintains persistent connection to an HID device.
+
+    Uses the host's StateMachine to track connection state and make
+    informed decisions about reconnection.
+    """
 
     def __init__(self):
         self.device_address = None
         self.protocol = None
         self.running = False
         self.host = None
+        self._last_error_reason = None
 
     def load_device(self) -> bool:
         """Load device(s) from config file."""
@@ -53,6 +61,14 @@ class HIDDaemon:
 
         return True
 
+    def _on_state_change(self, old_state: HostState, new_state: HostState):
+        """Handle host state transitions."""
+        logger.debug(f"Host state: {old_state.name} -> {new_state.name}")
+
+        if new_state == HostState.ERROR:
+            if self.host and hasattr(self.host, '_state_machine'):
+                self._last_error_reason = self.host._state_machine.error_reason
+
     async def run(self):
         """Main daemon loop."""
         self.running = True
@@ -63,9 +79,17 @@ class HIDDaemon:
         logger.info(f"HID Daemon v{__version__}")
 
         while self.running:
+            self._last_error_reason = None
+            skip_delay = False
+
             try:
                 logger.info("=== Starting connection ===")
                 self.host = create_host(self.protocol)
+
+                # Register state change listener
+                if hasattr(self.host, '_state_machine'):
+                    self.host._state_machine.add_listener(self._on_state_change)
+
                 await self.host.run(self.device_address)
 
             except asyncio.CancelledError:
@@ -75,6 +99,11 @@ class HIDDaemon:
             except Exception as e:
                 logger.error(f"Error: {e}")
 
+                # Check host state for more context
+                if self.host and hasattr(self.host, 'state'):
+                    state = self.host.state
+                    logger.debug(f"Host state at error: {state.name}")
+
             finally:
                 # Check for auth failure before cleanup
                 auth_fail_addr = None
@@ -82,6 +111,10 @@ class HIDDaemon:
                     auth_fail_addr = self.host.get_auth_failure_address()
 
                 if self.host:
+                    # Remove state listener before cleanup
+                    if hasattr(self.host, '_state_machine'):
+                        self.host._state_machine.remove_listener(self._on_state_change)
+
                     try:
                         await self.host.cleanup()
                     except Exception:
@@ -98,16 +131,16 @@ class HIDDaemon:
                     except Exception as e:
                         logger.warning(f"Failed to clear stale key: {e}")
                     logger.info("Retrying connection immediately...")
-                    self.host = None
-                    continue  # Skip the delay, retry now
+                    skip_delay = True
 
                 self.host = None
 
             if not self.running:
                 break
 
-            logger.info(f"Reconnecting in {config.reconnect_delay}s...")
-            await asyncio.sleep(config.reconnect_delay)
+            if not skip_delay:
+                logger.info(f"Reconnecting in {config.reconnect_delay}s...")
+                await asyncio.sleep(config.reconnect_delay)
 
         logger.info("Daemon stopped")
 
@@ -120,6 +153,13 @@ class HIDDaemon:
                 await self.host.cleanup()
             except Exception:
                 pass
+
+    @property
+    def host_state(self) -> HostState:
+        """Get current host state, or IDLE if no host."""
+        if self.host and hasattr(self.host, 'state'):
+            return self.host.state
+        return HostState.IDLE
 
 
 async def main():
