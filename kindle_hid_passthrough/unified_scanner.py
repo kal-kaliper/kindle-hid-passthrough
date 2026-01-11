@@ -214,7 +214,6 @@ class UnifiedScanner:
         seen_addresses = set()
 
         def on_inquiry_result(address, class_of_device, eir_data, rssi):
-            log.debug(f"Inquiry result: {address} CoD=0x{class_of_device:06X}")
             addr_str = str(address)
             if addr_str in seen_addresses:
                 return
@@ -222,12 +221,18 @@ class UnifiedScanner:
 
             # Check if HID device (Peripheral device class)
             is_hid = False
+            major_class_name = "Unknown"
             try:
-                _, major_class, _ = DeviceClass.split_class_of_device(class_of_device)
-                is_hid = DeviceClass.major_device_class_name(major_class) == "Peripheral"
+                _, major_class, minor_class = DeviceClass.split_class_of_device(class_of_device)
+                major_class_name = DeviceClass.major_device_class_name(major_class)
+                is_hid = major_class_name == "Peripheral"
             except Exception:
                 major_class = (class_of_device >> 8) & 0x1F
                 is_hid = (major_class == 0x05)  # Peripheral
+                major_class_name = f"0x{major_class:02X}"
+
+            # Log ALL devices found, not just HID
+            log.info(f"  Classic: {addr_str} CoD=0x{class_of_device:06X} ({major_class_name}) HID={is_hid}")
 
             if is_hid:
                 name = 'Unknown'
