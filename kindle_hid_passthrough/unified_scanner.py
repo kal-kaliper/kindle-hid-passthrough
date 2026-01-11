@@ -209,10 +209,12 @@ class UnifiedScanner:
 
     async def _scan_classic(self, duration: float) -> List[DiscoveredDevice]:
         """Scan for Classic Bluetooth HID devices."""
+        log.info(f"Starting Classic inquiry ({duration}s)...")
         devices_found: List[DiscoveredDevice] = []
         seen_addresses = set()
 
         def on_inquiry_result(address, class_of_device, eir_data, rssi):
+            log.debug(f"Inquiry result: {address} CoD=0x{class_of_device:06X}")
             addr_str = str(address)
             if addr_str in seen_addresses:
                 return
@@ -249,8 +251,10 @@ class UnifiedScanner:
         self.device.on('inquiry_result', on_inquiry_result)
         try:
             await self.device.start_discovery()
+            log.debug("Classic inquiry started")
             await asyncio.sleep(duration)
             await self.device.stop_discovery()
+            log.info(f"Classic inquiry complete: {len(seen_addresses)} total, {len(devices_found)} HID")
         finally:
             self.device.remove_listener('inquiry_result', on_inquiry_result)
 

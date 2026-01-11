@@ -27,22 +27,28 @@ from config import config, Protocol, create_host, create_scanner
 from logging_utils import log
 
 
-async def pair_mode(protocol_override: Protocol = None):
+async def pair_mode(protocol_override: Protocol = None, sequential: bool = False):
     """Interactive pairing mode - scan BLE and Classic, then pair.
 
     Args:
         protocol_override: If set, only scan for this protocol (legacy mode)
+        sequential: If True, scan BLE then Classic sequentially (not concurrent)
     """
     if protocol_override:
         log.info(f"Pairing mode ({protocol_override.value} only)")
         await _pair_mode_legacy(protocol_override)
     else:
-        log.info("Pairing mode (scanning BLE + Classic)")
-        await _pair_mode_unified()
+        mode = "sequentially" if sequential else "concurrently"
+        log.info(f"Pairing mode (scanning BLE + Classic {mode})")
+        await _pair_mode_unified(sequential=sequential)
 
 
-async def _pair_mode_unified():
-    """Unified pairing - scans both BLE and Classic simultaneously."""
+async def _pair_mode_unified(sequential: bool = False):
+    """Unified pairing - scans both BLE and Classic.
+
+    Args:
+        sequential: If True, scan sequentially instead of concurrently
+    """
     scanner = create_scanner()
 
     try:
@@ -51,7 +57,7 @@ async def _pair_mode_unified():
         log.info("Put your device in pairing mode...")
         devices = []
         while not devices:
-            devices = await scanner.scan(duration=10.0)
+            devices = await scanner.scan(duration=10.0, concurrent=not sequential)
             if not devices:
                 log.warning("No HID devices found. Scanning again...")
                 await asyncio.sleep(2)
@@ -236,6 +242,8 @@ def main():
                         help='Device address (overrides devices.conf)')
     parser.add_argument('--protocol', type=str, choices=['ble', 'classic'],
                         help='Bluetooth protocol (for --pair: scan only this; for run: override config)')
+    parser.add_argument('--sequential', action='store_true',
+                        help='Scan BLE and Classic sequentially instead of concurrently')
 
     args = parser.parse_args()
 
@@ -248,7 +256,7 @@ def main():
 
     # Pair mode
     if args.pair:
-        asyncio.run(pair_mode(protocol_override))
+        asyncio.run(pair_mode(protocol_override, sequential=args.sequential))
         return
 
     # Get device address and protocol for run/daemon modes
