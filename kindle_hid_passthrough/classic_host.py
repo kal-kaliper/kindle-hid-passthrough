@@ -13,7 +13,7 @@ __version__ = "2.1.0"
 
 import asyncio
 import logging
-from typing import Optional, List, Dict
+from typing import Optional, List
 
 from bumble.device import Device
 from bumble.hci import (
@@ -358,98 +358,15 @@ class ClassicHIDHost:
             return result
         self.device.host.link_key_provider = debug_get_link_key
 
-    async def scan(self, duration: float = 10.0) -> List[Dict]:
-        """Scan for Classic Bluetooth HID devices.
-
-        Args:
-            duration: Scan duration in seconds
-
-        Returns:
-            List of HID device dicts with address, name, rssi
-        """
-        self.state_machine.transition(HostState.SCANNING)
-
-        log.info(f"Scanning for Classic BT devices ({duration}s)...")
-
-        devices_found = []
-        seen_addresses = set()
-
-        def on_inquiry_result(address, class_of_device, eir_data, rssi):
-            addr_str = str(address)
-            if addr_str in seen_addresses:
-                return
-            seen_addresses.add(addr_str)
-
-            # Check if HID device (Peripheral class)
-            is_hid = False
-            try:
-                _, major_class, _ = DeviceClass.split_class_of_device(class_of_device)
-                is_hid = DeviceClass.major_device_class_name(major_class) == "Peripheral"
-            except Exception:
-                major_class = (class_of_device >> 8) & 0x1F
-                is_hid = (major_class == 0x05)
-
-            if is_hid:
-                name = 'Unknown'
-                if eir_data:
-                    try:
-                        name_data = eir_data.get(0x09) or eir_data.get(0x08)
-                        if name_data:
-                            name = name_data.decode('utf-8', errors='replace') if isinstance(name_data, bytes) else str(name_data)
-                    except Exception:
-                        pass
-
-                devices_found.append({
-                    'address': addr_str,
-                    'name': name,
-                    'rssi': rssi or -100,
-                })
-                log.info(f"  Found: {name} ({addr_str})")
-
-        self.device.on('inquiry_result', on_inquiry_result)
-        try:
-            await self.device.start_discovery()
-            await asyncio.sleep(duration)
-            await self.device.stop_discovery()
-        finally:
-            self.device.remove_listener('inquiry_result', on_inquiry_result)
-
-        # Get names for unknown devices
-        for dev in devices_found:
-            if dev['name'] == 'Unknown':
-                try:
-                    name = await asyncio.wait_for(
-                        self.device.request_remote_name(Address(dev['address'], Address.PUBLIC_DEVICE_ADDRESS)),
-                        timeout=3.0
-                    )
-                    if name:
-                        dev['name'] = name
-                except Exception:
-                    pass
-
-        log.success(f"Found {len(devices_found)} HID devices")
-        self.state_machine.transition(HostState.IDLE)
-        return devices_found
-
     async def pair_device(self, address: str) -> bool:
-        """Pair with a device - scan, connect, and authenticate.
+        """Pair with a device - connect and authenticate.
 
         Args:
-            address: Device address to pair with (if None, scan first)
+            address: Device address to pair with
 
         Returns:
             True if pairing successful
         """
-        # If no address provided, scan for devices first
-        if not address:
-            log.info("Scanning for HID devices...")
-            devices = await self.scan(duration=10.0)
-            if not devices:
-                log.error("No HID devices found")
-                return False
-
-            address = devices[0]['address']
-            log.info(f"Found device: {devices[0]['name']} ({address})")
 
         self.state_machine.transition(HostState.CONNECTING)
         log.info(f"Connecting to {address} for pairing...")

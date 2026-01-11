@@ -13,7 +13,7 @@ __version__ = "2.1.0"
 
 import asyncio
 import logging
-from typing import Optional, List, Dict
+from typing import Optional
 
 from bumble.device import Device, Peer
 from bumble.hci import Address, HCI_Reset_Command, OwnAddressType
@@ -31,7 +31,7 @@ from bumble.gatt import (
     GATT_BOOT_KEYBOARD_OUTPUT_REPORT_CHARACTERISTIC,
 )
 from bumble.transport import open_transport
-from bumble.core import AdvertisingData, InvalidStateError, ProtocolError
+from bumble.core import InvalidStateError, ProtocolError
 
 from config import config
 from logging_utils import log
@@ -152,65 +152,6 @@ class BLEHIDHost:
 
         await self.device.power_on()
         log.success(f"Device powered on: {self.device.public_address}")
-
-    async def scan(self, duration: float = 10.0) -> List[Dict]:
-        """Scan for BLE HID devices.
-
-        Args:
-            duration: Scan duration in seconds
-
-        Returns:
-            List of HID device dicts with address, name, rssi
-        """
-        self._state_machine.transition(HostState.SCANNING)
-        log.info(f"Scanning for BLE devices ({duration}s)...")
-
-        devices_found = []
-        seen_addresses = set()
-
-        def on_advertisement(advertisement):
-            addr_str = str(advertisement.address)
-            if addr_str in seen_addresses:
-                return
-            seen_addresses.add(addr_str)
-
-            # Check for HID service
-            is_hid = False
-            if hasattr(advertisement, 'data') and advertisement.data:
-                services = advertisement.data.get(
-                    AdvertisingData.COMPLETE_LIST_OF_16_BIT_SERVICE_CLASS_UUIDS
-                ) or advertisement.data.get(
-                    AdvertisingData.INCOMPLETE_LIST_OF_16_BIT_SERVICE_CLASS_UUIDS
-                )
-                if services:
-                    for service_uuid in services:
-                        if service_uuid == GATT_HUMAN_INTERFACE_DEVICE_SERVICE:
-                            is_hid = True
-                            break
-
-            if is_hid:
-                name = 'Unknown'
-                if hasattr(advertisement, 'data') and advertisement.data:
-                    name = advertisement.data.get(AdvertisingData.COMPLETE_LOCAL_NAME) or \
-                           advertisement.data.get(AdvertisingData.SHORTENED_LOCAL_NAME) or 'Unknown'
-                    if isinstance(name, bytes):
-                        name = name.decode('utf-8', errors='replace')
-
-                devices_found.append({
-                    'address': addr_str,
-                    'name': name,
-                    'rssi': advertisement.rssi,
-                })
-                log.info(f"  Found: {name} ({addr_str})")
-
-        self.device.on('advertisement', on_advertisement)
-        await self.device.start_scanning(filter_duplicates=True)
-        await asyncio.sleep(duration)
-        await self.device.stop_scanning()
-
-        self._state_machine.transition(HostState.IDLE)
-        log.success(f"Found {len(devices_found)} HID devices")
-        return devices_found
 
     async def pair_device(self, address: str) -> bool:
         """Pair with a device (first-time setup).
