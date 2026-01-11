@@ -101,11 +101,9 @@ async def _pair_mode_unified(sequential: bool = False):
         if success:
             log.success(f"Paired with {selected.name}")
 
-            # Offer to save to devices.conf
-            save = input("\nSave to devices.conf? [Y/n]: ").strip().lower()
-            if save != 'n':
-                save_device_config(selected.address, selected.protocol)
-                log.success("Saved! Run without --pair to connect.")
+            # Auto-save to devices.conf
+            save_device_config(selected.address, selected.protocol)
+            log.success("Saved to devices.conf. Run without --pair to connect.")
         else:
             log.error("Pairing failed")
 
@@ -156,11 +154,9 @@ async def _pair_mode_legacy(protocol: Protocol):
         if success:
             log.success(f"Paired with {selected['name']}")
 
-            # Offer to save to devices.conf
-            save = input("\nSave to devices.conf? [Y/n]: ").strip().lower()
-            if save != 'n':
-                save_device_config(selected['address'], protocol)
-                log.success("Saved! Run without --pair to connect.")
+            # Auto-save to devices.conf
+            save_device_config(selected['address'], protocol)
+            log.success("Saved to devices.conf. Run without --pair to connect.")
         else:
             log.error("Pairing failed")
 
@@ -169,7 +165,7 @@ async def _pair_mode_legacy(protocol: Protocol):
 
 
 def save_device_config(address: str, protocol: Protocol):
-    """Save device address to devices.conf."""
+    """Save device address to devices.conf (appends, avoids duplicates)."""
     conf_file = config.devices_config_file
     log.info(f"Saving to: {conf_file}")
 
@@ -178,11 +174,27 @@ def save_device_config(address: str, protocol: Protocol):
     if dir_path:
         os.makedirs(dir_path, exist_ok=True)
 
+    # Normalize address for comparison
+    addr_norm = address.split('/')[0].upper()
+
+    # Check if already exists
+    existing_devices = config.get_all_devices()
+    for existing_addr, _ in existing_devices:
+        if existing_addr.split('/')[0].upper() == addr_norm:
+            log.info(f"Device {address} already in devices.conf")
+            return
+
     try:
-        with open(conf_file, 'w') as f:
-            f.write(f"# Device address and protocol\n")
+        # Create file with header if it doesn't exist
+        if not os.path.exists(conf_file):
+            with open(conf_file, 'w') as f:
+                f.write("# Device addresses and protocols\n")
+                f.write("# Format: ADDRESS [ble|classic]\n")
+
+        # Append new device
+        with open(conf_file, 'a') as f:
             f.write(f"{address} {protocol.value}\n")
-        log.info(f"Written: {address} {protocol.value}")
+        log.info(f"Added: {address} {protocol.value}")
     except Exception as e:
         log.error(f"Failed to save: {e}")
 

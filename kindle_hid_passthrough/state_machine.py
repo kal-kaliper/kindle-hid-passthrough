@@ -64,6 +64,8 @@ class StateMachine:
         (HostState.AUTHENTICATING, HostState.DISCOVERING_SERVICES),
         (HostState.AUTHENTICATING, HostState.CONNECTED),  # Cached services
         (HostState.AUTHENTICATING, HostState.ERROR),
+        (HostState.AUTHENTICATING, HostState.IDLE),  # Auth failure/disconnect
+        (HostState.AUTHENTICATING, HostState.DISCONNECTING),  # Cleanup during auth
 
         # Service discovery
         (HostState.DISCOVERING_SERVICES, HostState.CONNECTED),

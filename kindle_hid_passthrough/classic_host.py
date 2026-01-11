@@ -94,7 +94,6 @@ class ConnectionPolicy:
         # Register connection handler (passive path)
         async def on_passive_connection(connection):
             addr_str = str(connection.peer_address)
-            log.info(f"Passive connection from: {addr_str}")
 
             # Check if device is allowed
             allowed, _ = config.is_device_allowed(addr_str)
@@ -105,11 +104,20 @@ class ConnectionPolicy:
             # Handle the connection
             await connection_handler(connection)
 
-            # Set future if not already done
+            # Set future result (should already be set by sync handler, but ensure)
             if not self._connection_future.done():
                 self._connection_future.set_result(connection)
 
         def on_connection_sync(connection):
+            addr_str = str(connection.peer_address)
+            log.info(f"Passive connection from: {addr_str}")
+
+            # Set future IMMEDIATELY to stop active connection attempts
+            # (before async handling runs)
+            allowed, _ = config.is_device_allowed(addr_str)
+            if allowed and not self._connection_future.done():
+                self._connection_future.set_result(connection)
+
             asyncio.create_task(on_passive_connection(connection))
 
         self.device.on('connection', on_connection_sync)
@@ -768,9 +776,29 @@ class ClassicHIDHost:
 
             log.info("Waiting for device authentication...")
             try:
-                await asyncio.wait_for(auth_event.wait(), timeout=5.0)
+                # Wait for either auth or disconnection
+                auth_task = asyncio.create_task(auth_event.wait())
+                disconnect_task = asyncio.create_task(self._disconnection_event.wait())
+                done, pending = await asyncio.wait(
+                    [auth_task, disconnect_task],
+                    timeout=5.0,
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+
+                if self._disconnection_event.is_set():
+                    log.warning("Device disconnected during authentication")
+                    connection.remove_listener('connection_authentication', on_auth)
+                    connection.remove_listener('connection_authentication_failure', on_auth_fail)
+                    return  # Don't signal handshake complete
             except asyncio.TimeoutError:
                 log.warning("No auth request from device, continuing...")
+
+            # Check again if disconnected
+            if self._disconnection_event.is_set():
+                log.warning("Device disconnected, aborting handshake")
+                return
 
             connection.remove_listener('connection_authentication', on_auth)
             connection.remove_listener('connection_authentication_failure', on_auth_fail)
@@ -788,9 +816,30 @@ class ClassicHIDHost:
             check_result=True
         )
 
-        # Get allowed addresses
+        # Get allowed addresses from devices.conf
         devices = config.get_all_devices()
         allowed_addresses = [addr for addr, _ in devices]
+
+        # Also include addresses from keystore for active connection attempts
+        # This helps when using wildcard (*) or when keystore has more devices
+        if self.keystore:
+            try:
+                keystore_addresses = set()
+                # Get all keys from keystore
+                keys = await self.keystore.get_all()
+                if keys:
+                    for addr_str in keys.keys():
+                        # Normalize address (remove /P suffix for comparison)
+                        norm_addr = addr_str.split('/')[0].upper()
+                        keystore_addresses.add(addr_str)
+                    # Add keystore addresses not already in allowed list
+                    for ks_addr in keystore_addresses:
+                        norm_ks = ks_addr.split('/')[0].upper()
+                        if not any(a.split('/')[0].upper() == norm_ks for a in allowed_addresses if a != '*'):
+                            allowed_addresses.append(ks_addr)
+                            log.info(f"Adding keystore address: {ks_addr}")
+            except Exception as e:
+                log.debug(f"Could not get keystore addresses: {e}")
 
         # Use ConnectionPolicy for race-free connection handling
         self.state_machine.transition(HostState.CONNECTING)
@@ -804,10 +853,23 @@ class ClassicHIDHost:
             retry_interval=5.0
         )
 
-        # Wait for handshake to complete
+        # Wait for handshake to complete (or disconnection)
         log.info("Connection received, waiting for handshake...")
         try:
-            await asyncio.wait_for(self._handshake_complete_event.wait(), timeout=15.0)
+            handshake_task = asyncio.create_task(self._handshake_complete_event.wait())
+            disconnect_task = asyncio.create_task(self._disconnection_event.wait())
+            done, pending = await asyncio.wait(
+                [handshake_task, disconnect_task],
+                timeout=15.0,
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+
+            if self._disconnection_event.is_set() and not self._handshake_complete_event.is_set():
+                log.warning("Device disconnected during handshake (auth failure?)")
+                self.state_machine.transition(HostState.IDLE)
+                raise InvalidStateError("Device disconnected during handshake")
         except asyncio.TimeoutError:
             log.warning("Handshake timeout")
             self.state_machine.transition(HostState.ERROR, "Handshake timeout")
@@ -854,10 +916,22 @@ class ClassicHIDHost:
 
         # Reason 5 = HCI_AUTHENTICATION_FAILURE
         if reason == 5 and self.current_device_address:
-            log.info("Authentication failure - marking for key cleanup and retry")
+            log.info("Authentication failure - clearing stale key immediately")
             self._auth_failure_address = self.current_device_address
+            # Schedule async key cleanup
+            asyncio.create_task(self._clear_stale_key_now())
 
         self._disconnection_event.set()
+
+    async def _clear_stale_key_now(self):
+        """Clear stale key immediately on auth failure."""
+        if self._auth_failure_address:
+            addr = self._auth_failure_address
+            success = await self.clear_stale_key(addr)
+            if success:
+                log.success(f"Cleared stale key for {addr}")
+            else:
+                log.warning(f"Failed to clear key for {addr}")
 
     def _on_virtual_cable_unplug(self):
         """Handle virtual cable unplug."""
@@ -1045,7 +1119,12 @@ class ClassicHIDHost:
 
     async def cleanup(self):
         """Clean up resources."""
-        self.state_machine.transition(HostState.DISCONNECTING)
+        # Only transition to DISCONNECTING from connected states
+        if self.state_machine.state in (HostState.CONNECTED, HostState.AUTHENTICATING,
+                                         HostState.DISCOVERING_SERVICES):
+            self.state_machine.transition(HostState.DISCONNECTING)
+        elif self.state_machine.state not in (HostState.IDLE, HostState.DISCONNECTING):
+            self.state_machine.reset()
 
         if self.uhid_device:
             try:
