@@ -12,7 +12,6 @@ Author: Lucas Zampieri <lzampier@redhat.com>
 __version__ = "2.1.0"
 
 import asyncio
-import logging
 from typing import Optional
 
 from bumble.device import Device, Peer
@@ -74,7 +73,7 @@ class BLEHIDHost:
         self.peer = None
 
         # State machine
-        self._state_machine = StateMachine()
+        self.state_machine = StateMachine()
 
         # Device state
         self.current_device_address = None
@@ -104,16 +103,16 @@ class BLEHIDHost:
     @property
     def state(self) -> HostState:
         """Current host state."""
-        return self._state_machine.state
+        return self.state_machine.state
 
     @property
     def is_connected(self) -> bool:
         """Check if currently connected."""
-        return self._state_machine.is_connected
+        return self.state_machine.is_connected
 
     async def start(self):
         """Initialize the Bumble device and BLE stack."""
-        self._state_machine.transition(HostState.STARTING)
+        self.state_machine.transition(HostState.STARTING)
 
         log.info(f"BLE HID Host v{__version__}")
         log.info("Opening transport...")
@@ -124,7 +123,7 @@ class BLEHIDHost:
                 timeout=config.transport_timeout
             )
         except asyncio.TimeoutError:
-            self._state_machine.transition(HostState.ERROR, "Transport timeout")
+            self.state_machine.transition(HostState.ERROR, "Transport timeout")
             log.error(f"Transport open timed out after {config.transport_timeout}s")
             raise
 
@@ -146,7 +145,7 @@ class BLEHIDHost:
             )
             log.success("HCI Reset successful")
         except asyncio.TimeoutError:
-            self._state_machine.transition(HostState.ERROR, "HCI Reset timeout")
+            self.state_machine.transition(HostState.ERROR, "HCI Reset timeout")
             log.error("HCI Reset timed out")
             raise
 
@@ -162,7 +161,7 @@ class BLEHIDHost:
         Returns:
             True if pairing successful
         """
-        self._state_machine.transition(HostState.CONNECTING)
+        self.state_machine.transition(HostState.CONNECTING)
         log.info(f"Pairing with {address}...")
 
         target = Address(address)
@@ -175,7 +174,7 @@ class BLEHIDHost:
                 timeout=config.connect_timeout,
             )
         except Exception as e:
-            self._state_machine.transition(HostState.ERROR, f"Connection failed: {e}")
+            self.state_machine.transition(HostState.ERROR, f"Connection failed: {e}")
             log.error(f"Connection failed: {e}")
             return False
 
@@ -183,19 +182,19 @@ class BLEHIDHost:
         log.success(f"Connected to {address}")
 
         try:
-            self._state_machine.transition(HostState.AUTHENTICATING)
+            self.state_machine.transition(HostState.AUTHENTICATING)
             log.info("Initiating pairing...")
             await self.connection.pair()
             log.success("Pairing complete!")
 
             # Discover and cache HID data
-            self._state_machine.transition(HostState.DISCOVERING_SERVICES)
+            self.state_machine.transition(HostState.DISCOVERING_SERVICES)
             await self._discover_and_cache_hid(address)
 
-            self._state_machine.transition(HostState.IDLE)
+            self.state_machine.transition(HostState.IDLE)
             return True
         except Exception as e:
-            self._state_machine.transition(HostState.ERROR, f"Pairing failed: {e}")
+            self.state_machine.transition(HostState.ERROR, f"Pairing failed: {e}")
             log.error(f"Pairing failed: {e}")
             return False
         finally:
@@ -279,7 +278,7 @@ class BLEHIDHost:
                 self.device_name = cache['device_name']
 
         # Connect
-        self._state_machine.transition(HostState.CONNECTING)
+        self.state_machine.transition(HostState.CONNECTING)
         log.info(f"Connecting to {target_address}...")
         target = Address(target_address)
         try:
@@ -288,7 +287,7 @@ class BLEHIDHost:
                 timeout=config.connect_timeout
             )
         except asyncio.TimeoutError:
-            self._state_machine.transition(HostState.ERROR, "Connection timeout")
+            self.state_machine.transition(HostState.ERROR, "Connection timeout")
             raise ProtocolError(f"Connection timeout after {config.connect_timeout}s")
 
         self.peer = Peer(self.connection)
@@ -299,16 +298,16 @@ class BLEHIDHost:
         self.connection.on('disconnection', self._on_disconnection)
 
         # Restore bonding or pair
-        self._state_machine.transition(HostState.AUTHENTICATING)
+        self.state_machine.transition(HostState.AUTHENTICATING)
         await self._restore_or_pair()
 
         # Discover HID service
-        self._state_machine.transition(HostState.DISCOVERING_SERVICES)
+        self.state_machine.transition(HostState.DISCOVERING_SERVICES)
         await self._discover_hid_service()
 
         # Create UHID device
         if not self.report_map:
-            self._state_machine.transition(HostState.ERROR, "No report descriptor")
+            self.state_machine.transition(HostState.ERROR, "No report descriptor")
             raise InvalidStateError("No report descriptor available")
 
         self._create_uhid_device()
@@ -316,7 +315,7 @@ class BLEHIDHost:
         # Subscribe to reports
         await self._subscribe_to_reports()
 
-        self._state_machine.transition(HostState.CONNECTED)
+        self.state_machine.transition(HostState.CONNECTED)
         log.success(f"\n[BLE] Receiving HID reports. Press Ctrl+C to exit.")
 
         # Wait for disconnection
@@ -325,7 +324,7 @@ class BLEHIDHost:
     def _on_disconnection(self, reason):
         """Handle device disconnection."""
         log.warning(f"Device disconnected (reason={reason})")
-        self._state_machine.transition(HostState.IDLE)
+        self.state_machine.transition(HostState.IDLE)
         self._disconnection_event.set()
 
     async def _restore_or_pair(self):
@@ -443,7 +442,7 @@ class BLEHIDHost:
 
     async def cleanup(self):
         """Clean up resources."""
-        self._state_machine.transition(HostState.DISCONNECTING)
+        self.state_machine.transition(HostState.DISCONNECTING)
 
         if self.uhid_device:
             try:
@@ -452,16 +451,22 @@ class BLEHIDHost:
                 pass
             self.uhid_device = None
 
-        if self.connection:
+        # Check if HCI connection is still valid before disconnecting
+        connection_alive = (self.connection is not None and
+                           hasattr(self.connection, 'handle') and
+                           self.connection.handle is not None)
+
+        if connection_alive:
             try:
                 await self.connection.disconnect()
             except Exception:
                 pass
+        self.connection = None
 
         if self.transport:
             await self.transport.close()
 
-        self._state_machine.reset()
+        self.state_machine.reset()
 
     async def wait_for_state(self, *states: HostState, timeout: float = None) -> HostState:
         """Wait until host reaches one of the specified states.
@@ -473,4 +478,4 @@ class BLEHIDHost:
         Returns:
             The state that was reached
         """
-        return await self._state_machine.wait_for(*states, timeout=timeout)
+        return await self.state_machine.wait_for(*states, timeout=timeout)

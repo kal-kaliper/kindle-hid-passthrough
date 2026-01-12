@@ -40,7 +40,6 @@ class HIDDaemon:
         self.protocol = None
         self.running = False
         self.host = None
-        self._last_error_reason = None
 
     def load_device(self) -> bool:
         """Load device(s) from config file."""
@@ -67,10 +66,6 @@ class HIDDaemon:
         """Handle host state transitions."""
         logger.debug(f"Host state: {old_state.name} -> {new_state.name}")
 
-        if new_state == HostState.ERROR:
-            if self.host and hasattr(self.host, '_state_machine'):
-                self._last_error_reason = self.host._state_machine.error_reason
-
     async def run(self):
         """Main daemon loop."""
         self.running = True
@@ -81,7 +76,6 @@ class HIDDaemon:
         logger.info(f"HID Daemon v{__version__}")
 
         while self.running:
-            self._last_error_reason = None
             skip_delay = False
 
             try:
@@ -89,8 +83,8 @@ class HIDDaemon:
                 self.host = create_host(self.protocol)
 
                 # Register state change listener
-                if hasattr(self.host, '_state_machine'):
-                    self.host._state_machine.add_listener(self._on_state_change)
+                if hasattr(self.host, 'state_machine'):
+                    self.host.state_machine.add_listener(self._on_state_change)
 
                 await self.host.run(self.device_address)
 
@@ -114,8 +108,8 @@ class HIDDaemon:
 
                 if self.host:
                     # Remove state listener before cleanup
-                    if hasattr(self.host, '_state_machine'):
-                        self.host._state_machine.remove_listener(self._on_state_change)
+                    if hasattr(self.host, 'state_machine'):
+                        self.host.state_machine.remove_listener(self._on_state_change)
 
                     try:
                         await self.host.cleanup()

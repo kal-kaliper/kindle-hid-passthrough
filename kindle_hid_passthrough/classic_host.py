@@ -12,8 +12,7 @@ Author: Lucas Zampieri <lzampier@redhat.com>
 __version__ = "2.1.0"
 
 import asyncio
-import logging
-from typing import Optional, List
+from typing import Optional
 
 from bumble.device import Device
 from bumble.hci import (
@@ -31,18 +30,11 @@ from bumble.hid import (
     HID_INTERRUPT_PSM,
 )
 from bumble.core import (
-    DeviceClass,
     BT_BR_EDR_TRANSPORT,
     BT_HUMAN_INTERFACE_DEVICE_SERVICE,
     InvalidStateError,
-    ProtocolError,
 )
-from bumble.sdp import (
-    Client as SDPClient,
-    SDP_SERVICE_RECORD_HANDLE_ATTRIBUTE_ID,
-    SDP_SERVICE_CLASS_ID_LIST_ATTRIBUTE_ID,
-    SDP_PROTOCOL_DESCRIPTOR_LIST_ATTRIBUTE_ID,
-)
+from bumble.sdp import Client as SDPClient
 
 from config import config
 from logging_utils import log
@@ -54,35 +46,56 @@ __all__ = ['ClassicHIDHost', '__version__']
 
 
 class ConnectionPolicy:
-    """Unified connection policy - eliminates active/passive race condition.
+    """Hybrid connection policy supporting both passive and active connections.
 
-    Uses asyncio.Future as single source of truth:
-    - Passive path (page scan) sets the future via connection event
-    - Active path checks future.done() before each attempt
-    - No window for race condition
+    Runs both concurrently:
+    - Passive: Page scan enabled, accepts incoming connections (Xbox-style devices)
+    - Active: Periodically attempts to connect to known addresses (Nintendo-style devices)
+
+    First successful connection wins. This handles devices that:
+    - Initiate connection themselves (Xbox controller)
+    - Wait for host to connect (Nintendo Pro Controller)
     """
 
-    def __init__(self, device: Device, state_machine: StateMachine, keystore=None):
+    # How long to wait before starting active connection attempts
+    ACTIVE_DELAY = 2.0  # Short delay, then start trying
+
+    # Interval between active connection attempt rounds
+    ACTIVE_RETRY_INTERVAL = 5.0
+
+    # Timeout for each active connection attempt (in 0.5s increments)
+    # 10 * 0.5s = 5 seconds per device
+    ACTIVE_CONNECT_TIMEOUT = 10
+
+    def __init__(self, device: Device, keystore=None):
         self.device = device
-        self.state_machine = state_machine
         self.keystore = keystore
-        self._connection_future: Optional[asyncio.Future] = None
-        self._keystore_addresses: set = set()  # Cached for sync access
+        self._keystore_addresses: set = set()
+        self._address_names: dict = {}
+        self._active_task = None
+
+    def _format_device(self, addr: str) -> str:
+        """Format device address with name if available."""
+        norm = addr.split('/')[0].upper()
+        name = self._address_names.get(norm)
+        return f"{name} ({addr})" if name else addr
 
     async def wait_for_connection(
         self,
-        allowed_addresses: List[str],
         connection_handler,
         timeout: float = 60.0,
-        retry_interval: float = 5.0
+        address_names: dict = None
     ):
-        """Wait for connection using coordinated active+passive approach.
+        """Wait for device to connect (hybrid: passive + active).
+
+        Runs both concurrently:
+        - Passive: Page scan accepts incoming connections
+        - Active: Attempts to connect to known paired devices
 
         Args:
-            allowed_addresses: List of allowed device addresses (* = wildcard)
-            connection_handler: Async callback for handling connections
-            timeout: Total timeout for connection
-            retry_interval: Seconds between active connection retry rounds
+            connection_handler: Async callback for handling the connection
+            timeout: Maximum time to wait for connection
+            address_names: Optional dict mapping normalized address -> device name
 
         Returns:
             Connection object
@@ -90,42 +103,63 @@ class ConnectionPolicy:
         Raises:
             InvalidStateError: If no connection within timeout
         """
-        # Create future that will hold the connection
-        self._connection_future = asyncio.get_event_loop().create_future()
+        self._address_names = address_names or {}
 
-        # Pre-load keystore addresses for sync access
+        # Pre-load keystore addresses for active connection attempts
         self._keystore_addresses = set()
+        active_addresses = []  # Addresses to try active connection
         if self.keystore:
             try:
                 keys = await self.keystore.get_all()
                 if keys:
                     for entry in keys:
-                        # Entry is (address, key_data) tuple or similar
                         addr = str(entry[0]) if isinstance(entry, (list, tuple)) else str(entry)
-                        norm = addr.split('/')[0].upper()
-                        self._keystore_addresses.add(norm)
-                    log.info(f"Keystore addresses: {self._keystore_addresses}")
+                        norm_addr = addr.split('/')[0].upper()
+                        self._keystore_addresses.add(norm_addr)
+                        # Only add for active if it's a valid address (not wildcard)
+                        if norm_addr != '*':
+                            active_addresses.append(norm_addr)
             except Exception as e:
                 log.warning(f"Failed to load keystore: {e}")
+
+        # Prioritize the configured device (from devices.conf) for active connections
+        devices = config.get_all_devices()
+        priority_addresses = []
+        for addr, _, name in devices:
+            if addr != '*':
+                norm = addr.split('/')[0].upper()
+                if norm in self._keystore_addresses and norm not in priority_addresses:
+                    priority_addresses.append(norm)
+                    log.info(f"Priority device for active: {self._format_device(norm)}")
+
+        # Reorder: priority devices first, then remaining keystore devices
+        remaining = [a for a in active_addresses if a not in priority_addresses]
+        active_addresses = priority_addresses + remaining
+
+        if active_addresses:
+            log.info(f"Active connection order: {len(active_addresses)} device(s)")
+
+        # Future to signal when connection is handled - single source of truth
+        connection_future = asyncio.get_event_loop().create_future()
 
         def is_allowed(addr_str: str) -> bool:
             """Check if address is allowed (devices.conf OR has link key)."""
             allowed, _ = config.is_device_allowed(addr_str)
             if allowed:
                 return True
-            # Also accept if device has a link key (previously paired)
             norm_addr = addr_str.split('/')[0].upper()
             if norm_addr in self._keystore_addresses:
-                log.info(f"Accepting {addr_str} (has link key from previous pairing)")
+                log.info(f"Accepting {self._format_device(addr_str)} (has link key)")
                 return True
             return False
 
-        # Register connection handler (passive path)
-        async def on_passive_connection(connection):
+        async def on_connection(connection):
+            """Handle incoming connection (passive path)."""
             addr_str = str(connection.peer_address)
+            log.info(f"[Passive] Device connected: {self._format_device(addr_str)}")
 
             if not is_allowed(addr_str):
-                log.warning(f"Rejecting {addr_str} (not in devices.conf, no link key)")
+                log.warning(f"Rejecting {self._format_device(addr_str)} (not allowed)")
                 try:
                     await connection.disconnect()
                 except Exception:
@@ -135,99 +169,146 @@ class ConnectionPolicy:
             # Handle the connection
             await connection_handler(connection)
 
-            # Set future result (should already be set by sync handler, but ensure)
-            if not self._connection_future.done():
-                self._connection_future.set_result(connection)
+            # Signal completion
+            if not connection_future.done():
+                connection_future.set_result(connection)
 
-        def on_connection_sync(connection):
-            addr_str = str(connection.peer_address)
-            log.info(f"Passive connection from: {addr_str}")
+        def on_connection_event(connection):
+            asyncio.create_task(on_connection(connection))
 
-            # Set future IMMEDIATELY to stop active connection attempts
-            if is_allowed(addr_str) and not self._connection_future.done():
-                self._connection_future.set_result(connection)
+        # Register passive connection handler
+        self.device.on('connection', on_connection_event)
 
-            asyncio.create_task(on_passive_connection(connection))
-
-        self.device.on('connection', on_connection_sync)
-
-        # Start active connection task if we have specific addresses
-        active_task = None
-        specific_addresses = [a for a in allowed_addresses if a != '*']
-        if specific_addresses:
-            active_task = asyncio.create_task(
-                self._try_active_connects(
-                    specific_addresses,
+        # Start active connection task if we have addresses to try
+        if active_addresses:
+            self._active_task = asyncio.create_task(
+                self._active_connect_loop(
+                    active_addresses,
                     connection_handler,
-                    retry_interval
+                    connection_future
                 )
             )
+            log.info(f"[Hybrid] Passive (page scan) + Active (connecting to {len(active_addresses)} device(s))")
+        else:
+            log.info("[Passive] Waiting for device to connect...")
 
         try:
-            # Wait for either passive or active to succeed
-            connection = await asyncio.wait_for(
-                self._connection_future,
-                timeout=timeout
-            )
-            return connection
-
+            return await asyncio.wait_for(connection_future, timeout=timeout)
         except asyncio.TimeoutError:
             log.warning("Connection timeout - no device connected")
             raise InvalidStateError("No device connected within timeout")
-
         finally:
-            # Clean up
-            if active_task:
-                active_task.cancel()
+            # Cancel active task if still running
+            if self._active_task and not self._active_task.done():
+                self._active_task.cancel()
                 try:
-                    await active_task
+                    await self._active_task
                 except asyncio.CancelledError:
                     pass
-            self.device.remove_listener('connection', on_connection_sync)
+                self._active_task = None
+            self.device.remove_listener('connection', on_connection_event)
 
-    async def _try_active_connects(
+    async def _active_connect_loop(
         self,
-        addresses: List[str],
+        addresses: list,
         connection_handler,
-        retry_interval: float
+        connection_future: asyncio.Future
     ):
-        """Try active connects, checking future before each attempt."""
-        while not self._connection_future.done():
+        """Actively try to connect to known devices.
+
+        Runs in parallel with passive page scan. First success wins.
+
+        Args:
+            addresses: List of addresses to try
+            connection_handler: Async callback for handling the connection
+            connection_future: Future to complete when connected
+        """
+        # Give passive mode a head start
+        log.info(f"[Active] Waiting {self.ACTIVE_DELAY}s before starting active attempts...")
+        await asyncio.sleep(self.ACTIVE_DELAY)
+
+        attempt = 0
+        while not connection_future.done():
+            attempt += 1
             for addr in addresses:
-                # Check if someone else (passive) got a connection
-                if self._connection_future.done():
-                    return
+                if connection_future.done():
+                    return  # Someone connected via passive
+
+                log.info(f"[Active] Attempt {attempt}: connecting to {self._format_device(addr)}...")
 
                 try:
-                    log.info(f"Trying active connection to {addr}...")
                     target = Address(addr, Address.PUBLIC_DEVICE_ADDRESS)
-                    connection = await asyncio.wait_for(
-                        self.device.connect(target, transport=BT_BR_EDR_TRANSPORT),
-                        timeout=5.0
+
+                    # Don't use asyncio timeout - let HCI handle it naturally
+                    # HCI page timeout is typically 5-10 seconds
+                    connect_task = asyncio.create_task(
+                        self.device.connect(target, transport=BT_BR_EDR_TRANSPORT)
                     )
 
-                    # Connection successful
-                    log.success(f"Active connection to {addr} successful")
+                    # Wait with timeout, checking for passive connection every 0.5s
+                    for _ in range(self.ACTIVE_CONNECT_TIMEOUT):
+                        if connection_future.done():
+                            connect_task.cancel()
+                            return
 
-                    # Handle the connection
+                        done, _ = await asyncio.wait(
+                            [connect_task],
+                            timeout=0.5,
+                            return_when=asyncio.FIRST_COMPLETED
+                        )
+
+                        if done:
+                            break
+
+                    if not connect_task.done():
+                        log.info(f"[Active] Connect to {addr} timed out")
+                        connect_task.cancel()
+                        try:
+                            await connect_task
+                        except asyncio.CancelledError:
+                            pass
+                        # Long wait for HCI to fully recover
+                        await asyncio.sleep(3.0)
+                        continue
+
+                    # Get result
+                    connection = await connect_task
+
+                    # Check if passive already succeeded
+                    if connection_future.done():
+                        log.info(f"[Active] Passive won, disconnecting")
+                        try:
+                            await connection.disconnect()
+                        except Exception:
+                            pass
+                        return
+
+                    # We won - handle the connection
+                    log.success(f"[Active] Connected to {self._format_device(addr)}")
                     await connection_handler(connection)
 
-                    # Set future if not already done
-                    if not self._connection_future.done():
-                        self._connection_future.set_result(connection)
+                    if not connection_future.done():
+                        connection_future.set_result(connection)
                     return
 
-                except asyncio.TimeoutError:
-                    log.info(f"  {addr} not responding")
                 except asyncio.CancelledError:
-                    raise
+                    raise  # Let cancellation propagate
                 except Exception as e:
-                    log.info(f"  {addr} connection failed: {e}")
+                    error_str = str(e)
+                    if "DISALLOWED" in error_str or "PENDING" in error_str:
+                        log.warning(f"[Active] HCI busy, waiting 5s to recover...")
+                        await asyncio.sleep(5.0)
+                    elif "PAGE_TIMEOUT" in error_str or "timeout" in error_str.lower():
+                        log.info(f"[Active] {addr} not responding (page timeout)")
+                        await asyncio.sleep(1.0)
+                    else:
+                        log.info(f"[Active] Connect to {addr} failed: {e}")
+                        await asyncio.sleep(2.0)
 
-            # All devices tried, wait before retrying
-            if not self._connection_future.done():
-                log.info(f"Retrying active connection in {retry_interval}s...")
-                await asyncio.sleep(retry_interval)
+            # Wait before next round
+            if not connection_future.done():
+                log.info(f"[Active] Round {attempt} complete, retrying in {self.ACTIVE_RETRY_INTERVAL}s...")
+                await asyncio.sleep(self.ACTIVE_RETRY_INTERVAL)
 
 
 class ClassicHIDHost:
@@ -371,7 +452,7 @@ class ClassicHIDHost:
                     for addr, keys in all_keys:
                         log.info(f"  Key for: {addr}")
                         if keys.link_key:
-                            log.info(f"    link_key: {keys.link_key.value.hex()}")
+                            log.info(f"    link_key: present ({len(keys.link_key.value)} bytes)")
             except Exception as e:
                 log.warning(f"Keystore check failed: {e}")
 
@@ -381,7 +462,7 @@ class ClassicHIDHost:
             log.info(f"Link key requested for: {address} (type: {type(address)})")
             result = await original_get_link_key(address)
             if result:
-                log.info(f"Link key result: found, {len(result)} bytes: {result.hex()}")
+                log.info(f"Link key result: found ({len(result)} bytes)")
             else:
                 log.info(f"Link key result: NOT FOUND")
             return result
@@ -432,7 +513,7 @@ class ClassicHIDHost:
         def on_device_link_key(bd_addr, link_key, key_type):
             nonlocal received_link_key
             log.success(f"Link key event received (device): {bd_addr}, type={key_type}")
-            log.info(f"Link key value: {link_key.hex()}")
+            log.info(f"Link key received ({len(link_key)} bytes)")
             received_link_key = link_key
             link_key_received.set()
 
@@ -459,19 +540,8 @@ class ClassicHIDHost:
             except asyncio.TimeoutError:
                 log.warning("Link key event timeout (may already be saved)")
 
-            # Request encryption
+            # Set up encryption event listeners BEFORE requesting encryption
             log.info("Requesting encryption...")
-            try:
-                await asyncio.wait_for(
-                    self.connection.encrypt(enable=True),
-                    timeout=10.0
-                )
-                log.success("Encryption request sent")
-            except Exception as e:
-                log.warning(f"Encryption request: {e}")
-
-            # Wait for encryption
-            log.info("Waiting for encryption...")
             encryption_done = asyncio.Event()
 
             def on_encryption_change():
@@ -486,6 +556,17 @@ class ClassicHIDHost:
             self.connection.on('connection_encryption_change', on_encryption_change)
             self.connection.on('connection_encryption_failure', on_encryption_failure)
 
+            # Now request encryption
+            try:
+                await asyncio.wait_for(
+                    self.connection.encrypt(enable=True),
+                    timeout=10.0
+                )
+                log.success("Encryption request sent")
+            except Exception as e:
+                log.warning(f"Encryption request: {e}")
+
+            # Wait for encryption to complete
             try:
                 await asyncio.wait_for(encryption_done.wait(), timeout=10.0)
             except asyncio.TimeoutError:
@@ -509,7 +590,7 @@ class ClassicHIDHost:
             if self.keystore:
                 keys = await self.keystore.get(address)
                 if keys and keys.link_key:
-                    log.success(f"Link key verified: {keys.link_key.value.hex()}")
+                    log.success("Link key verified in keystore")
                 else:
                     log.warning("Link key not found in keystore!")
 
@@ -695,108 +776,85 @@ class ClassicHIDHost:
         self.hid_host.on(HIDHost.EVENT_EXIT_SUSPEND, lambda: log.info("[HID] Device resumed"))
         log.info(f"HID Host created (Control PSM: 0x{HID_CONTROL_PSM:04X}, Interrupt PSM: 0x{HID_INTERRUPT_PSM:04X})")
 
-        # Connection handler
+        # Connection handler - event-driven approach
         async def handle_connection(connection):
             addr_str = str(connection.peer_address)
             log.success(f"Connection established: {addr_str}")
 
             self.connection = connection
             self.current_device_address = addr_str
-
-            # Set up disconnection handler
             connection.on('disconnection', self._on_disconnection)
+
+            # Register with HID host FIRST - so L2CAP servers can accept channels
+            self.hid_host.on_device_connection(connection)
 
             self.state_machine.transition(HostState.AUTHENTICATING)
 
-            # Wait for device to authenticate us
-            auth_event = asyncio.Event()
-            def on_auth():
-                log.success("Device authenticated us")
-                auth_event.set()
-            def on_auth_fail(error):
-                log.warning(f"Auth failed: {error}")
-                auth_event.set()
-
-            connection.on('connection_authentication', on_auth)
-            connection.on('connection_authentication_failure', on_auth_fail)
-
-            log.info("Waiting for device authentication...")
+            # Initiate authentication - we need to start this, not wait for device
+            log.info("Initiating authentication...")
             try:
-                # Wait for either auth or disconnection
-                auth_task = asyncio.create_task(auth_event.wait())
-                disconnect_task = asyncio.create_task(self._disconnection_event.wait())
-                done, pending = await asyncio.wait(
-                    [auth_task, disconnect_task],
-                    timeout=5.0,
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in pending:
-                    task.cancel()
+                await asyncio.wait_for(connection.authenticate(), timeout=10.0)
+                log.success("Authentication complete")
+            except Exception as e:
+                # Transaction collision is OK - means both sides tried to auth
+                if "transaction collision" in str(e).lower():
+                    log.info(f"Auth transaction collision (harmless): {e}")
+                else:
+                    log.warning(f"Authentication: {e}")
 
-                if self._disconnection_event.is_set():
-                    log.warning("Device disconnected during authentication")
-                    connection.remove_listener('connection_authentication', on_auth)
-                    connection.remove_listener('connection_authentication_failure', on_auth_fail)
-                    return  # Don't signal handshake complete
-            except asyncio.TimeoutError:
-                log.warning("No auth request from device, continuing...")
-
-            # Check again if disconnected
             if self._disconnection_event.is_set():
-                log.warning("Device disconnected, aborting handshake")
+                log.warning("Device disconnected during authentication")
                 return
 
-            connection.remove_listener('connection_authentication', on_auth)
-            connection.remove_listener('connection_authentication_failure', on_auth_fail)
+            # Wait for HID channels (device should open them after auth)
+            log.info("Waiting for HID channels...")
+            for _ in range(30):  # 3 seconds
+                if self.hid_host.l2cap_intr_channel and self.hid_host.l2cap_ctrl_channel:
+                    log.success("HID channels opened by device")
+                    break
+                if self._disconnection_event.is_set():
+                    return
+                await asyncio.sleep(0.1)
 
-            # Register with HID host
-            self.hid_host.on_device_connection(connection)
+            # Fallback: if device didn't open channels, we connect them
+            if not self.hid_host.l2cap_ctrl_channel:
+                log.info("Control channel not opened by device, connecting...")
+                try:
+                    await asyncio.wait_for(self.hid_host.connect_control_channel(), timeout=5.0)
+                    log.success("Control channel connected")
+                except Exception as e:
+                    log.warning(f"Control channel: {e}")
+
+            if not self.hid_host.l2cap_intr_channel:
+                log.info("Interrupt channel not opened by device, connecting...")
+                try:
+                    await asyncio.wait_for(self.hid_host.connect_interrupt_channel(), timeout=5.0)
+                    log.success("Interrupt channel connected")
+                except Exception as e:
+                    log.warning(f"Interrupt channel: {e}")
 
             # Signal handshake complete
             self._handshake_complete_event.set()
 
-        # Enable Page Scan
+        # Enable Page Scan (makes us connectable)
         log.info("Enabling Page Scan...")
         await self.device.host.send_command(
             HCI_Write_Scan_Enable_Command(scan_enable=0x02),
             check_result=True
         )
 
-        # Get allowed addresses from devices.conf
+        # Build address -> name mapping for logging
         devices = config.get_all_devices()
-        allowed_addresses = [addr for addr, _, _ in devices]
+        address_names = {addr.split('/')[0].upper(): name for addr, _, name in devices if name}
 
-        # Also include addresses from keystore for active connection attempts
-        # This helps when using wildcard (*) or when keystore has more devices
-        if self.keystore:
-            try:
-                keystore_addresses = set()
-                # Get all keys from keystore (returns list of entries)
-                keys = await self.keystore.get_all()
-                if keys:
-                    for entry in keys:
-                        # Entry is (address, key_data) tuple
-                        addr_str = str(entry[0]) if isinstance(entry, (list, tuple)) else str(entry)
-                        keystore_addresses.add(addr_str)
-                    # Add keystore addresses not already in allowed list
-                    for ks_addr in keystore_addresses:
-                        norm_ks = ks_addr.split('/')[0].upper()
-                        if not any(a.split('/')[0].upper() == norm_ks for a in allowed_addresses if a != '*'):
-                            allowed_addresses.append(ks_addr)
-                            log.info(f"Adding keystore address: {ks_addr}")
-            except Exception as e:
-                log.debug(f"Could not get keystore addresses: {e}")
-
-        # Use ConnectionPolicy for race-free connection handling
+        # Wait for device to connect (passive mode)
         self.state_machine.transition(HostState.CONNECTING)
-        policy = ConnectionPolicy(self.device, self.state_machine, self.keystore)
+        policy = ConnectionPolicy(self.device, self.keystore)
 
-        log.info("Waiting for device (passive) + trying active connection...")
         await policy.wait_for_connection(
-            allowed_addresses=allowed_addresses,
             connection_handler=handle_connection,
             timeout=60.0,
-            retry_interval=5.0
+            address_names=address_names
         )
 
         # Wait for handshake to complete (or disconnection)
@@ -821,21 +879,10 @@ class ClassicHIDHost:
             self.state_machine.transition(HostState.ERROR, "Handshake timeout")
             raise InvalidStateError("Connection handshake failed")
 
-        # Wait for L2CAP channels
-        log.info("Waiting for HID channels...")
-        for _ in range(50):
-            if self.hid_host.l2cap_intr_channel:
-                break
-            await asyncio.sleep(0.1)
-
-        if self.hid_host.l2cap_intr_channel:
-            log.success("HID interrupt channel connected")
-        else:
-            self.state_machine.transition(HostState.ERROR, "HID channel not connected")
-            raise InvalidStateError("HID channel not connected")
-
-        if self.hid_host.l2cap_ctrl_channel:
-            log.success("HID control channel connected")
+        # Verify HID channels are connected (handle_connection already waited for them)
+        if not self.hid_host.l2cap_intr_channel:
+            self.state_machine.transition(HostState.ERROR, "HID interrupt channel not connected")
+            raise InvalidStateError("HID interrupt channel not connected")
 
         # If no cached descriptor, try SDP now
         if not self.report_map:
@@ -1065,13 +1112,14 @@ class ClassicHIDHost:
 
     async def cleanup(self):
         """Clean up resources."""
-        # Only transition to DISCONNECTING from connected states
+        # State transition
         if self.state_machine.state in (HostState.CONNECTED, HostState.AUTHENTICATING,
                                          HostState.DISCOVERING_SERVICES):
             self.state_machine.transition(HostState.DISCONNECTING)
         elif self.state_machine.state not in (HostState.IDLE, HostState.DISCONNECTING):
             self.state_machine.reset()
 
+        # Destroy UHID
         if self.uhid_device:
             try:
                 self.uhid_device.destroy()
@@ -1079,21 +1127,34 @@ class ClassicHIDHost:
                 pass
             self.uhid_device = None
 
-        if self.hid_host:
-            try:
-                if self.hid_host.l2cap_intr_channel:
-                    await self.hid_host.disconnect_interrupt_channel()
-                if self.hid_host.l2cap_ctrl_channel:
-                    await self.hid_host.disconnect_control_channel()
-            except Exception:
-                pass
+        # Check if HCI connection is still valid using Bumble's state
+        connection_alive = (self.connection is not None and
+                           hasattr(self.connection, 'handle') and
+                           self.connection.handle is not None)
 
-        if self.connection:
+        # Disconnect HID channels only if connection still alive
+        if self.hid_host and connection_alive:
+            if self.hid_host.l2cap_intr_channel:
+                try:
+                    await self.hid_host.disconnect_interrupt_channel()
+                except Exception:
+                    pass
+            if self.hid_host.l2cap_ctrl_channel:
+                try:
+                    await self.hid_host.disconnect_control_channel()
+                except Exception:
+                    pass
+        self.hid_host = None
+
+        # Disconnect connection only if still alive
+        if connection_alive:
             try:
                 await self.connection.disconnect()
             except Exception:
                 pass
+        self.connection = None
 
+        # Close transport
         if self.transport:
             await self.transport.close()
 
