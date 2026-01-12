@@ -90,7 +90,7 @@ async def pair_mode(protocol_filter: Protocol = None, sequential: bool = False):
 
         if success:
             log.success(f"Paired with {selected.name}")
-            save_device_config(selected.address, selected.protocol)
+            save_device_config(selected.address, selected.protocol, selected.name)
             log.success("Saved to devices.conf. Run without --pair to connect.")
         else:
             log.error("Pairing failed")
@@ -99,8 +99,11 @@ async def pair_mode(protocol_filter: Protocol = None, sequential: bool = False):
         await host.cleanup()
 
 
-def save_device_config(address: str, protocol: Protocol):
-    """Save device address to devices.conf (appends, avoids duplicates)."""
+def save_device_config(address: str, protocol: Protocol, name: str = None):
+    """Save device to devices.conf (appends, avoids duplicates).
+
+    Format: ADDRESS PROTOCOL [NAME]
+    """
     conf_file = config.devices_config_file
     log.info(f"Saving to: {conf_file}")
 
@@ -111,7 +114,7 @@ def save_device_config(address: str, protocol: Protocol):
     addr_norm = address.split('/')[0].upper()
 
     existing_devices = config.get_all_devices()
-    for existing_addr, _ in existing_devices:
+    for existing_addr, _, _ in existing_devices:
         if existing_addr.split('/')[0].upper() == addr_norm:
             log.info(f"Device {address} already in devices.conf")
             return
@@ -120,11 +123,14 @@ def save_device_config(address: str, protocol: Protocol):
         if not os.path.exists(conf_file):
             with open(conf_file, 'w') as f:
                 f.write("# Device addresses and protocols\n")
-                f.write("# Format: ADDRESS [ble|classic]\n")
+                f.write("# Format: ADDRESS PROTOCOL [NAME]\n")
 
         with open(conf_file, 'a') as f:
-            f.write(f"{address} {protocol.value}\n")
-        log.info(f"Added: {address} {protocol.value}")
+            if name:
+                f.write(f"{address} {protocol.value} {name}\n")
+            else:
+                f.write(f"{address} {protocol.value}\n")
+        log.info(f"Added: {address} {protocol.value} ({name or 'unnamed'})")
     except Exception as e:
         log.error(f"Failed to save: {e}")
 
@@ -205,10 +211,11 @@ def main():
     if not address:
         device_config = config.get_device_config()
         if device_config:
-            address, protocol = device_config
+            address, protocol, name = device_config
             if protocol_override:
                 protocol = protocol_override
-            log.info(f"Using device from {config.devices_config_file}: {address}")
+            display = f"{name} ({address})" if name else address
+            log.info(f"Using device from {config.devices_config_file}: {display}")
         else:
             log.error("No device address specified. Use --address or create devices.conf")
             log.info("Run with --pair to set up a new device")

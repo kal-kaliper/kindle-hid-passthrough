@@ -50,14 +50,16 @@ class HIDDaemon:
             return False
 
         # Use first device's protocol, but we'll accept any from the list
-        self.device_address, self.protocol = devices[0]
+        self.device_address, self.protocol, name = devices[0]
 
         if len(devices) == 1 and self.device_address != '*':
-            logger.info(f"Device: {self.device_address} ({self.protocol.value})")
+            display = f"{name} ({self.device_address})" if name else self.device_address
+            logger.info(f"Device: {display} ({self.protocol.value})")
         else:
             logger.info(f"Accepting {len(devices)} device(s) ({self.protocol.value}):")
-            for addr, proto in devices:
-                logger.info(f"  - {addr} ({proto.value})")
+            for addr, proto, dev_name in devices:
+                display = f"{dev_name} ({addr})" if dev_name else addr
+                logger.info(f"  - {display} ({proto.value})")
 
         return True
 

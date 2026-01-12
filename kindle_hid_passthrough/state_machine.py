@@ -70,6 +70,8 @@ class StateMachine:
         # Service discovery
         (HostState.DISCOVERING_SERVICES, HostState.CONNECTED),
         (HostState.DISCOVERING_SERVICES, HostState.ERROR),
+        (HostState.DISCOVERING_SERVICES, HostState.IDLE),  # Pairing complete
+        (HostState.DISCOVERING_SERVICES, HostState.DISCONNECTING),  # Cleanup after pairing
 
         # Connected state
         (HostState.CONNECTED, HostState.DISCONNECTING),

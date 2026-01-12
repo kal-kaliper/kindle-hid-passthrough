@@ -62,10 +62,12 @@ class ConnectionPolicy:
     - No window for race condition
     """
 
-    def __init__(self, device: Device, state_machine: StateMachine):
+    def __init__(self, device: Device, state_machine: StateMachine, keystore=None):
         self.device = device
         self.state_machine = state_machine
+        self.keystore = keystore
         self._connection_future: Optional[asyncio.Future] = None
+        self._keystore_addresses: set = set()  # Cached for sync access
 
     async def wait_for_connection(
         self,
@@ -91,14 +93,43 @@ class ConnectionPolicy:
         # Create future that will hold the connection
         self._connection_future = asyncio.get_event_loop().create_future()
 
+        # Pre-load keystore addresses for sync access
+        self._keystore_addresses = set()
+        if self.keystore:
+            try:
+                keys = await self.keystore.get_all()
+                if keys:
+                    for entry in keys:
+                        # Entry is (address, key_data) tuple or similar
+                        addr = str(entry[0]) if isinstance(entry, (list, tuple)) else str(entry)
+                        norm = addr.split('/')[0].upper()
+                        self._keystore_addresses.add(norm)
+                    log.info(f"Keystore addresses: {self._keystore_addresses}")
+            except Exception as e:
+                log.warning(f"Failed to load keystore: {e}")
+
+        def is_allowed(addr_str: str) -> bool:
+            """Check if address is allowed (devices.conf OR has link key)."""
+            allowed, _ = config.is_device_allowed(addr_str)
+            if allowed:
+                return True
+            # Also accept if device has a link key (previously paired)
+            norm_addr = addr_str.split('/')[0].upper()
+            if norm_addr in self._keystore_addresses:
+                log.info(f"Accepting {addr_str} (has link key from previous pairing)")
+                return True
+            return False
+
         # Register connection handler (passive path)
         async def on_passive_connection(connection):
             addr_str = str(connection.peer_address)
 
-            # Check if device is allowed
-            allowed, _ = config.is_device_allowed(addr_str)
-            if not allowed:
-                log.warning(f"Ignoring {addr_str} (not in devices.conf)")
+            if not is_allowed(addr_str):
+                log.warning(f"Rejecting {addr_str} (not in devices.conf, no link key)")
+                try:
+                    await connection.disconnect()
+                except Exception:
+                    pass
                 return
 
             # Handle the connection
@@ -113,9 +144,7 @@ class ConnectionPolicy:
             log.info(f"Passive connection from: {addr_str}")
 
             # Set future IMMEDIATELY to stop active connection attempts
-            # (before async handling runs)
-            allowed, _ = config.is_device_allowed(addr_str)
-            if allowed and not self._connection_future.done():
+            if is_allowed(addr_str) and not self._connection_future.done():
                 self._connection_future.set_result(connection)
 
             asyncio.create_task(on_passive_connection(connection))
@@ -735,19 +764,19 @@ class ClassicHIDHost:
 
         # Get allowed addresses from devices.conf
         devices = config.get_all_devices()
-        allowed_addresses = [addr for addr, _ in devices]
+        allowed_addresses = [addr for addr, _, _ in devices]
 
         # Also include addresses from keystore for active connection attempts
         # This helps when using wildcard (*) or when keystore has more devices
         if self.keystore:
             try:
                 keystore_addresses = set()
-                # Get all keys from keystore
+                # Get all keys from keystore (returns list of entries)
                 keys = await self.keystore.get_all()
                 if keys:
-                    for addr_str in keys.keys():
-                        # Normalize address (remove /P suffix for comparison)
-                        norm_addr = addr_str.split('/')[0].upper()
+                    for entry in keys:
+                        # Entry is (address, key_data) tuple
+                        addr_str = str(entry[0]) if isinstance(entry, (list, tuple)) else str(entry)
                         keystore_addresses.add(addr_str)
                     # Add keystore addresses not already in allowed list
                     for ks_addr in keystore_addresses:
@@ -760,7 +789,7 @@ class ClassicHIDHost:
 
         # Use ConnectionPolicy for race-free connection handling
         self.state_machine.transition(HostState.CONNECTING)
-        policy = ConnectionPolicy(self.device, self.state_machine)
+        policy = ConnectionPolicy(self.device, self.state_machine, self.keystore)
 
         log.info("Waiting for device (passive) + trying active connection...")
         await policy.wait_for_connection(
