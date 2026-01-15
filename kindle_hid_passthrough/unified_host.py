@@ -38,6 +38,7 @@ from config import config, Protocol, get_fallback_hid_descriptor
 from logging_utils import log
 from pairing import create_pairing_config, create_keystore
 from device_cache import DeviceCache
+from base_host import BaseHIDHost
 
 __all__ = ['UnifiedHIDHost']
 
@@ -53,7 +54,7 @@ class DeviceConfig:
     name: Optional[str] = None
 
 
-class UnifiedHIDHost:
+class UnifiedHIDHost(BaseHIDHost):
     """Unified HID Host supporting both BLE and Classic Bluetooth.
 
     This host:
@@ -79,20 +80,14 @@ class UnifiedHIDHost:
         Args:
             transport_spec: HCI transport (default: from config)
         """
-        self.transport_spec = transport_spec or config.transport
-        self.transport = None
-        self.device = None
-        self.connection = None
-        self.peer = None  # For BLE
+        super().__init__(transport_spec)
+
+        # BLE-specific
+        self.peer = None
 
         # Protocol-specific
         self.hid_host = None  # For Classic
         self.connected_protocol = None
-
-        # Device state
-        self.current_device_address = None
-        self.device_name = None
-        self.report_map: Optional[bytes] = None
         self.hid_reports = {}  # For BLE
 
         # Device configs
@@ -103,18 +98,6 @@ class UnifiedHIDHost:
         # Components
         self.keystore = create_keystore(config.pairing_keys_file)
         self.device_cache = DeviceCache(config.cache_dir)
-
-        # UHID
-        self.uhid_device = None
-        self._uhid_available = False
-        try:
-            from uhid_handler import UHIDDevice, Bus, UHIDError
-            self._UHIDDevice = UHIDDevice
-            self._Bus = Bus
-            self._UHIDError = UHIDError
-            self._uhid_available = True
-        except ImportError:
-            log.warning("UHID support not available")
 
         # Events
         self._disconnection_event = None
@@ -1291,48 +1274,9 @@ class UnifiedHIDHost:
 
         self._disconnection_event.set()
 
-    def _create_uhid_device(self):
-        """Create UHID virtual device."""
-        if not self._uhid_available:
-            log.warning("UHID not available")
-            return
-
-        if not self.report_map:
-            log.warning("No report descriptor for UHID")
-            return
-
-        try:
-            name = self.device_name or "HID Device"
-            self.uhid_device = self._UHIDDevice(
-                name=name,
-                report_descriptor=self.report_map,
-                bus=self._Bus.BLUETOOTH,
-                vendor=0,
-                product=0,
-            )
-            log.success(f"UHID device created: {name}")
-        except Exception as e:
-            log.error(f"Failed to create UHID device: {e}")
-
-    def _is_connection_alive(self) -> bool:
-        """Check if the connection is still alive and usable."""
-        if self.connection is None:
-            return False
-        if not hasattr(self.connection, 'handle') or self.connection.handle is None:
-            return False
-        # Check if connection is already disconnected
-        if hasattr(self.connection, 'is_disconnected') and self.connection.is_disconnected:
-            return False
-        return True
-
     async def cleanup(self):
         """Clean up resources."""
-        if self.uhid_device:
-            try:
-                self.uhid_device.destroy()
-            except Exception:
-                pass
-            self.uhid_device = None
+        self._cleanup_uhid()
 
         # Classic cleanup
         if self.hid_host:
