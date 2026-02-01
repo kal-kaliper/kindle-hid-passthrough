@@ -1,22 +1,21 @@
-# Dockerfile for building Kindle HID Passthrough ARM binary
+# Dockerfile for building Kindle HID Passthrough ARM binary (musl libc)
 # Uses Nuitka with special ARM flags to handle branch range issues
 # Target: ARMv7 hard-float (armhf)
 
-# Use Debian-based image - Kindle uses glibc, not musl
-FROM arm32v7/python:3.11-slim-bookworm
+# Use Alpine with musl libc - for Kindles that support musl
+FROM arm32v7/python:3.11-alpine
 
 # Install build dependencies including Rust for some Python packages
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
+RUN apk add --no-cache \
+    build-base \
     patchelf \
     ccache \
     libffi-dev \
-    zlib1g-dev \
-    linux-libc-dev \
-    libssl-dev \
-    rustc \
-    cargo \
-    && rm -rf /var/lib/apt/lists/*
+    zlib-dev \
+    linux-headers \
+    openssl-dev \
+    rust \
+    cargo
 
 # Install Python build tools and dependencies
 RUN pip install --no-cache-dir \
@@ -67,7 +66,6 @@ RUN python3 -m nuitka \
     --mode=onefile \
     --jobs=$(nproc) \
     --lto=no \
-    --low-memory \
     --show-progress \
     --output-filename=kindle-hid-passthrough.bin \
     --include-package=kindle_hid_passthrough \

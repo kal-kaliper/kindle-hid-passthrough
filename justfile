@@ -14,7 +14,7 @@ default:
 deploy:
     @echo "Deploying to Kindle..."
     @echo "Stopping daemon..."
-    -ssh kindle "initctl stop hid-passthrough" 2>/dev/null || true
+    -just stop 2>/dev/null
     @echo "Remounting filesystems as writable..."
     ssh kindle "/usr/sbin/mntroot rw && mount -o remount,rw /mnt/base-us"
     @echo "Copying files..."
@@ -27,13 +27,13 @@ deploy:
     ssh kindle "mkdir -p {{remote_dir}}/cache"
     @echo "Deployment complete!"
     @echo ""
-    @echo "Start daemon with: just start"
-    -ssh kindle "initctl start hid-passthrough" 2>/dev/null || true
+    @echo "Starting daemon..."
+    -just start 2>/dev/null
     @echo "View logs with: just logs"
 
 # Check daemon status
 status:
-    ssh kindle "initctl status hid-passthrough"
+    ssh kindle "/sbin/initctl status hid-passthrough"
 
 # View daemon logs
 logs:
@@ -45,15 +45,15 @@ logs-recent:
 
 # Restart daemon
 restart:
-    ssh kindle "initctl restart hid-passthrough"
+    ssh kindle "/sbin/initctl restart hid-passthrough"
 
 # Stop daemon
 stop:
-    ssh kindle "initctl stop hid-passthrough"
+    ssh kindle "/sbin/initctl stop hid-passthrough"
 
 # Start daemon
 start:
-    ssh kindle "initctl start hid-passthrough"
+    ssh kindle "/sbin/initctl start hid-passthrough"
 
 # Clear cache
 clear-cache:
