@@ -22,7 +22,7 @@ RUN pip install --no-cache-dir \
     nuitka \
     ordered-set \
     zstandard \
-    bumble>=0.0.193 \
+    bumble>=0.0.222 \
     aiofiles>=23.0.0
 
 # Enable ccache for faster C compilation
