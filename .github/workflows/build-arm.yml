@@ -9,8 +9,28 @@ on:
   workflow_dispatch:
 
 jobs:
+  create-runner:
+    name: Create Hetzner ARM runner
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.create.outputs.label }}
+      server_id: ${{ steps.create.outputs.server_id }}
+    steps:
+      - name: Create Hetzner CAX41 runner
+        id: create
+        uses: Cyclenerd/hcloud-github-runner@v1
+        with:
+          mode: create
+          github_token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+          server_type: cax41
+          location: nbg1
+          image: ubuntu-24.04
+
   build:
-    runs-on: ubuntu-24.04-arm
+    name: Build ARMv7
+    needs: create-runner
+    runs-on: ${{ needs.create-runner.outputs.label }}
     permissions:
       contents: write
 
@@ -18,26 +38,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Docker
+        run: |
+          curl -fsSL https://get.docker.com | sudo sh
+          sudo usermod -aG docker $USER
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Build ARMv7 binary with Docker
         run: |
-          docker build \
+          sudo docker build \
             --platform linux/arm/v7 \
-            -f .github/Dockerfile.arm \
+            --memory=28g \
+            --memory-swap=30g \
+            -f .github/Dockerfile.arm-glibc-static \
             -t kindle-hid-passthrough-builder \
             --load \
             .
 
       - name: Extract binaries
         run: |
-          CONTAINER_ID=$(docker create kindle-hid-passthrough-builder)
+          CONTAINER_ID=$(sudo docker create kindle-hid-passthrough-builder)
           mkdir -p dist
-          docker cp "$CONTAINER_ID:/build/kindle-hid-passthrough" ./dist/kindle-hid-passthrough
-          docker cp "$CONTAINER_ID:/build/kindle-hid-passthrough.bin" ./dist/kindle-hid-passthrough.bin
-          docker cp "$CONTAINER_ID:/build/libsyscall_wrapper.so" ./dist/libsyscall_wrapper.so
-          docker rm "$CONTAINER_ID"
+          sudo docker cp "$CONTAINER_ID:/build/kindle-hid-passthrough" ./dist/kindle-hid-passthrough
+          sudo docker cp "$CONTAINER_ID:/build/kindle-hid-passthrough.bin" ./dist/kindle-hid-passthrough.bin
+          sudo docker cp "$CONTAINER_ID:/build/libsyscall_wrapper.so" ./dist/libsyscall_wrapper.so
+          sudo docker rm "$CONTAINER_ID"
           chmod +x dist/kindle-hid-passthrough dist/kindle-hid-passthrough.bin
 
       - name: Add config files
@@ -75,3 +102,18 @@ jobs:
           files: kindle-hid-passthrough-${{ github.ref_name }}-armv7.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  delete-runner:
+    name: Delete Hetzner runner
+    needs: [create-runner, build]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Delete Hetzner runner
+        uses: Cyclenerd/hcloud-github-runner@v1
+        with:
+          mode: delete
+          github_token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+          name: ${{ needs.create-runner.outputs.label }}
+          server_id: ${{ needs.create-runner.outputs.server_id }}

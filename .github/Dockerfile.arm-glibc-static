@@ -1,0 +1,120 @@
+# Dockerfile for building Kindle HID Passthrough ARM binary (static glibc)
+# Uses Debian Buster (glibc 2.28) for maximum compatibility
+# Target: ARMv7 hard-float (armhf)
+
+FROM arm32v7/python:3.11-slim-buster
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    patchelf \
+    ccache \
+    libffi-dev \
+    zlib1g-dev \
+    linux-libc-dev \
+    libssl-dev \
+    rustc \
+    cargo \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python build tools
+RUN pip install --no-cache-dir \
+    nuitka \
+    ordered-set \
+    zstandard \
+    bumble>=0.0.193 \
+    aiofiles>=23.0.0
+
+# Enable ccache
+ENV CCACHE_DIR=/ccache
+ENV PATH="/usr/lib/ccache:${PATH}"
+
+WORKDIR /build
+
+# Copy source
+COPY kindle_hid_passthrough/*.py /build/kindle_hid_passthrough/
+COPY kindle_hid_passthrough/config.ini /build/kindle_hid_passthrough/
+
+# ARM-specific compiler flags to fix branch range errors
+ENV CFLAGS="-mword-relocations -mlong-calls -ffunction-sections -fdata-sections"
+ENV LDFLAGS="-Wl,--gc-sections"
+
+# Build syscall wrapper for Kindle kernel compatibility
+RUN printf '%s\n' \
+    '#define _GNU_SOURCE' \
+    '#include <sys/uio.h>' \
+    '#include <unistd.h>' \
+    '' \
+    'ssize_t preadv2(int fd, const struct iovec *iov, int iovcnt, off_t offset, int flags) {' \
+    '    return preadv(fd, iov, iovcnt, offset);' \
+    '}' \
+    '' \
+    'ssize_t pwritev2(int fd, const struct iovec *iov, int iovcnt, off_t offset, int flags) {' \
+    '    return pwritev(fd, iov, iovcnt, offset);' \
+    '}' \
+    > /build/syscall_wrapper.c && \
+    gcc -shared -fPIC -o /build/libsyscall_wrapper.so /build/syscall_wrapper.c && \
+    strip /build/libsyscall_wrapper.so
+
+# Build with Nuitka
+RUN python3 -m nuitka \
+    --mode=onefile \
+    --jobs=$(nproc) \
+    --lto=no \
+    --show-progress \
+    --output-filename=kindle-hid-passthrough.bin \
+    --include-package=kindle_hid_passthrough \
+    --include-data-file=kindle_hid_passthrough/config.ini=kindle_hid_passthrough/config.ini \
+    --nofollow-import-to=pytest \
+    --nofollow-import-to=unittest \
+    --nofollow-import-to=setuptools \
+    kindle_hid_passthrough/main.py
+
+# Build C wrapper
+RUN printf '%s\n' \
+    '#define _GNU_SOURCE' \
+    '#include <stdio.h>' \
+    '#include <stdlib.h>' \
+    '#include <string.h>' \
+    '#include <unistd.h>' \
+    '#include <libgen.h>' \
+    '#include <linux/limits.h>' \
+    '' \
+    'int main(int argc, char *argv[]) {' \
+    '    char exe_path[PATH_MAX];' \
+    '    char dir_path[PATH_MAX];' \
+    '    char bin_path[PATH_MAX];' \
+    '    char lib_path[PATH_MAX];' \
+    '    ssize_t len;' \
+    '' \
+    '    len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);' \
+    '    if (len == -1) {' \
+    '        perror("readlink");' \
+    '        return 1;' \
+    '    }' \
+    '    exe_path[len] = '"'"'\0'"'"';' \
+    '' \
+    '    strncpy(dir_path, exe_path, sizeof(dir_path));' \
+    '    char *dir = dirname(dir_path);' \
+    '' \
+    '    snprintf(bin_path, sizeof(bin_path), "%s/kindle-hid-passthrough.bin", dir);' \
+    '    snprintf(lib_path, sizeof(lib_path), "%s/libsyscall_wrapper.so", dir);' \
+    '' \
+    '    setenv("LD_PRELOAD", lib_path, 1);' \
+    '    setenv("KINDLE_HID_BASE", dir, 1);' \
+    '    setenv("TMPDIR", dir, 1);' \
+    '' \
+    '    argv[0] = bin_path;' \
+    '    execv(bin_path, argv);' \
+    '' \
+    '    perror("execv");' \
+    '    return 1;' \
+    '}' \
+    > /build/wrapper.c && \
+    gcc -static -o /build/kindle-hid-passthrough /build/wrapper.c && \
+    strip /build/kindle-hid-passthrough
+
+# Output:
+# /build/kindle-hid-passthrough     - C wrapper (static)
+# /build/kindle-hid-passthrough.bin - Nuitka binary (dynamically linked to glibc)
+# /build/libsyscall_wrapper.so      - Syscall compatibility shim
