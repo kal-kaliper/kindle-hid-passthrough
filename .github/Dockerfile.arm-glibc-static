@@ -23,7 +23,8 @@ RUN pip install --no-cache-dir \
     ordered-set \
     zstandard \
     bumble>=0.0.193 \
-    aiofiles>=23.0.0
+    aiofiles>=23.0.0 \
+    staticx
 
 # Enable ccache
 ENV CCACHE_DIR=/ccache
@@ -62,13 +63,17 @@ RUN python3 -m nuitka \
     --jobs=$(nproc) \
     --lto=no \
     --show-progress \
-    --output-filename=kindle-hid-passthrough.bin \
+    --output-filename=kindle-hid-passthrough.bin.tmp \
     --include-package=kindle_hid_passthrough \
     --include-data-file=kindle_hid_passthrough/config.ini=kindle_hid_passthrough/config.ini \
     --nofollow-import-to=pytest \
     --nofollow-import-to=unittest \
     --nofollow-import-to=setuptools \
     kindle_hid_passthrough/main.py
+
+# Make the binary fully static with staticx
+RUN staticx --strip /build/kindle-hid-passthrough.bin.tmp /build/kindle-hid-passthrough.bin && \
+    rm /build/kindle-hid-passthrough.bin.tmp
 
 # Build C wrapper
 RUN printf '%s\n' \
@@ -116,5 +121,5 @@ RUN printf '%s\n' \
 
 # Output:
 # /build/kindle-hid-passthrough     - C wrapper (static)
-# /build/kindle-hid-passthrough.bin - Nuitka binary (dynamically linked to glibc)
+# /build/kindle-hid-passthrough.bin - Nuitka binary (fully static via staticx)
 # /build/libsyscall_wrapper.so      - Syscall compatibility shim
