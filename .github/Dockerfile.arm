@@ -1,10 +1,11 @@
-# Dockerfile for building Kindle HID Passthrough ARM binary (fully static musl)
-# Uses Nuitka + staticx to create a truly static binary with bundled musl
+# Dockerfile for building Kindle HID Passthrough ARM binary (musl libc)
+# Uses Nuitka with special ARM flags to handle branch range issues
 # Target: ARMv7 hard-float (armhf)
 
+# Use Alpine with musl libc - for Kindles that support musl
 FROM arm32v7/python:3.11-alpine
 
-# Install build dependencies
+# Install build dependencies including Rust for some Python packages
 RUN apk add --no-cache \
     build-base \
     patchelf \
@@ -14,35 +15,35 @@ RUN apk add --no-cache \
     linux-headers \
     openssl-dev \
     rust \
-    cargo \
-    scons \
-    upx
+    cargo
 
-# Install Python build tools
+# Install Python build tools and dependencies
 RUN pip install --no-cache-dir \
     nuitka \
     ordered-set \
     zstandard \
     bumble>=0.0.193 \
-    aiofiles>=23.0.0 \
-    staticx \
-    pyinstaller
+    aiofiles>=23.0.0
 
-# Enable ccache
+# Enable ccache for faster C compilation
 ENV CCACHE_DIR=/ccache
 ENV PATH="/usr/lib/ccache:${PATH}"
 
 WORKDIR /build
 
-# Copy source
+# Copy source files
 COPY kindle_hid_passthrough/*.py /build/kindle_hid_passthrough/
 COPY kindle_hid_passthrough/config.ini /build/kindle_hid_passthrough/
 
-# ARM-specific compiler flags for branch range + size optimization
-ENV CFLAGS="-mword-relocations -mlong-calls -ffunction-sections -fdata-sections -Os"
+# ARM-specific compiler flags to fix branch range errors:
+# -mword-relocations: Use word-sized relocations for position-independent code
+# -mlong-calls: Generate long call sequences for distant functions
+# -ffunction-sections -fdata-sections: Enable linker garbage collection
+ENV CFLAGS="-mword-relocations -mlong-calls -ffunction-sections -fdata-sections"
 ENV LDFLAGS="-Wl,--gc-sections"
 
-# Build syscall wrapper (statically)
+# Build syscall wrapper library for Kindle kernel compatibility
+# Kindle kernel 4.9.77 is missing pwritev2/preadv2 syscalls
 RUN printf '%s\n' \
     '#define _GNU_SOURCE' \
     '#include <sys/uio.h>' \
@@ -59,13 +60,14 @@ RUN printf '%s\n' \
     gcc -shared -fPIC -o /build/libsyscall_wrapper.so /build/syscall_wrapper.c && \
     strip /build/libsyscall_wrapper.so
 
-# Build with Nuitka (onefile, will be made static with staticx)
+# Build with Nuitka
+# ARM compiler flags handle branch range issues for large modules like bumble.hci
 RUN python3 -m nuitka \
     --mode=onefile \
     --jobs=$(nproc) \
     --lto=no \
     --show-progress \
-    --output-filename=kindle-hid-passthrough.bin.dynamic \
+    --output-filename=kindle-hid-passthrough.bin \
     --include-package=kindle_hid_passthrough \
     --include-data-file=kindle_hid_passthrough/config.ini=kindle_hid_passthrough/config.ini \
     --nofollow-import-to=pytest \
@@ -73,21 +75,8 @@ RUN python3 -m nuitka \
     --nofollow-import-to=setuptools \
     kindle_hid_passthrough/main.py
 
-# Make it fully static with staticx (bundles musl loader)
-RUN echo "=== Original binary (dynamic) ===" && \
-    file kindle-hid-passthrough.bin.dynamic && \
-    ldd kindle-hid-passthrough.bin.dynamic && \
-    echo "" && \
-    echo "=== Creating static version ===" && \
-    staticx --strip --loglevel INFO \
-        kindle-hid-passthrough.bin.dynamic \
-        kindle-hid-passthrough.bin && \
-    echo "" && \
-    echo "=== Static binary ===" && \
-    file kindle-hid-passthrough.bin && \
-    (ldd kindle-hid-passthrough.bin 2>&1 || echo "Fully static - no dynamic dependencies!")
-
-# Build C wrapper (fully static)
+# Build C wrapper that sets up LD_PRELOAD and execs the real binary
+# This eliminates the need for run.sh
 RUN printf '%s\n' \
     '#define _GNU_SOURCE' \
     '#include <stdio.h>' \
@@ -104,6 +93,7 @@ RUN printf '%s\n' \
     '    char lib_path[PATH_MAX];' \
     '    ssize_t len;' \
     '' \
+    '    /* Get path to this executable */' \
     '    len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);' \
     '    if (len == -1) {' \
     '        perror("readlink");' \
@@ -111,36 +101,32 @@ RUN printf '%s\n' \
     '    }' \
     '    exe_path[len] = '"'"'\0'"'"';' \
     '' \
+    '    /* Get directory */' \
     '    strncpy(dir_path, exe_path, sizeof(dir_path));' \
     '    char *dir = dirname(dir_path);' \
     '' \
+    '    /* Build paths */' \
     '    snprintf(bin_path, sizeof(bin_path), "%s/kindle-hid-passthrough.bin", dir);' \
     '    snprintf(lib_path, sizeof(lib_path), "%s/libsyscall_wrapper.so", dir);' \
     '' \
+    '    /* Set environment */' \
     '    setenv("LD_PRELOAD", lib_path, 1);' \
     '    setenv("KINDLE_HID_BASE", dir, 1);' \
     '    setenv("TMPDIR", dir, 1);' \
     '' \
+    '    /* Exec the real binary */' \
     '    argv[0] = bin_path;' \
     '    execv(bin_path, argv);' \
     '' \
+    '    /* If we get here, exec failed */' \
     '    perror("execv");' \
     '    return 1;' \
     '}' \
     > /build/wrapper.c && \
-    gcc -static -Os -o /build/kindle-hid-passthrough /build/wrapper.c && \
+    gcc -static -o /build/kindle-hid-passthrough /build/wrapper.c && \
     strip /build/kindle-hid-passthrough
 
-# Final verification
-RUN echo "=== Wrapper (should be static) ===" && \
-    file kindle-hid-passthrough && \
-    (ldd kindle-hid-passthrough 2>&1 || echo "Fully static!") && \
-    echo "" && \
-    echo "=== Main binary (should be static) ===" && \
-    file kindle-hid-passthrough.bin && \
-    (ldd kindle-hid-passthrough.bin 2>&1 || echo "Fully static!")
-
 # Output:
-# /build/kindle-hid-passthrough     - C wrapper (fully static)
-# /build/kindle-hid-passthrough.bin - Nuitka binary made static by staticx
+# /build/kindle-hid-passthrough     - C wrapper (entry point)
+# /build/kindle-hid-passthrough.bin - Nuitka Python binary
 # /build/libsyscall_wrapper.so      - Syscall compatibility shim
