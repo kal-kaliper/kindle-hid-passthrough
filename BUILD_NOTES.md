@@ -57,18 +57,20 @@ scons: *** [module.bumble.hci.o] Error 1
 **Result:** Broke working configuration  
 **Lesson:** Parallel compilation (`--jobs=$(nproc)`) is required for Nuitka to work properly
 
-### Attempt 7: Debian Buster + glibc (Current)
-**Status:** 🔄 In Progress  
+### Attempt 7: Debian Bookworm + glibc
+**Status:** ✅ Building  
 **Branch:** glibc-static-build  
 **PR:** #17  
 **Reasoning:** Use glibc (which Kindle already has) instead of musl  
 **Config:**
-- Debian Buster (glibc 2.28)
-- Nuitka onefile
+- Debian Bookworm (glibc 2.36)
+- Nuitka onefile with parallel compilation
 - Dynamically linked to glibc
 **Issues encountered:**
-1. Debian Buster is EOL → repos moved to archive.debian.org (fixed)
-2. Build currently running...
+1. ~~Debian Buster is EOL → repos moved to archive.debian.org~~ (switched to Bookworm)
+2. ~~Buster's Rust too old for cryptography~~ (Bookworm has Rust 1.63)
+3. Build currently running...
+**Risk:** Kindle might have older glibc (can test and downgrade to Bullseye 2.31 if needed)
 
 ## What We Know
 
