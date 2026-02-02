@@ -59,10 +59,10 @@ RUN printf '%s\n' \
     gcc -shared -fPIC -o /build/libsyscall_wrapper.so /build/syscall_wrapper.c && \
     strip /build/libsyscall_wrapper.so
 
-# Build with Nuitka - exclude ALL unused transports and heavy dependencies
+# Build with Nuitka (onefile, will be made static with staticx)
 RUN python3 -m nuitka \
     --mode=onefile \
-    --jobs=1 \
+    --jobs=$(nproc) \
     --lto=no \
     --show-progress \
     --output-filename=kindle-hid-passthrough.bin.dynamic \
@@ -71,24 +71,6 @@ RUN python3 -m nuitka \
     --nofollow-import-to=pytest \
     --nofollow-import-to=unittest \
     --nofollow-import-to=setuptools \
-    --nofollow-import-to=bumble.transport.grpc_protobuf \
-    --nofollow-import-to=bumble.transport.android_emulator \
-    --nofollow-import-to=bumble.transport.pyusb \
-    --nofollow-import-to=bumble.transport.usb \
-    --nofollow-import-to=bumble.transport.ws_server \
-    --nofollow-import-to=bumble.transport.ws_client \
-    --nofollow-import-to=bumble.transport.tcp_server \
-    --nofollow-import-to=bumble.transport.tcp_client \
-    --nofollow-import-to=bumble.transport.udp \
-    --nofollow-import-to=bumble.transport.serial \
-    --nofollow-import-to=bumble.transport.pty \
-    --nofollow-import-to=bumble.transport.vhci \
-    --nofollow-import-to=grpc \
-    --nofollow-import-to=google.protobuf \
-    --nofollow-import-to=websockets \
-    --nofollow-import-to=usb \
-    --nofollow-import-to=usb1 \
-    --nofollow-import-to=serial \
     kindle_hid_passthrough/main.py
 
 # Make it fully static with staticx (bundles musl loader)
