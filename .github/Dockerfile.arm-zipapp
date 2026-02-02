@@ -1,0 +1,85 @@
+# Dockerfile for building Kindle HID Passthrough ARM zipapp
+# Bundles standalone Python + zipapp - fully portable
+# Target: ARMv7 hard-float (armhf)
+
+FROM arm32v7/python:3.11-slim-bookworm
+
+WORKDIR /build
+
+# Install build tools and development libraries
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    wget \
+    xz-utils \
+    patchelf \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download Python standalone build for ARM (from python-build-standalone)
+# Using a portable Python build that includes everything needed
+RUN wget -O python.tar.gz \
+    "https://github.com/indygreg/python-build-standalone/releases/download/20241016/cpython-3.11.10%2B20241016-armv7-unknown-linux-gnueabihf-install_only.tar.gz" && \
+    mkdir -p /build/python && \
+    tar -xzf python.tar.gz -C /build/python --strip-components=1 && \
+    rm python.tar.gz
+
+# Install Python dependencies to a directory
+RUN /build/python/bin/python3 -m pip install --target=/build/app \
+    bumble>=0.0.193 \
+    aiofiles>=23.0.0
+
+# Copy source files
+COPY kindle_hid_passthrough/*.py /build/app/kindle_hid_passthrough/
+COPY kindle_hid_passthrough/config.ini /build/app/kindle_hid_passthrough/
+
+# Create __main__.py entry point for zipapp
+RUN printf '%s\n' \
+    'import sys' \
+    'from kindle_hid_passthrough.main import main' \
+    '' \
+    'if __name__ == "__main__":' \
+    '    sys.exit(main())' \
+    > /build/app/__main__.py
+
+# Create zipapp
+RUN /build/python/bin/python3 -m zipapp /build/app -o /build/kindle-hid-passthrough.pyz
+
+# Build syscall wrapper for Kindle kernel compatibility
+RUN printf '%s\n' \
+    '#define _GNU_SOURCE' \
+    '#include <sys/uio.h>' \
+    '#include <unistd.h>' \
+    '' \
+    'ssize_t preadv2(int fd, const struct iovec *iov, int iovcnt, off_t offset, int flags) {' \
+    '    return preadv(fd, iov, iovcnt, offset);' \
+    '}' \
+    '' \
+    'ssize_t pwritev2(int fd, const struct iovec *iov, int iovcnt, off_t offset, int flags) {' \
+    '    return pwritev(fd, iov, iovcnt, offset);' \
+    '}' \
+    > /build/syscall_wrapper.c && \
+    gcc -shared -fPIC -o /build/libsyscall_wrapper.so /build/syscall_wrapper.c && \
+    strip /build/libsyscall_wrapper.so
+
+# Create shell wrapper that uses bundled Python
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    '' \
+    '# Get directory of this script' \
+    'DIR="$(cd "$(dirname "$0")" && pwd)"' \
+    '' \
+    '# Set up environment' \
+    'export LD_PRELOAD="$DIR/libsyscall_wrapper.so"' \
+    'export KINDLE_HID_BASE="$DIR"' \
+    'export TMPDIR="$DIR"' \
+    '' \
+    '# Run the zipapp with bundled Python' \
+    'exec "$DIR/python/bin/python3" "$DIR/kindle-hid-passthrough.pyz" "$@"' \
+    > /build/kindle-hid-passthrough && \
+    chmod +x /build/kindle-hid-passthrough
+
+# Output structure:
+# /build/kindle-hid-passthrough     - Shell wrapper (entry point)
+# /build/kindle-hid-passthrough.pyz - Python zipapp (all code + dependencies)
+# /build/python/                    - Portable Python installation
+# /build/libsyscall_wrapper.so      - Syscall compatibility shim

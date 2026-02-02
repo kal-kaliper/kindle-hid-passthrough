@@ -1,9 +1,6 @@
-name: Build ARM Binary
+name: Build ARM Zipapp
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -21,24 +18,25 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build ARMv7 binary with Docker
+      - name: Build ARMv7 zipapp with Docker
         run: |
           docker build \
             --platform linux/arm/v7 \
-            -f .github/Dockerfile.arm \
-            -t kindle-hid-passthrough-builder \
+            -f .github/Dockerfile.arm-zipapp \
+            -t kindle-hid-passthrough-zipapp \
             --load \
             .
 
-      - name: Extract binaries
+      - name: Extract files
         run: |
-          CONTAINER_ID=$(docker create kindle-hid-passthrough-builder)
+          CONTAINER_ID=$(docker create kindle-hid-passthrough-zipapp)
           mkdir -p dist
           docker cp "$CONTAINER_ID:/build/kindle-hid-passthrough" ./dist/kindle-hid-passthrough
-          docker cp "$CONTAINER_ID:/build/kindle-hid-passthrough.bin" ./dist/kindle-hid-passthrough.bin
+          docker cp "$CONTAINER_ID:/build/kindle-hid-passthrough.pyz" ./dist/kindle-hid-passthrough.pyz
+          docker cp "$CONTAINER_ID:/build/python" ./dist/python
           docker cp "$CONTAINER_ID:/build/libsyscall_wrapper.so" ./dist/libsyscall_wrapper.so
           docker rm "$CONTAINER_ID"
-          chmod +x dist/kindle-hid-passthrough dist/kindle-hid-passthrough.bin
+          chmod +x dist/kindle-hid-passthrough
 
       - name: Add config files
         run: |
@@ -47,8 +45,14 @@ jobs:
 
       - name: Show contents
         run: |
-          file dist/*
+          echo "=== File types ==="
+          file dist/kindle-hid-passthrough dist/kindle-hid-passthrough.pyz dist/libsyscall_wrapper.so
+          echo ""
+          echo "=== Sizes ==="
           ls -lh dist/
+          echo ""
+          echo "=== Python bundle size ==="
+          du -sh dist/python/
 
       - name: Create tarball
         run: |
@@ -57,13 +61,13 @@ jobs:
           else
             VERSION="dev-$(git rev-parse --short HEAD)"
           fi
-          tar -czvf "kindle-hid-passthrough-${VERSION}-armv7.tar.gz" -C dist .
+          tar -czvf "kindle-hid-passthrough-${VERSION}-armv7-zipapp.tar.gz" -C dist .
           ls -lh *.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: kindle-hid-passthrough-armv7
+          name: kindle-hid-passthrough-armv7-zipapp
           path: |
             dist/
             *.tar.gz
@@ -72,6 +76,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v1
         with:
-          files: kindle-hid-passthrough-${{ github.ref_name }}-armv7.tar.gz
+          files: kindle-hid-passthrough-${{ github.ref_name }}-armv7-zipapp.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
