@@ -66,6 +66,7 @@ RUN printf '%s\n' \
 # ARM compiler flags handle branch range issues for large modules like bumble.hci
 RUN python3 -m nuitka \
     --mode=onefile \
+    --onefile-no-compression \
     --jobs=$(nproc) \
     --lto=no \
     --show-progress \
