@@ -61,6 +61,7 @@ RUN printf '%s\n' \
 # Build with Nuitka
 RUN python3 -m nuitka \
     --mode=onefile \
+    --onefile-no-compression \
     --jobs=$(nproc) \
     --lto=no \
     --show-progress \
