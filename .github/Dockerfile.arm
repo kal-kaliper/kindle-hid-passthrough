@@ -24,6 +24,7 @@ RUN pip install --no-cache-dir \
     zstandard \
     bumble>=0.0.193 \
     aiofiles>=23.0.0 \
+    scons \
     staticx
 
 # Enable ccache for faster C compilation
