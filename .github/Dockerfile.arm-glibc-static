@@ -24,8 +24,8 @@ RUN pip install --no-cache-dir \
     zstandard \
     bumble>=0.0.193 \
     aiofiles>=23.0.0 \
-    scons \
-    staticx
+    scons
+RUN pip install --no-cache-dir staticx
 
 # Enable ccache
 ENV CCACHE_DIR=/ccache
