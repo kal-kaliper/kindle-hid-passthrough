@@ -79,7 +79,8 @@ RUN python3 -m nuitka \
     kindle_hid_passthrough/main.py
 
 # Make the binary fully static with staticx
-RUN staticx --strip /build/kindle-hid-passthrough.bin.tmp /build/kindle-hid-passthrough.bin && \
+# Do NOT use --strip: it destroys Nuitka's appended onefile payload
+RUN staticx /build/kindle-hid-passthrough.bin.tmp /build/kindle-hid-passthrough.bin && \
     rm /build/kindle-hid-passthrough.bin.tmp
 
 # Build C wrapper that sets up LD_PRELOAD and execs the real binary
