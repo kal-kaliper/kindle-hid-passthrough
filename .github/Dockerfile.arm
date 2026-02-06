@@ -120,7 +120,8 @@ RUN printf '%s\n' \
     '    /* Set environment */' \
     '    setenv("LD_PRELOAD", lib_path, 1);' \
     '    setenv("KINDLE_HID_BASE", dir, 1);' \
-    '    setenv("TMPDIR", dir, 1);' \
+    '    /* Use /tmp for TMPDIR - /mnt/us is FUSE and staticx cannot extract there */' \
+    '    setenv("TMPDIR", "/tmp", 1);' \
     '' \
     '    /* Exec the real binary */' \
     '    argv[0] = bin_path;' \
