@@ -18,10 +18,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python build tools
+# Note: zstandard deliberately omitted - Nuitka will skip compression
+# to avoid OOM on GitHub ARM runners during onefile packaging
 RUN pip install --no-cache-dir \
     nuitka \
     ordered-set \
-    zstandard \
     bumble>=0.0.193 \
     aiofiles>=23.0.0 \
     scons
@@ -59,9 +60,9 @@ RUN printf '%s\n' \
     strip /build/libsyscall_wrapper.so
 
 # Build with Nuitka
+# Build with Nuitka (no zstandard = no compression = avoids OOM)
 RUN python3 -m nuitka \
     --mode=onefile \
-    --onefile-no-compression \
     --jobs=$(nproc) \
     --lto=no \
     --show-progress \
