@@ -1,10 +1,11 @@
 # Dockerfile for building Kindle HID Passthrough ARM binary (glibc)
-# Uses Debian Bookworm (glibc 2.36) with Nuitka onefile + staticx
+# Uses Debian Bookworm (glibc 2.36) with Nuitka standalone + bundled ld-linux
 # Target: ARMv7 hard-float (armhf)
 #
-# staticx bundles the dynamic linker and makes the binary runnable on any Linux.
-# Nuitka onefile bundles all Python deps into a single self-extracting binary.
-# IMPORTANT: staticx must NOT use --strip (destroys Nuitka's appended payload).
+# Strategy: Nuitka standalone creates a directory with the binary + all .so deps.
+# We bundle the build container's ld-linux-armhf.so.3 and invoke it directly,
+# completely bypassing the Kindle's ancient glibc 2.20 / dynamic linker.
+# No staticx needed — just a directory with everything.
 
 FROM arm32v7/python:3.11-slim-bookworm
 
@@ -26,9 +27,7 @@ RUN pip install --no-cache-dir \
     nuitka \
     ordered-set \
     bumble>=0.0.193 \
-    aiofiles>=23.0.0 \
-    scons
-RUN pip install --no-cache-dir staticx
+    aiofiles>=23.0.0
 
 # Enable ccache
 ENV CCACHE_DIR=/ccache
@@ -62,12 +61,9 @@ RUN printf '%s\n' \
     gcc -shared -fPIC -o /build/libsyscall_wrapper.so /build/syscall_wrapper.c && \
     strip /build/libsyscall_wrapper.so
 
-# Build with Nuitka in onefile mode
-# --onefile-no-compression: avoids OOM on GitHub ARM runners during zstd packaging
-# Onefile bundles ALL Python deps into a single self-extracting binary
+# Build with Nuitka in standalone mode (creates directory with all deps)
 RUN python3 -m nuitka \
-    --mode=onefile \
-    --onefile-no-compression \
+    --mode=standalone \
     --jobs=$(nproc) \
     --lto=no \
     --show-progress \
@@ -79,14 +75,12 @@ RUN python3 -m nuitka \
     --nofollow-import-to=setuptools \
     kindle_hid_passthrough/main.py
 
-# Make the onefile binary fully static with staticx
-# CRITICAL: Do NOT use --strip — it destroys Nuitka's appended onefile payload
-RUN staticx /build/nuitka-out/main.bin /build/kindle-hid-passthrough.bin
+# Copy the build container's dynamic linker into the standalone dist
+# This is the key: we ship our own ld-linux so we don't depend on Kindle's
+RUN cp /lib/ld-linux-armhf.so.3 /build/nuitka-out/main.dist/ld-linux-armhf.so.3
 
-# Build C wrapper that sets up LD_PRELOAD and TMPDIR, then execs the real binary
-# - LD_PRELOAD: loads syscall_wrapper.so for kernel compatibility
-# - TMPDIR: Kindle's /mnt/us is FUSE (can't exec), /tmp is often full;
-#   /dev/shm (237MB tmpfs) is the safe extraction target for staticx+nuitka
+# Build C wrapper that invokes the bundled ld-linux directly
+# This bypasses the system dynamic linker entirely
 RUN printf '%s\n' \
     '#define _GNU_SOURCE' \
     '#include <stdio.h>' \
@@ -99,8 +93,11 @@ RUN printf '%s\n' \
     'int main(int argc, char *argv[]) {' \
     '    char exe_path[PATH_MAX];' \
     '    char dir_path[PATH_MAX];' \
+    '    char dist_path[PATH_MAX];' \
+    '    char ld_path[PATH_MAX];' \
     '    char bin_path[PATH_MAX];' \
     '    char lib_path[PATH_MAX];' \
+    '    char preload_env[PATH_MAX];' \
     '    ssize_t len;' \
     '' \
     '    len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);' \
@@ -113,24 +110,46 @@ RUN printf '%s\n' \
     '    strncpy(dir_path, exe_path, sizeof(dir_path));' \
     '    char *dir = dirname(dir_path);' \
     '' \
-    '    snprintf(bin_path, sizeof(bin_path), "%s/kindle-hid-passthrough.bin", dir);' \
+    '    snprintf(dist_path, sizeof(dist_path), "%s/dist", dir);' \
+    '    snprintf(ld_path, sizeof(ld_path), "%s/dist/ld-linux-armhf.so.3", dir);' \
+    '    snprintf(bin_path, sizeof(bin_path), "%s/dist/main.bin", dir);' \
     '    snprintf(lib_path, sizeof(lib_path), "%s/libsyscall_wrapper.so", dir);' \
     '' \
+    '    /* Set LD_PRELOAD for syscall compatibility shim */' \
+    '    snprintf(preload_env, sizeof(preload_env), "%s:%s/dist/libsyscall_wrapper.so", lib_path, dir);' \
     '    setenv("LD_PRELOAD", lib_path, 1);' \
     '    setenv("KINDLE_HID_BASE", dir, 1);' \
-    '    setenv("TMPDIR", "/dev/shm", 1);' \
     '' \
-    '    argv[0] = bin_path;' \
-    '    execv(bin_path, argv);' \
+    '    /* Build new argv: ld-linux --library-path dist dist/main.bin [original args] */' \
+    '    int new_argc = argc + 3; /* ld-linux, --library-path, dist, bin, then original args minus argv[0] */' \
+    '    char **new_argv = malloc(sizeof(char *) * (new_argc + 1));' \
+    '    if (!new_argv) {' \
+    '        perror("malloc");' \
+    '        return 1;' \
+    '    }' \
     '' \
-    '    perror("execv");' \
+    '    new_argv[0] = ld_path;' \
+    '    new_argv[1] = "--library-path";' \
+    '    new_argv[2] = dist_path;' \
+    '    new_argv[3] = bin_path;' \
+    '    for (int i = 1; i < argc; i++) {' \
+    '        new_argv[i + 3] = argv[i];' \
+    '    }' \
+    '    new_argv[argc + 3] = NULL;' \
+    '' \
+    '    execv(ld_path, new_argv);' \
+    '' \
+    '    perror("execv ld-linux");' \
     '    return 1;' \
     '}' \
     > /build/wrapper.c && \
     gcc -static -o /build/kindle-hid-passthrough /build/wrapper.c && \
     strip /build/kindle-hid-passthrough
 
-# Output:
-# /build/kindle-hid-passthrough     - C wrapper (static, entry point)
-# /build/kindle-hid-passthrough.bin - Nuitka onefile binary (fully static via staticx)
-# /build/libsyscall_wrapper.so      - Syscall compatibility shim
+# Prepare the output directory structure:
+#   kindle-hid-passthrough          - C wrapper (static, entry point)
+#   libsyscall_wrapper.so           - Syscall compatibility shim
+#   dist/                           - Nuitka standalone output
+#     main.bin                      - Python binary
+#     ld-linux-armhf.so.3           - Bundled dynamic linker
+#     *.so                          - All shared library dependencies
