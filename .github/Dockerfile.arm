@@ -18,10 +18,11 @@ RUN apk add --no-cache \
     cargo
 
 # Install Python build tools and dependencies
+# Note: zstandard deliberately omitted - Nuitka will skip compression
+# to avoid OOM on GitHub ARM runners during onefile packaging
 RUN pip install --no-cache-dir \
     nuitka \
     ordered-set \
-    zstandard \
     bumble>=0.0.193 \
     aiofiles>=23.0.0 \
     scons
@@ -64,9 +65,9 @@ RUN printf '%s\n' \
 
 # Build with Nuitka
 # ARM compiler flags handle branch range issues for large modules like bumble.hci
+# No zstandard installed = Nuitka skips compression (avoids OOM)
 RUN python3 -m nuitka \
     --mode=onefile \
-    --onefile-no-compression \
     --jobs=$(nproc) \
     --lto=no \
     --show-progress \
