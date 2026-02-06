@@ -1,8 +1,7 @@
 # Dockerfile for building Kindle HID Passthrough ARM binary (musl libc)
-# Uses Nuitka with special ARM flags to handle branch range issues
+# Uses Nuitka standalone + staticx for fully static binary
 # Target: ARMv7 hard-float (armhf)
 
-# Use Alpine with musl libc - for Kindles that support musl
 FROM arm32v7/python:3.11-alpine
 
 # Install build dependencies including Rust for some Python packages
@@ -18,8 +17,6 @@ RUN apk add --no-cache \
     cargo
 
 # Install Python build tools and dependencies
-# Note: zstandard deliberately omitted - Nuitka will skip compression
-# to avoid OOM on GitHub ARM runners during onefile packaging
 RUN pip install --no-cache-dir \
     nuitka \
     ordered-set \
@@ -63,15 +60,14 @@ RUN printf '%s\n' \
     gcc -shared -fPIC -o /build/libsyscall_wrapper.so /build/syscall_wrapper.c && \
     strip /build/libsyscall_wrapper.so
 
-# Build with Nuitka
-# ARM compiler flags handle branch range issues for large modules like bumble.hci
-# No zstandard installed = Nuitka skips compression (avoids OOM)
+# Build with Nuitka in standalone mode (creates directory, not single file)
+# Standalone mode avoids the onefile payload that staticx corrupts
 RUN python3 -m nuitka \
-    --mode=onefile \
+    --mode=standalone \
     --jobs=$(nproc) \
     --lto=no \
     --show-progress \
-    --output-filename=kindle-hid-passthrough.bin.tmp \
+    --output-dir=/build/nuitka-out \
     --include-package=kindle_hid_passthrough \
     --include-data-file=kindle_hid_passthrough/config.ini=kindle_hid_passthrough/config.ini \
     --nofollow-import-to=pytest \
@@ -79,13 +75,11 @@ RUN python3 -m nuitka \
     --nofollow-import-to=setuptools \
     kindle_hid_passthrough/main.py
 
-# Make the binary fully static with staticx
-# Do NOT use --strip: it destroys Nuitka's appended onefile payload
-RUN staticx /build/kindle-hid-passthrough.bin.tmp /build/kindle-hid-passthrough.bin && \
-    rm /build/kindle-hid-passthrough.bin.tmp
+# Make the standalone binary fully static with staticx
+# Standalone mode = no appended payload, so --strip is safe
+RUN staticx --strip /build/nuitka-out/main.dist/main.bin /build/kindle-hid-passthrough.bin
 
 # Build C wrapper that sets up LD_PRELOAD and execs the real binary
-# This eliminates the need for run.sh
 RUN printf '%s\n' \
     '#define _GNU_SOURCE' \
     '#include <stdio.h>' \
@@ -102,7 +96,6 @@ RUN printf '%s\n' \
     '    char lib_path[PATH_MAX];' \
     '    ssize_t len;' \
     '' \
-    '    /* Get path to this executable */' \
     '    len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);' \
     '    if (len == -1) {' \
     '        perror("readlink");' \
@@ -110,25 +103,20 @@ RUN printf '%s\n' \
     '    }' \
     '    exe_path[len] = '"'"'\0'"'"';' \
     '' \
-    '    /* Get directory */' \
     '    strncpy(dir_path, exe_path, sizeof(dir_path));' \
     '    char *dir = dirname(dir_path);' \
     '' \
-    '    /* Build paths */' \
     '    snprintf(bin_path, sizeof(bin_path), "%s/kindle-hid-passthrough.bin", dir);' \
     '    snprintf(lib_path, sizeof(lib_path), "%s/libsyscall_wrapper.so", dir);' \
     '' \
-    '    /* Set environment */' \
     '    setenv("LD_PRELOAD", lib_path, 1);' \
     '    setenv("KINDLE_HID_BASE", dir, 1);' \
-    '    /* Use /tmp for TMPDIR - /mnt/us is FUSE and staticx cannot extract there */' \
-    '    setenv("TMPDIR", "/tmp", 1);' \
+    '    /* Kindle /tmp is full (64MB tmpfs). Use /dev/shm (237MB) for staticx extraction */' \
+    '    setenv("TMPDIR", "/dev/shm", 1);' \
     '' \
-    '    /* Exec the real binary */' \
     '    argv[0] = bin_path;' \
     '    execv(bin_path, argv);' \
     '' \
-    '    /* If we get here, exec failed */' \
     '    perror("execv");' \
     '    return 1;' \
     '}' \
@@ -137,6 +125,6 @@ RUN printf '%s\n' \
     strip /build/kindle-hid-passthrough
 
 # Output:
-# /build/kindle-hid-passthrough     - C wrapper (entry point, static)
-# /build/kindle-hid-passthrough.bin - Nuitka Python binary (fully static via staticx)
+# /build/kindle-hid-passthrough     - C wrapper (static, entry point)
+# /build/kindle-hid-passthrough.bin - Nuitka standalone binary (fully static via staticx)
 # /build/libsyscall_wrapper.so      - Syscall compatibility shim
