@@ -82,12 +82,12 @@ RUN cp /lib/ld-linux-armhf.so.3 /build/nuitka-out/main.dist/ld-linux-armhf.so.3 
     for lib in libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1 \
                libutil.so.1 libresolv.so.2 libnss_dns.so.2 libnss_files.so.2 \
                libz.so.1 libstdc++.so.6; do \
-        src=$(find /lib /usr/lib -name "$lib" -type f 2>/dev/null | head -1); \
+        src=$(find /lib /usr/lib -name "$lib" 2>/dev/null | head -1); \
         if [ -n "$src" ]; then \
-            cp "$src" /build/nuitka-out/main.dist/"$lib"; \
+            cp -L "$src" /build/nuitka-out/main.dist/"$lib"; \
         fi; \
     done && \
-    echo "Bundled glibc libs:" && ls -la /build/nuitka-out/main.dist/lib*.so*
+    echo "Bundled libs:" && ls -la /build/nuitka-out/main.dist/lib*.so*
 
 # Build C wrapper that invokes the bundled ld-linux directly
 # This bypasses the system dynamic linker entirely
