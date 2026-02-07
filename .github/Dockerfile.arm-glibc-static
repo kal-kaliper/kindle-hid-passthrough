@@ -75,9 +75,19 @@ RUN python3 -m nuitka \
     --nofollow-import-to=setuptools \
     kindle_hid_passthrough/main.py
 
-# Copy the build container's dynamic linker into the standalone dist
-# This is the key: we ship our own ld-linux so we don't depend on Kindle's
-RUN cp /lib/ld-linux-armhf.so.3 /build/nuitka-out/main.dist/ld-linux-armhf.so.3
+# Copy the build container's dynamic linker and core glibc libs into the dist.
+# Nuitka standalone doesn't include glibc core libs (assumes they exist on target).
+# But Kindle has glibc 2.20 which is incompatible, so we must bundle everything.
+RUN cp /lib/ld-linux-armhf.so.3 /build/nuitka-out/main.dist/ld-linux-armhf.so.3 && \
+    for lib in libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1 \
+               libutil.so.1 libresolv.so.2 libnss_dns.so.2 libnss_files.so.2 \
+               libz.so.1 libstdc++.so.6; do \
+        src=$(find /lib /usr/lib -name "$lib" -type f 2>/dev/null | head -1); \
+        if [ -n "$src" ]; then \
+            cp "$src" /build/nuitka-out/main.dist/"$lib"; \
+        fi; \
+    done && \
+    echo "Bundled glibc libs:" && ls -la /build/nuitka-out/main.dist/lib*.so*
 
 # Build C wrapper that invokes the bundled ld-linux directly
 # This bypasses the system dynamic linker entirely
