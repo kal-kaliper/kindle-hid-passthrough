@@ -26,7 +26,7 @@ jobs:
         run: |
           docker build \
             --platform linux/arm/v7 \
-            -f .github/Dockerfile.arm-glibc-static \
+            -f .github/Dockerfile.arm \
             -t kindle-hid-passthrough-builder \
             --load \
             .
