@@ -23,7 +23,7 @@ import sys
 # Add current directory to path for imports
 sys.path.insert(0, '/mnt/us/kindle_hid_passthrough')
 
-from config import Protocol, config, normalize_addr
+from config import Protocol, __version__, config, normalize_addr
 from daemon import main as daemon_main
 from host import HIDHost
 from logging_utils import log
@@ -48,37 +48,53 @@ async def pair_mode(protocol_filter: Protocol = None, sequential: bool = False):
     try:
         await scanner.start()
 
-        log.info("Put your device in pairing mode...")
-        devices = []
-        while not devices:
-            all_devices = await scanner.scan(duration=10.0, concurrent=not sequential)
-            if protocol_filter:
-                devices = [d for d in all_devices if d.protocol == protocol_filter]
-            else:
-                devices = all_devices
-            if not devices:
-                log.warning("No HID devices found. Scanning again...")
-                await asyncio.sleep(2)
-
-        print("\nFound devices:")
-        for i, dev in enumerate(devices):
-            proto_tag = "[BLE]" if dev.protocol == Protocol.BLE else "[Classic]"
-            print(f"  {i+1}. {proto_tag} {dev.name} ({dev.address})")
-
         selected = None
-        while True:
-            try:
-                choice = input("\nSelect device (number): ").strip()
-                idx = int(choice) - 1
-                if 0 <= idx < len(devices):
-                    selected = devices[idx]
-                    break
-                print("Invalid selection")
-            except ValueError:
-                print("Enter a number")
-            except (EOFError, KeyboardInterrupt):
-                print("\nCancelled")
-                return
+        while selected is None:
+            log.info("Put your device in pairing mode...")
+            print("Press Enter to stop scanning early.")
+            devices = []
+            while not devices:
+                stop_event = asyncio.Event()
+                loop = asyncio.get_event_loop()
+                loop.add_reader(sys.stdin.fileno(), stop_event.set)
+                try:
+                    all_devices = await scanner.scan(
+                        duration=10.0, concurrent=not sequential,
+                        stop_event=stop_event
+                    )
+                finally:
+                    loop.remove_reader(sys.stdin.fileno())
+                    if stop_event.is_set():
+                        sys.stdin.readline()  # consume the Enter
+                if protocol_filter:
+                    devices = [d for d in all_devices if d.protocol == protocol_filter]
+                else:
+                    devices = all_devices
+                if not devices:
+                    log.warning("No HID devices found. Scanning again...")
+                    await asyncio.sleep(2)
+
+            print("\nFound devices:")
+            for i, dev in enumerate(devices):
+                proto_tag = "[BLE]" if dev.protocol == Protocol.BLE else "[Classic]"
+                print(f"  {i+1}. {proto_tag} {dev.name} ({dev.address})")
+
+            while True:
+                try:
+                    choice = input("\nSelect device (number, or 'r' to rescan): ").strip()
+                    if choice.lower() == 'r':
+                        print("Restarting search...")
+                        break
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(devices):
+                        selected = devices[idx]
+                        break
+                    print("Invalid selection")
+                except ValueError:
+                    print("Enter a number or 'r' to rescan")
+                except (EOFError, KeyboardInterrupt):
+                    print("\nCancelled")
+                    return
 
         log.info(f"Selected: {selected.name} ({selected.address}) [{selected.protocol.value}]")
 
@@ -176,6 +192,7 @@ def main():
 
     args = parser.parse_args()
 
+    log.info(f"Kindle HID Passthrough v{__version__}")
     log.info(f"Config base path: {config.base_path}")
 
     protocol_override = None

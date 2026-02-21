@@ -102,33 +102,35 @@ class Scanner:
     async def scan(
         self,
         duration: float = 10.0,
-        concurrent: bool = True
+        concurrent: bool = True,
+        stop_event: asyncio.Event = None
     ) -> List[DiscoveredDevice]:
         """Scan for HID devices across both BLE and Classic.
 
         Args:
             duration: Scan duration in seconds (split between protocols if concurrent)
             concurrent: Try concurrent scanning (falls back to sequential if fails)
+            stop_event: If set, scan stops early when this event is triggered
 
         Returns:
             List of discovered HID devices with protocol tags
         """
         if concurrent:
             try:
-                return await self._scan_concurrent(duration)
+                return await self._scan_concurrent(duration, stop_event)
             except Exception as e:
                 log.warning(f"Concurrent scan failed ({e}), falling back to sequential")
-                return await self._scan_sequential(duration)
+                return await self._scan_sequential(duration, stop_event)
         else:
-            return await self._scan_sequential(duration)
+            return await self._scan_sequential(duration, stop_event)
 
-    async def _scan_concurrent(self, duration: float) -> List[DiscoveredDevice]:
+    async def _scan_concurrent(self, duration: float, stop_event: asyncio.Event = None) -> List[DiscoveredDevice]:
         """Run BLE and Classic scans concurrently."""
         log.info(f"Scanning BLE + Classic concurrently ({duration}s)...")
 
         # Run both scans as concurrent tasks
-        ble_task = asyncio.create_task(self._scan_ble(duration))
-        classic_task = asyncio.create_task(self._scan_classic(duration))
+        ble_task = asyncio.create_task(self._scan_ble(duration, stop_event))
+        classic_task = asyncio.create_task(self._scan_classic(duration, stop_event))
 
         results = await asyncio.gather(ble_task, classic_task, return_exceptions=True)
 
@@ -142,19 +144,32 @@ class Scanner:
 
         return self._merge_results(ble_devices, classic_devices)
 
-    async def _scan_sequential(self, duration: float) -> List[DiscoveredDevice]:
+    async def _scan_sequential(self, duration: float, stop_event: asyncio.Event = None) -> List[DiscoveredDevice]:
         """Run BLE and Classic scans sequentially."""
         half_duration = duration / 2.0
 
         log.info(f"Scanning BLE ({half_duration}s)...")
-        ble_devices = await self._scan_ble(half_duration)
+        ble_devices = await self._scan_ble(half_duration, stop_event)
+
+        if stop_event and stop_event.is_set():
+            return self._merge_results(ble_devices, [])
 
         log.info(f"Scanning Classic ({half_duration}s)...")
-        classic_devices = await self._scan_classic(half_duration)
+        classic_devices = await self._scan_classic(half_duration, stop_event)
 
         return self._merge_results(ble_devices, classic_devices)
 
-    async def _scan_ble(self, duration: float) -> List[DiscoveredDevice]:
+    async def _interruptible_sleep(self, duration: float, stop_event: asyncio.Event = None):
+        """Sleep for duration, but return early if stop_event is set."""
+        if stop_event is None:
+            await asyncio.sleep(duration)
+        else:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=duration)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _scan_ble(self, duration: float, stop_event: asyncio.Event = None) -> List[DiscoveredDevice]:
         """Scan for BLE HID devices."""
         devices_found: List[DiscoveredDevice] = []
         seen_addresses = set()
@@ -199,14 +214,14 @@ class Scanner:
         self.device.on('advertisement', on_advertisement)
         try:
             await self.device.start_scanning(filter_duplicates=True)
-            await asyncio.sleep(duration)
+            await self._interruptible_sleep(duration, stop_event)
             await self.device.stop_scanning()
         finally:
             self.device.remove_listener('advertisement', on_advertisement)
 
         return devices_found
 
-    async def _scan_classic(self, duration: float) -> List[DiscoveredDevice]:
+    async def _scan_classic(self, duration: float, stop_event: asyncio.Event = None) -> List[DiscoveredDevice]:
         """Scan for Classic Bluetooth HID devices."""
         log.info(f"Starting Classic inquiry ({duration}s)...")
         devices_found: List[DiscoveredDevice] = []
@@ -259,7 +274,7 @@ class Scanner:
         try:
             await self.device.start_discovery()
             log.debug("Classic inquiry started")
-            await asyncio.sleep(duration)
+            await self._interruptible_sleep(duration, stop_event)
             await self.device.stop_discovery()
             log.info(f"Classic inquiry complete: {len(seen_addresses)} total, {len(devices_found)} HID")
         finally:
