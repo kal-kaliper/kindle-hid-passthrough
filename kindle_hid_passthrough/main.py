@@ -23,7 +23,7 @@ import sys
 # Add current directory to path for imports
 sys.path.insert(0, '/mnt/us/kindle_hid_passthrough')
 
-from config import Protocol, config, normalize_addr
+from config import Protocol, __version__, config, normalize_addr
 from daemon import main as daemon_main
 from host import HIDHost
 from logging_utils import log
@@ -176,6 +176,7 @@ def main():
 
     args = parser.parse_args()
 
+    log.info(f"Kindle HID Passthrough v{__version__}")
     log.info(f"Config base path: {config.base_path}")
 
     protocol_override = None
