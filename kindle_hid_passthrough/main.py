@@ -51,9 +51,21 @@ async def pair_mode(protocol_filter: Protocol = None, sequential: bool = False):
         selected = None
         while selected is None:
             log.info("Put your device in pairing mode...")
+            print("Press Enter to stop scanning early.")
             devices = []
             while not devices:
-                all_devices = await scanner.scan(duration=10.0, concurrent=not sequential)
+                stop_event = asyncio.Event()
+                loop = asyncio.get_event_loop()
+                loop.add_reader(sys.stdin.fileno(), stop_event.set)
+                try:
+                    all_devices = await scanner.scan(
+                        duration=10.0, concurrent=not sequential,
+                        stop_event=stop_event
+                    )
+                finally:
+                    loop.remove_reader(sys.stdin.fileno())
+                    if stop_event.is_set():
+                        sys.stdin.readline()  # consume the Enter
                 if protocol_filter:
                     devices = [d for d in all_devices if d.protocol == protocol_filter]
                 else:
