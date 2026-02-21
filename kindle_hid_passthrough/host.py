@@ -511,8 +511,6 @@ class HIDHost:
             return True
         except Exception as e:
             log.error(f"[BLE] Pairing failed: {e}")
-            return False
-        finally:
             if self.connection:
                 try:
                     await self.connection.disconnect()
@@ -520,6 +518,7 @@ class HIDHost:
                     pass
                 self.connection = None
                 self.peer = None
+            return False
 
     async def _discover_and_cache_ble_hid(self, address: str):
         """Discover BLE HID service and cache data."""
@@ -685,11 +684,20 @@ class HIDHost:
         Uses the existing connection from pair_device() to establish
         HID channels and start receiving reports.
         """
-        if not self.connection:
+        if not self.connected_protocol:
+            raise InvalidStateError("No paired device - call pair_device first")
+
+        # Classic requires an active connection from pair_device().
+        # BLE will reconnect in _continue_ble_after_pairing().
+        if self.connected_protocol == Protocol.CLASSIC and not self.connection:
             raise InvalidStateError("No connection - call pair_device first")
 
         self._disconnection_event = asyncio.Event()
-        self.connection.on('disconnection', self._on_disconnection)
+
+        # Only set listener if connection exists (Classic).
+        # BLE will set it after reconnecting in _continue_ble_after_pairing().
+        if self.connection:
+            self.connection.on('disconnection', self._on_disconnection)
 
         if self.connected_protocol == Protocol.CLASSIC:
             await self._continue_classic_after_pairing()
@@ -738,15 +746,20 @@ class HIDHost:
 
     async def _continue_ble_after_pairing(self):
         """Continue BLE connection after pairing."""
-        # Need to reconnect since we disconnected after pairing
-        log.info(f"[BLE] Reconnecting to {self.current_device_address}...")
-        target = Address(self.current_device_address)
-        self.connection = await asyncio.wait_for(
-            self.device.connect(target, own_address_type=OwnAddressType.PUBLIC),
-            timeout=config.connect_timeout
-        )
-        self.peer = Peer(self.connection)
-        self.connection.on('disconnection', self._on_disconnection)
+        # Reuse existing connection if available (from pair_ble)
+        if not self.connection:
+            log.info(f"[BLE] Reconnecting to {self.current_device_address}...")
+            target = Address(self.current_device_address)
+            self.connection = await asyncio.wait_for(
+                self.device.connect(target, own_address_type=OwnAddressType.PUBLIC),
+                timeout=config.connect_timeout
+            )
+            self.peer = Peer(self.connection)
+            self.connection.on('disconnection', self._on_disconnection)
+        else:
+            log.info("[BLE] Using existing connection from pairing")
+            if not self.peer:
+                self.peer = Peer(self.connection)
 
         # Restore encryption
         await self._ble_restore_or_pair()
@@ -1151,31 +1164,35 @@ class HIDHost:
 
             if found_device:
                 # Connect to found device
-                try:
-                    log.info(f"[BLE] Connecting to {found_device.address}...")
-                    self.connection = await asyncio.wait_for(
-                        self.device.connect(found_device.address, own_address_type=OwnAddressType.PUBLIC),
-                        timeout=config.connect_timeout
-                    )
+                max_attempts = 2
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        log.info(f"[BLE] Connecting to {found_device.address} (Attempt {attempt}/{max_attempts})...")
+                        self.connection = await asyncio.wait_for(
+                            self.device.connect(found_device.address, own_address_type=OwnAddressType.PUBLIC),
+                            timeout=config.connect_timeout
+                        )
 
-                    if self._connection_future.done():
-                        await self.connection.disconnect()
+                        if self._connection_future.done():
+                            await self.connection.disconnect()
+                            return
+
+                        self.peer = Peer(self.connection)
+                        self.current_device_address = str(found_device.address)
+                        self.connected_protocol = Protocol.BLE
+                        self.connection.on('disconnection', self._on_disconnection)
+
+                        # Authenticate
+                        await self._ble_restore_or_pair()
+
+                        if not self._connection_future.done():
+                            self._connection_future.set_result(self.connection)
                         return
 
-                    self.peer = Peer(self.connection)
-                    self.current_device_address = str(found_device.address)
-                    self.connected_protocol = Protocol.BLE
-                    self.connection.on('disconnection', self._on_disconnection)
-
-                    # Authenticate
-                    await self._ble_restore_or_pair()
-
-                    if not self._connection_future.done():
-                        self._connection_future.set_result(self.connection)
-                    return
-
-                except Exception as e:
-                    log.warning(f"[BLE] Connect failed: {e}")
+                    except Exception as e:
+                        log.warning(f"[BLE] Connect attempt {attempt} failed: {e}")
+                        if attempt < max_attempts:
+                            await asyncio.sleep(2.0)
 
             # Wait before next scan
             if not self._connection_future.done():
@@ -1183,6 +1200,10 @@ class HIDHost:
 
     async def _ble_restore_or_pair(self):
         """Restore BLE bonding or initiate new pairing."""
+        if self.connection.is_encrypted:
+            log.info("[BLE] Connection already encrypted")
+            return
+
         if self.device.keystore:
             try:
                 keys = await self.device.keystore.get(str(self.connection.peer_address))
@@ -1292,17 +1313,24 @@ class HIDHost:
         """Subscribe to BLE HID input report notifications."""
         for report_id, char in self.hid_reports.items():
             try:
-                await self.peer.subscribe(char, self._on_ble_hid_report)
+                # Use a closure to capture the report_id
+                def make_callback(rid):
+                    return lambda value: self._on_ble_hid_report(value, rid)
+
+                await self.peer.subscribe(char, make_callback(report_id))
                 log.success(f"[BLE] Subscribed to report {report_id}")
             except Exception as e:
                 log.warning(f"[BLE] Failed to subscribe to report {report_id}: {e}")
 
-    def _on_ble_hid_report(self, value):
+    def _on_ble_hid_report(self, value, report_id):
         """Handle BLE HID report."""
-        data = bytes(value)
+        # For BLE, GATT notifications do NOT include the Report ID.
+        # But if the device has multiple reports (which it does if we are here),
+        # UHID/Kernel expects the Report ID as the first byte of the data.
+        data = bytes([report_id]) + bytes(value)
 
         if data != self._last_report:
-            log.debug(f"[BLE] Report: {data.hex()}")
+            log.info(f"[BLE] Report (ID={report_id}): {data.hex()}")
             self._last_report = data
 
         if self.uhid_device:
