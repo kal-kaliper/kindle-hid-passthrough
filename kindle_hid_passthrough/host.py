@@ -40,6 +40,7 @@ from bumble.transport import open_transport
 from config import Protocol, __version__, config, get_fallback_hid_descriptor, normalize_addr
 from device_cache import DeviceCache
 from logging_utils import log
+from bt_setup import prepare_bt
 from uhid_handler import Bus, UHIDDevice, UHIDError
 
 __all__ = ['HIDHost']
@@ -181,6 +182,15 @@ class HIDHost:
     async def start(self):
         """Initialize the Bumble device with both protocols."""
         log.info(f"HID Host v{__version__}")
+
+        # Ensure BT hardware is available
+        prepare_bt(
+            transport_spec=self.transport_spec,
+            module_patterns=config.bt_module_patterns,
+            kill_processes=config.bt_kill_processes,
+            settle_time=config.bt_settle_time,
+        )
+
         log.info("Opening transport...")
 
         try:

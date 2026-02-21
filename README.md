@@ -41,17 +41,18 @@ Pre-built ARM binaries are available from [GitHub Releases](https://github.com/z
 
    The release contains a `dist/` directory with a bundled Python runtime and all dependencies — no Python installation required on the Kindle.
 
-2. Set up the Bluetooth transport (required before first run):
-
+2. Pair your device and test:
    ```bash
-   # Load the BT kernel module
-   insmod /lib/modules/4.9.77-lab126/extra/wmt_cdev_bt.ko
-
-   # Kill Amazon's conflicting BT processes
-   killall bluetoothd vhci_stpbt_bridge
+   /mnt/us/kindle_hid_passthrough/kindle-hid-passthrough --pair
+   /mnt/us/kindle_hid_passthrough/kindle-hid-passthrough --daemon
    ```
-   Without this, `/dev/stpbt` won't exist and the program will fail with `FileNotFoundError`.
 
+   Bluetooth hardware setup (kernel module loading, killing conflicting processes) is handled automatically on startup.
+
+3. (Optional) Install the upstart config for autostart:
+   ```bash
+   cp /mnt/us/kindle_hid_passthrough/hid-passthrough.upstart /etc/upstart/hid-passthrough.conf
+   ```
 
 ## Usage
 
