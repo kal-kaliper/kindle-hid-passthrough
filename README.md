@@ -6,8 +6,15 @@ A userspace Bluetooth HID host for Amazon Kindle e-readers. Connects Bluetooth H
 
 This project implements a complete Bluetooth stack in userspace using [Google Bumble](https://github.com/google/bumble), bypassing the Kindle's buggy kernel Bluetooth drivers. HID reports are forwarded to the Linux input subsystem via `/dev/uhid`, making devices appear as native input devices.
 
-```
-BT HID Device  -->  /dev/stpbt  -->  Bumble (userspace BT stack)  -->  /dev/uhid  -->  Linux input (/dev/input/eventX)  -->  Keypresses
+```mermaid
+graph LR
+    A["BT HID Device"] -->|Bluetooth| B["/dev/stpbt (11th gen+, MediaTek)"]
+    A -->|Bluetooth| B2["/dev/ttymxc2 (8th-10th gen, Broadcom)"]
+    B --> C["Bumble (Userspace BT Stack)"]
+    B2 --> C
+    C --> D["/dev/uhid"]
+    D --> E["Linux Input (/dev/input/eventX)"]
+    E --> F["Keypresses"]
 ```
 
 ## Features
