@@ -87,6 +87,11 @@ class Config:
         self.connect_timeout = self._getint('connection', 'connect_timeout', 30)
         self.transport_timeout = self._getint('connection', 'transport_timeout', 30)
 
+        # Bluetooth hardware setup
+        self.bt_module_patterns = self._get_list('bluetooth', 'module_patterns', None)
+        self.bt_kill_processes = self._get_list('bluetooth', 'kill_processes', None)
+        self.bt_settle_time = float(self._get('bluetooth', 'settle_time', '0.5'))
+
         # Device identity
         self.device_name = self._get('device', 'name', 'Kindle-HID')
         self.device_address = self._get('device', 'address', 'F0:F0:F0:F0:F0:F0')
@@ -104,6 +109,14 @@ class Config:
     def _get(self, section: str, key: str, default: str) -> str:
         try:
             return self._parser.get(section, key)
+        except (configparser.NoSectionError, configparser.NoOptionError):
+            return default
+
+    def _get_list(self, section: str, key: str, default):
+        """Get a comma-separated list from config, or return default."""
+        try:
+            raw = self._parser.get(section, key)
+            return [s.strip() for s in raw.split(',') if s.strip()]
         except (configparser.NoSectionError, configparser.NoOptionError):
             return default
 
