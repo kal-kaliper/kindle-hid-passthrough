@@ -9,21 +9,18 @@ Forwards all HID reports to Linux via UHID.
 Usage:
     main.py                    # Run normally (connect to configured device)
     main.py --pair             # Interactive pairing mode (scans BLE + Classic)
-    main.py --daemon           # Run as daemon with auto-reconnect
+    main.py --daemon           # Run as daemon with auto-reconnect + API server
     main.py --address XX:XX:XX:XX:XX:XX  # Connect to specific address
-
-Author: Lucas Zampieri <lzampier@redhat.com>
 """
 
 import argparse
 import asyncio
-import os
 import sys
 
 # Add current directory to path for imports
 sys.path.insert(0, '/mnt/us/kindle_hid_passthrough')
 
-from config import Protocol, __version__, config, normalize_addr
+from config import Protocol, __version__, config
 from daemon import main as daemon_main
 from host import HIDHost
 from logging_utils import log
@@ -108,7 +105,7 @@ async def pair_mode(protocol_filter: Protocol = None, sequential: bool = False):
 
         if success:
             log.success(f"Paired with {selected.name}")
-            save_device_config(selected.address, selected.protocol, selected.name)
+            config.add_device(selected.address, selected.protocol, selected.name)
 
             # Continue into run mode if host supports it
             if hasattr(host, 'continue_after_pairing'):
@@ -123,49 +120,13 @@ async def pair_mode(protocol_filter: Protocol = None, sequential: bool = False):
         await host.cleanup()
 
 
-def save_device_config(address: str, protocol: Protocol, name: str = None):
-    """Save device to devices.conf (appends, avoids duplicates).
-
-    Format: ADDRESS PROTOCOL [NAME]
-    """
-    conf_file = config.devices_config_file
-    log.info(f"Saving to: {conf_file}")
-
-    dir_path = os.path.dirname(conf_file)
-    if dir_path:
-        os.makedirs(dir_path, exist_ok=True)
-
-    addr_norm = normalize_addr(address)
-
-    existing_devices = config.get_all_devices()
-    for existing_addr, _, _ in existing_devices:
-        if existing_addr == addr_norm:
-            log.info(f"Device {address} already in devices.conf")
-            return
-
-    try:
-        if not os.path.exists(conf_file):
-            with open(conf_file, 'w') as f:
-                f.write("# Device addresses and protocols\n")
-                f.write("# Format: ADDRESS PROTOCOL [NAME]\n")
-
-        with open(conf_file, 'a') as f:
-            if name:
-                f.write(f"{addr_norm} {protocol.value} {name}\n")
-            else:
-                f.write(f"{addr_norm} {protocol.value}\n")
-        log.info(f"Added: {addr_norm} {protocol.value} ({name or 'unnamed'})")
-    except Exception as e:
-        log.error(f"Failed to save: {e}")
-
-
 async def run_mode(address: str):
     """Normal run mode - connect and forward reports."""
     log.info(f"Connecting to {address}")
     host = HIDHost()
 
     try:
-        await host.run(address)
+        await host.run()
     except KeyboardInterrupt:
         log.warning("\nInterrupted")
     except Exception as e:
@@ -182,7 +143,7 @@ def main():
     parser.add_argument('--pair', action='store_true',
                         help='Interactive pairing mode (scans BLE + Classic)')
     parser.add_argument('--daemon', action='store_true',
-                        help='Run as daemon with auto-reconnect')
+                        help='Run as daemon with auto-reconnect + API server')
     parser.add_argument('--address', type=str,
                         help='Device address (overrides devices.conf)')
     parser.add_argument('--protocol', type=str, choices=['ble', 'classic'],
@@ -221,9 +182,12 @@ def main():
             # Use first device's address for compatibility (unified host reads all from config)
             address = all_devices[0][0]
         else:
-            log.error("No device address specified. Use --address or create devices.conf")
-            log.info("Run with --pair to set up a new device")
-            sys.exit(1)
+            if args.daemon:
+                log.info("No devices configured. Starting API server for pairing.")
+            else:
+                log.error("No device address specified. Use --address or create devices.conf")
+                log.info("Run with --pair to set up a new device")
+                sys.exit(1)
 
     if args.daemon:
         # Use daemon module for proper reconnect handling

@@ -8,6 +8,8 @@ Author: Lucas Zampieri <lzampier@redhat.com>
 """
 
 import configparser
+import json
+import logging
 import os
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
@@ -125,6 +127,131 @@ class Config:
             return self._parser.getint(section, key)
         except (configparser.NoSectionError, configparser.NoOptionError, ValueError):
             return default
+
+    def validate_keystore(self):
+        """Validate pairing_keys.json; back up and reset if corrupt."""
+        logger = logging.getLogger(__name__)
+        keys_file = self.pairing_keys_file
+        if not os.path.exists(keys_file):
+            return
+        try:
+            with open(keys_file, 'r') as f:
+                json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Corrupt keystore ({e}), backing up and resetting")
+            try:
+                backup = keys_file + '.bak'
+                os.rename(keys_file, backup)
+                logger.info(f"Backed up to {backup}")
+            except OSError:
+                try:
+                    os.remove(keys_file)
+                except OSError:
+                    pass
+
+    def remove_pairing_key(self, address: str) -> bool:
+        """Remove a pairing key from pairing_keys.json by normalized address."""
+        keys_file = self.pairing_keys_file
+        if not os.path.exists(keys_file):
+            return False
+
+        try:
+            with open(keys_file, 'r') as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return False
+
+        addr_norm = normalize_addr(address)
+        removed = False
+        keys_to_remove = []
+        for key in data:
+            if normalize_addr(key) == addr_norm:
+                keys_to_remove.append(key)
+
+        for key in keys_to_remove:
+            del data[key]
+            removed = True
+
+        if removed:
+            try:
+                with open(keys_file, 'w') as f:
+                    json.dump(data, f, indent=2)
+            except OSError:
+                return False
+
+        return removed
+
+    def remove_device(self, address: str) -> dict:
+        """Remove a device from devices.conf and its pairing key.
+
+        Returns:
+            Dict with 'removed' (bool) and 'keys_removed' (bool) fields.
+        """
+        address = normalize_addr(address)
+        conf_file = self.devices_config_file
+
+        if not os.path.exists(conf_file):
+            return {"removed": False, "keys_removed": False}
+
+        removed = False
+        lines_to_keep = []
+        with open(conf_file, 'r') as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith('#'):
+                    lines_to_keep.append(line)
+                    continue
+                parts = stripped.split()
+                line_addr = normalize_addr(parts[0]) if parts[0] != '*' else parts[0]
+                if line_addr == address and not removed:
+                    removed = True
+                    continue
+                lines_to_keep.append(line)
+
+        keys_removed = False
+        if removed:
+            with open(conf_file, 'w') as f:
+                f.writelines(lines_to_keep)
+            keys_removed = self.remove_pairing_key(address)
+
+        return {"removed": removed, "keys_removed": keys_removed}
+
+    def add_device(self, address: str, protocol, name: str = None):
+        """Add a device to devices.conf (appends, avoids duplicates).
+
+        Args:
+            address: Bluetooth address
+            protocol: Protocol enum (BLE or CLASSIC)
+            name: Optional device name
+        """
+        logger = logging.getLogger(__name__)
+        conf_file = self.devices_config_file
+
+        dir_path = os.path.dirname(conf_file)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+
+        addr_norm = normalize_addr(address)
+
+        for existing_addr, _, _ in self.get_all_devices():
+            if existing_addr == addr_norm:
+                logger.info(f"Device {address} already in devices.conf")
+                return
+
+        try:
+            if not os.path.exists(conf_file):
+                with open(conf_file, 'w') as f:
+                    f.write("# Device addresses and protocols\n")
+                    f.write("# Format: ADDRESS PROTOCOL [NAME]\n")
+
+            with open(conf_file, 'a') as f:
+                if name:
+                    f.write(f"{addr_norm} {protocol.value} {name}\n")
+                else:
+                    f.write(f"{addr_norm} {protocol.value}\n")
+            logger.info(f"Added: {addr_norm} {protocol.value} ({name or 'unnamed'})")
+        except Exception as e:
+            logger.error(f"Failed to save device: {e}")
 
     def get_device_config(self) -> Optional[tuple]:
         """Load first device address, protocol, and name from devices.conf.

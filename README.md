@@ -6,15 +6,8 @@ A userspace Bluetooth HID host for Amazon Kindle e-readers. Connects Bluetooth H
 
 This project implements a complete Bluetooth stack in userspace using [Google Bumble](https://github.com/google/bumble), bypassing the Kindle's buggy kernel Bluetooth drivers. HID reports are forwarded to the Linux input subsystem via `/dev/uhid`, making devices appear as native input devices.
 
-```mermaid
-graph LR
-    A["BT HID Device"] -->|Bluetooth| B["/dev/stpbt (11th gen+, MediaTek)"]
-    A -->|Bluetooth| B2["/dev/ttymxc2 (8th-10th gen, Broadcom)"]
-    B --> C["Bumble (Userspace BT Stack)"]
-    B2 --> C
-    C --> D["/dev/uhid"]
-    D --> E["Linux Input (/dev/input/eventX)"]
-    E --> F["Keypresses"]
+```
+BT HID Device  -->  /dev/stpbt  -->  Bumble (userspace BT stack)  -->  /dev/uhid  -->  Linux input (/dev/input/eventX)  -->  Keypresses
 ```
 
 ## Features
@@ -73,10 +66,22 @@ It allows to:
 
 - **Pair a new device**
 - **List paired devices**
-- **Install service** - these files are needed to configure the connected devices as keyboard. Don't need to use this if you use other input devices (page turners, game controllers)
-- **Install upstart daemon** - this will make *kindle-hid-passthrough* start automatically at system startup. Use this if you plan to often use the Kindle for writing. 
-- **Install KUAL menu** - adds a KUAL menu to start or stop the service.
-- **Set custom keyboard layout** - Adds KUAL menu to switch to a custom keyboard layout (French, German, Dvorak...)
+- **Install udev rules** - needed to configure connected devices as keyboards. Not required for other input devices (page turners, game controllers)
+- **Install upstart** - makes *kindle-hid-passthrough* start automatically at boot. Use this if you plan to often use the Kindle for writing
+- **Install BTManager app** - installs a touchscreen UI for managing devices directly on the Kindle (see below)
+- **Set custom keyboard layout** - switch to a custom keyboard layout (French, German, Dvorak...)
+
+### BTManager WAF App
+
+A built-in Kindle app for managing Bluetooth HID devices from the touchscreen — no SSH needed. Scan for devices, pair, remove, start/stop the daemon, all from the Kindle UI.
+
+![BTManager scan & pair](docs/screenshots/btmanager-scan.png)
+
+Install via option 5 in `install.sh`, or directly:
+
+```bash
+/mnt/us/kindle_hid_passthrough/illusion/install-waf-app.sh
+```
 
 ### Manual usage
 

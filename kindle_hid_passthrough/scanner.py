@@ -53,6 +53,7 @@ class Scanner:
         self.transport_spec = transport_spec or config.transport
         self.transport = None
         self.device = None
+        self.on_device_found = None  # Optional callback(DiscoveredDevice)
 
     async def start(self):
         """Initialize the Bumble device."""
@@ -210,6 +211,8 @@ class Scanner:
                 )
                 devices_found.append(device)
                 log.info(f"  Found: {device}")
+                if self.on_device_found:
+                    self.on_device_found(device)
 
         self.device.on('advertisement', on_advertisement)
         try:
@@ -269,6 +272,8 @@ class Scanner:
                 )
                 devices_found.append(device)
                 log.info(f"  Found: {device}")
+                if self.on_device_found:
+                    self.on_device_found(device)
 
         self.device.on('inquiry_result', on_inquiry_result)
         try:
