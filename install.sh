@@ -1,13 +1,22 @@
 #!/bin/sh
 
-installDaemon()
+installAll()
 {
-  echo " -> Installing daemon"
+  echo ""
+  echo "=== Full Install ==="
+  installUdevRules
+  installUpstart
+  installWAFApp
+  echo ""
+  echo "Installation complete. Open 'BT Manager' from the Kindle library."
+}
+
+installUdevRules()
+{
+  echo " -> Installing udev rules"
   mntroot rw
-  echo "    * Copying udev rules"
   cp assets/dev_is_keyboard.sh /usr/local/bin/
   cp assets/99-hid-keyboard.rules /etc/udev/rules.d
-  echo "    * Enabling udev rules"
   udevadm control --reload-rules
   mntroot ro
   echo " -> Ready."
@@ -17,17 +26,8 @@ installUpstart()
 {
   echo " -> Installing upstart service"
   mntroot rw
-  cp assets/hid-passthrough-dev.upstart  /etc/upstart/hid-passthrough.conf
+  cp kindle_hid_passthrough/hid-passthrough.upstart /etc/upstart/hid-passthrough.conf
   mntroot ro
-  echo " -> Ready."
-}
-
-installKUAL()
-{
-  echo " -> Installing KUAL menu"
-  mkdir -p ../extensions/BT_Keyboard
-  cp assets/config.xml ../extensions/BT_Keyboard/
-  cp assets/menu.json ../extensions/BT_Keyboard/
   echo " -> Ready."
 }
 
@@ -44,50 +44,60 @@ listDevices()
 
 setLayout()
 {
-  echo "This option will install a KUAL menu to switch to a custom keyboard layout"
-  mkdir -p ../extensions/BT_Keyboard
-  cp assets/menu_setlayout.json ../extensions/BT_Keyboard/menu.json
   printf "Enter layout code (e.g. fr, de, 'fr(oss)'): "
   read layout
-  sed -i "s/CUSTOMLAYOUT/$layout/g" ../extensions/BT_Keyboard/menu.json
+  /bin/sh setlayout.sh "$layout"
+}
+
+installWAFApp()
+{
+  if [ -f illusion/install-waf-app.sh ]; then
+    /bin/sh illusion/install-waf-app.sh
+  else
+    echo "ERROR: illusion/install-waf-app.sh not found"
+  fi
 }
 
 print_menu()
 {
   printf "\nSelect an option:\n"
-  printf " 1) Pair Bluetooth keyboard\n"
-  printf " 2) List paired devices\n"
-  printf " 3) Install upstart - installs a service running continuously\n"
-  printf " 4) Install keyboard service - maps keyboard events to keypresses\n"
-  printf " 5) Install KUAL menu\n"
-  printf " 6) Set custom keyboard layout\n"
-  printf " 7) Quit\n"
+  printf " 1) Install everything (recommended)\n"
+  printf " 2) Pair Bluetooth keyboard\n"
+  printf " 3) List paired devices\n"
+  printf " 4) Install udev rules (keyboard service)\n"
+  printf " 5) Install upstart (auto-start on boot)\n"
+  printf " 6) Install BTManager app\n"
+  printf " 7) Set custom keyboard layout\n"
+  printf " 8) Quit\n"
 }
 
 while :; do
   print_menu
-  printf "Enter choice [1-6]: "
+  printf "Enter choice [1-8]: "
   read choice
   case "$choice" in
     1)
-      pairDevice
+      installAll
       ;;
     2)
-      listDevices
+      pairDevice
       ;;
     3)
-      installDaemon
+      listDevices
       ;;
     4)
-      installUpstart
+      installUdevRules
       ;;
     5)
-      installKUAL
+      installUpstart
       ;;
     6)
-      setLayout
+      installWAFApp
       ;;
     7)
+      setLayout
+      ;;
+    8)
       echo "Exiting."
       break
       ;;
