@@ -17,7 +17,9 @@ from bumble.device import Device, Peer
 from bumble.gatt import (
     GATT_DEVICE_NAME_CHARACTERISTIC,
     GATT_GENERIC_ACCESS_SERVICE,
+    GATT_HID_CONTROL_POINT_CHARACTERISTIC,
     GATT_HUMAN_INTERFACE_DEVICE_SERVICE,
+    GATT_PROTOCOL_MODE_CHARACTERISTIC,
     GATT_REPORT_CHARACTERISTIC,
     GATT_REPORT_MAP_CHARACTERISTIC,
     GATT_REPORT_REFERENCE_DESCRIPTOR,
@@ -153,10 +155,6 @@ class HIDHost:
 
         # UHID
         self.uhid_device = None
-        self._uhid_available = True
-        self._UHIDDevice = UHIDDevice
-        self._Bus = Bus
-        self._UHIDError = UHIDError
 
         # Events
         self._disconnection_event = None
@@ -293,12 +291,8 @@ class HIDHost:
                     return f"{dev.name} ({addr})"
         return addr
 
-    async def run(self, target_address: str = None):
-        """Main run loop - handle both protocols concurrently.
-
-        Args:
-            target_address: Optional specific address (uses devices.conf if None)
-        """
+    async def run(self):
+        """Main run loop - handle both protocols concurrently."""
         self._disconnection_event = asyncio.Event()
         self._connection_future = asyncio.get_event_loop().create_future()
 
@@ -516,7 +510,7 @@ class HIDHost:
             log.success("[BLE] Pairing complete!")
 
             # Discover and cache HID data
-            await self._discover_and_cache_ble_hid(address)
+            await self._discover_ble_hid_service()
 
             return True
         except Exception as e:
@@ -530,37 +524,47 @@ class HIDHost:
                 self.peer = None
             return False
 
-    async def _discover_and_cache_ble_hid(self, address: str):
-        """Discover BLE HID service and cache data."""
-        if not self.peer:
-            return
+    async def _discover_ble_hid_service(self, process_reports: bool = False):
+        """Discover BLE GATT HID service and cache descriptor.
 
+        Args:
+            process_reports: If True, also discover report characteristics
+                for subscribing to notifications (used during connection).
+        """
         await self.peer.discover_services()
-        await self._read_ble_device_name()
+
+        if not self.device_name:
+            await self._read_ble_device_name()
 
         hid_services = [s for s in self.peer.services if s.uuid == GATT_HUMAN_INTERFACE_DEVICE_SERVICE]
         if not hid_services:
+            if process_reports:
+                raise InvalidStateError("[BLE] HID service not found")
             log.warning("[BLE] HID service not found")
             return
 
         hid_service = hid_services[0]
+        log.success("[BLE] Found HID service")
+
         await self.peer.discover_characteristics(service=hid_service)
 
         for char in hid_service.characteristics:
-            if char.uuid == GATT_REPORT_MAP_CHARACTERISTIC:
+            if char.uuid == GATT_REPORT_MAP_CHARACTERISTIC and not self.report_map:
                 try:
                     value = await self.peer.read_value(char)
                     self.report_map = bytes(value)
-                    log.success(f"[BLE] Got report descriptor: {len(self.report_map)} bytes")
+                    log.success(f"[BLE] Got descriptor: {len(self.report_map)} bytes")
+
+                    address = self.current_device_address
+                    self.device_cache.save(address, {
+                        'report_map': self.report_map.hex(),
+                        'device_name': self.device_name
+                    })
                 except Exception as e:
                     log.warning(f"[BLE] Failed to read report map: {e}")
 
-        if self.report_map:
-            self.device_cache.save(address, {
-                'report_map': self.report_map.hex(),
-                'device_name': self.device_name
-            })
-            log.success("[BLE] Cached HID data for future connections")
+            elif process_reports and char.uuid == GATT_REPORT_CHARACTERISTIC:
+                await self._process_ble_report_char(char)
 
     async def _pair_classic(self, address: str) -> bool:
         """Pair with a Classic Bluetooth device."""
@@ -621,7 +625,7 @@ class HIDHost:
                     log.warning(f"[Classic] Encryption: {e}")
 
             # Query SDP for report descriptor
-            await self._query_and_cache_classic_sdp(address)
+            await self._query_classic_sdp(address)
 
             # Verify link key was saved
             if self.keystore:
@@ -645,12 +649,18 @@ class HIDHost:
                 self.connection = None
             return False
 
-    async def _query_and_cache_classic_sdp(self, address: str):
-        """Query SDP for HID descriptor and cache it."""
+    async def _query_classic_sdp(self, address: str = None):
+        """Query SDP for HID descriptor and cache it.
+
+        Args:
+            address: Device address for caching. Defaults to current_device_address.
+        """
         if not self.connection:
             return
 
-        log.info("[Classic] Querying SDP for HID descriptor...")
+        address = address or self.current_device_address
+
+        log.info("[Classic] Querying SDP...")
         try:
             sdp_client = SDPClient(self.connection)
             await asyncio.wait_for(sdp_client.connect(), timeout=5.0)
@@ -776,13 +786,14 @@ class HIDHost:
 
         # Discover HID service if needed
         if not self.report_map:
-            await self._discover_ble_hid_service()
+            await self._discover_ble_hid_service(process_reports=True)
 
         if not self.report_map:
             raise InvalidStateError("[BLE] No report descriptor available")
 
         self._create_uhid_device()
         await self._subscribe_to_ble_reports()
+        await self._ble_activate_hid_service()
 
     # ==================== CLASSIC HANDLER ====================
 
@@ -1030,48 +1041,6 @@ class HIDHost:
 
         self._create_uhid_device()
 
-    async def _query_classic_sdp(self):
-        """Query SDP for HID descriptor."""
-        if not self.connection:
-            return
-
-        log.info("[Classic] Querying SDP...")
-        try:
-            sdp_client = SDPClient(self.connection)
-            await asyncio.wait_for(sdp_client.connect(), timeout=5.0)
-
-            result = await asyncio.wait_for(
-                sdp_client.search_attributes(
-                    [BT_HUMAN_INTERFACE_DEVICE_SERVICE],
-                    [0x0100, 0x0206]
-                ),
-                timeout=10.0
-            )
-
-            if result:
-                for record in result:
-                    for attr in record:
-                        if hasattr(attr, 'id') and attr.id == 0x0206:
-                            self._parse_hid_descriptor_list(attr.value)
-                        elif hasattr(attr, 'id') and attr.id == 0x0100:
-                            try:
-                                name = attr.value.value
-                                if isinstance(name, bytes):
-                                    name = name.decode('utf-8', errors='replace')
-                                self.device_name = str(name)
-                            except Exception:
-                                pass
-
-            await sdp_client.disconnect()
-
-            if self.report_map:
-                self.device_cache.save(self.current_device_address, {
-                    'report_map': self.report_map.hex(),
-                    'device_name': self.device_name or 'Unknown'
-                })
-        except Exception as e:
-            log.warning(f"[Classic] SDP query failed: {e}")
-
     def _parse_hid_descriptor_list(self, data_element):
         """Parse HID Descriptor List from SDP."""
         try:
@@ -1239,7 +1208,7 @@ class HIDHost:
             log.success(f"[BLE] Loaded cached descriptor ({len(self.report_map)} bytes)")
 
         # Discover GATT services
-        await self._discover_ble_hid_service()
+        await self._discover_ble_hid_service(process_reports=True)
 
         if not self.report_map:
             raise InvalidStateError("[BLE] No report descriptor available")
@@ -1248,40 +1217,6 @@ class HIDHost:
 
         # Subscribe to reports
         await self._subscribe_to_ble_reports()
-
-    async def _discover_ble_hid_service(self):
-        """Discover BLE GATT HID service."""
-        await self.peer.discover_services()
-
-        # Read device name
-        if not self.device_name:
-            await self._read_ble_device_name()
-
-        hid_services = [s for s in self.peer.services if s.uuid == GATT_HUMAN_INTERFACE_DEVICE_SERVICE]
-        if not hid_services:
-            raise InvalidStateError("[BLE] HID service not found")
-
-        hid_service = hid_services[0]
-        log.success("[BLE] Found HID service")
-
-        await self.peer.discover_characteristics(service=hid_service)
-
-        for char in hid_service.characteristics:
-            if char.uuid == GATT_REPORT_MAP_CHARACTERISTIC and not self.report_map:
-                try:
-                    value = await self.peer.read_value(char)
-                    self.report_map = bytes(value)
-                    log.success(f"[BLE] Got descriptor: {len(self.report_map)} bytes")
-
-                    self.device_cache.save(self.current_device_address, {
-                        'report_map': self.report_map.hex(),
-                        'device_name': self.device_name
-                    })
-                except Exception as e:
-                    log.warning(f"[BLE] Failed to read report map: {e}")
-
-            elif char.uuid == GATT_REPORT_CHARACTERISTIC:
-                await self._process_ble_report_char(char)
 
     async def _read_ble_device_name(self):
         """Read BLE device name from Generic Access Service."""
@@ -1332,6 +1267,49 @@ class HIDHost:
             except Exception as e:
                 log.warning(f"[BLE] Failed to subscribe to report {report_id}: {e}")
 
+    async def _ble_activate_hid_service(self):
+        """Write Exit Suspend to HID Control Point and read Protocol Mode.
+
+        Some BLE keyboards enter a suspended state after reconnection and
+        won't send GATT notifications until the host writes Exit Suspend
+        (0x01) to the HID Control Point characteristic (UUID 0x2A4C).
+        """
+        if not self.peer:
+            log.warning("[BLE] No peer for HID activation")
+            return
+
+        hid_services = [s for s in self.peer.services if s.uuid == GATT_HUMAN_INTERFACE_DEVICE_SERVICE]
+        if not hid_services:
+            log.warning("[BLE] No HID service found for activation")
+            return
+
+        hid_service = hid_services[0]
+        # Ensure characteristics are discovered
+        if not hid_service.characteristics:
+            log.info("[BLE] Discovering characteristics for HID activation...")
+            await self.peer.discover_characteristics(service=hid_service)
+
+        found_cp = False
+        for char in hid_service.characteristics:
+            if char.uuid == GATT_HID_CONTROL_POINT_CHARACTERISTIC:
+                found_cp = True
+                try:
+                    await self.peer.write_value(char, bytes([0x01]), with_response=False)
+                    log.info("[BLE] Wrote Exit Suspend to HID Control Point")
+                except Exception as e:
+                    log.warning(f"[BLE] Failed to write HID Control Point: {e}")
+
+            elif char.uuid == GATT_PROTOCOL_MODE_CHARACTERISTIC:
+                try:
+                    value = await self.peer.read_value(char)
+                    mode = "Report" if bytes(value) == b'\x01' else "Boot"
+                    log.info(f"[BLE] Protocol Mode: {mode}")
+                except Exception as e:
+                    log.warning(f"[BLE] Failed to read Protocol Mode: {e}")
+
+        if not found_cp:
+            log.info(f"[BLE] No HID Control Point characteristic (found {len(hid_service.characteristics)} chars)")
+
     def _on_ble_hid_report(self, value, report_id):
         """Handle BLE HID report."""
         # For BLE, GATT notifications do NOT include the Report ID.
@@ -1366,20 +1344,16 @@ class HIDHost:
 
     def _create_uhid_device(self):
         """Create UHID virtual device."""
-        if not self._uhid_available:
-            log.warning("UHID not available")
-            return
-
         if not self.report_map:
             log.warning("No report descriptor for UHID")
             return
 
         try:
             name = self.device_name or "HID Device"
-            self.uhid_device = self._UHIDDevice(
+            self.uhid_device = UHIDDevice(
                 name=name,
                 report_descriptor=self.report_map,
-                bus=self._Bus.BLUETOOTH,
+                bus=Bus.BLUETOOTH,
                 vendor=0,
                 product=0,
             )

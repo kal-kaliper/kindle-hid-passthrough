@@ -20,7 +20,7 @@ Usage:
     from host import HIDHost
 
     host = HIDHost()
-    await host.run(device_address)
+    await host.run()
 """
 
 from config import Protocol, __version__, config
