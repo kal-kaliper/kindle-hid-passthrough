@@ -85,7 +85,7 @@ class HIDDaemon:
         """Load device(s) from config file."""
         devices = config.get_all_devices()
         if not devices:
-            logger.error(f"No devices in {config.devices_config_file}")
+            logger.info(f"No devices in {config.devices_config_file}")
             return False
 
         # Use first device's address

@@ -26,7 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir \
     nuitka \
     ordered-set \
-    bumble>=0.0.193 \
+    bumble==0.0.226 \
     aiofiles>=23.0.0
 
 # Enable ccache
