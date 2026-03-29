@@ -50,6 +50,7 @@ jobs:
         run: |
           cp install.sh hid-passthrough-daemon.sh setlayout.sh output/
           cp -r assets/ output/
+          cp -r illusion/ output/
           cp kindle_hid_passthrough/config.ini output/
 
       - name: Show contents
@@ -63,12 +64,7 @@ jobs:
 
       - name: Create tarball
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF_NAME}"
-          else
-            VERSION="dev-$(git rev-parse --short HEAD)"
-          fi
-          tar -czvf "kindle-hid-passthrough-${VERSION}-armv7.tar.gz" -C output .
+          tar -czvf "kindle-hid-passthrough-armv7.tar.gz" -C output .
           ls -lh *.tar.gz
 
       - name: Upload artifact
@@ -83,6 +79,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v1
         with:
-          files: kindle-hid-passthrough-${{ github.ref_name }}-armv7.tar.gz
+          files: kindle-hid-passthrough-armv7.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
