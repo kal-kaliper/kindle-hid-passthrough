@@ -8,8 +8,7 @@ APP_ID="com.lzampier.btmanager"
 APP_DIR="/mnt/us/kindle_hid_passthrough/illusion/BTManager"
 ILLUSION_DIR="/mnt/us/kindle_hid_passthrough/illusion"
 SOURCE_DIR="$APP_DIR"
-PYTHON="/mnt/us/python3.10-kindle/python3-wrapper.sh"
-MAIN_PY="$ILLUSION_DIR/../main.py"
+BINARY="$ILLUSION_DIR/../kindle-hid-passthrough"
 SCRIPTLET="$ILLUSION_DIR/BTManager.sh"
 SCRIPTLET_DEST="/mnt/us/documents/BTManager.sh"
 APPREG_DB="/var/local/appreg.db"
@@ -26,8 +25,8 @@ if [ ! -f "$SOURCE_DIR/config.xml" ]; then
     exit 1
 fi
 
-if [ ! -f "$MAIN_PY" ]; then
-    echo "ERROR: main.py not found at $MAIN_PY"
+if [ ! -f "$BINARY" ]; then
+    echo "ERROR: kindle-hid-passthrough binary not found at $BINARY"
     exit 1
 fi
 
@@ -84,9 +83,9 @@ echo "   Installed to $SCRIPTLET_DEST"
 
 echo "5. Starting daemon..."
 # Stop existing instances
-pkill -f 'main.py --daemon' 2>/dev/null
+pkill -f "ld-linux-armhf." 2>/dev/null
 sleep 1
-"$PYTHON" "$MAIN_PY" --daemon &
+"$BINARY" --daemon &
 sleep 1
 echo "   Daemon started"
 
@@ -98,5 +97,5 @@ echo "  - Open 'BT Manager' from the Kindle library (scriptlet)"
 echo "  - Or launch directly: lipc-set-prop com.lab126.appmgrd start app://$APP_ID"
 echo ""
 echo "To start on boot, install the upstart config:"
-echo "  cp $ILLUSION_DIR/../hid-passthrough-dev.upstart /etc/upstart/hid-passthrough.conf"
+echo "  cp $ILLUSION_DIR/../assets/hid-passthrough.upstart /etc/upstart/hid-passthrough.conf"
 echo ""

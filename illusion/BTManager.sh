@@ -7,8 +7,8 @@
 APP_ID="com.lzampier.btmanager"
 APP_NAME="BT Manager"
 APP_DIR="/mnt/us/kindle_hid_passthrough/illusion/BTManager"
-PYTHON="/mnt/us/python3.10-kindle/python3-wrapper.sh"
-MAIN_PY="/mnt/us/kindle_hid_passthrough/main.py"
+BINARY="/mnt/us/kindle_hid_passthrough/kindle-hid-passthrough"
+LD_PROCESS="ld-linux-armhf."
 APPREG_DB="/var/local/appreg.db"
 
 # ---- Helpers ----
@@ -58,18 +58,18 @@ EOF
 # ---- Start helper daemon ----
 
 start_helper() {
-    if pgrep -f 'main.py --daemon' >/dev/null 2>&1; then
+    if pgrep -f "$LD_PROCESS" >/dev/null 2>&1; then
         log_msg "Daemon already running"
         return
     fi
 
-    if [ -f "$MAIN_PY" ]; then
+    if [ -f "$BINARY" ]; then
         log_msg "Starting daemon"
-        "$PYTHON" "$MAIN_PY" --daemon &
+        "$BINARY" --daemon &
         sleep 1
         log_msg "Daemon started"
     else
-        log_msg "WARNING: main.py not found at $MAIN_PY"
+        log_msg "WARNING: binary not found at $BINARY"
     fi
 }
 

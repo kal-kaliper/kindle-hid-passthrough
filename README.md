@@ -151,7 +151,7 @@ See [docs/troubleshooting.md](docs/troubleshooting.md) for manual commands, inst
 
 ## Development
 
-See [docs/development.md](docs/development.md) for development setup and commands.
+See [CLAUDE.md](CLAUDE.md) for development setup and commands.
 
 ## References
 
