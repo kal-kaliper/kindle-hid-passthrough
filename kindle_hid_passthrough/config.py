@@ -14,6 +14,8 @@ import os
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
+from kindle_detect import detect_kindle
+
 if TYPE_CHECKING:
     pass
 
@@ -80,8 +82,8 @@ class Config:
                                              f'{self.base_path}/devices.conf')
         self.log_file = self._get('logging', 'log_file', '/var/log/hid_passthrough.log')
 
-        # Transport
-        self.transport = self._get('transport', 'hci_transport', 'file:/dev/stpbt')
+        # Transport - auto-detect from Kindle model, fall back to config.ini
+        self.transport = self._detect_transport()
 
         # Timeouts (seconds)
         self.reconnect_delay = self._getint('connection', 'reconnect_delay', 5)
@@ -101,6 +103,51 @@ class Config:
         # Protocol
         protocol_str = self._get('protocol', 'type', 'ble').lower()
         self.protocol = self._parse_protocol(protocol_str)
+
+    def _detect_transport(self) -> str:
+        """Auto-detect HCI transport from Kindle hardware.
+
+        Tries known device paths for the detected Kindle model, then
+        falls back to probing common paths, and finally the hardcoded default.
+        """
+
+        defaults = detect_kindle()
+        self._kindle_defaults = defaults
+
+        if defaults:
+            transport = f'file:{defaults.device_path}'
+            if os.path.exists(defaults.device_path):
+                logging.getLogger(__name__).info(
+                    "Auto-detected transport: %s (%s)", transport, defaults.model_name)
+            else:
+                logging.getLogger(__name__).info(
+                    "Detected %s but %s not found yet (module may need loading)",
+                    defaults.model_name, defaults.device_path)
+            return transport
+
+        # Probe common device paths as a fallback
+        for path in ['/dev/stpbt', '/dev/ttyHS0', '/dev/ttyS1']:
+            if os.path.exists(path):
+                transport = f'file:{path}'
+                logging.getLogger(__name__).info(
+                    "Probed transport: %s", transport)
+                return transport
+
+        # Fall back to config.ini value
+        configured = self._get('transport', 'hci_transport', None)
+        if configured:
+            logging.getLogger(__name__).info(
+                "Using configured transport: %s", configured)
+            return configured
+
+        return None
+
+    @property
+    def kindle_defaults(self):
+        """Return detected Kindle hardware defaults, or None."""
+        if not hasattr(self, '_kindle_defaults'):
+                self._kindle_defaults = detect_kindle()
+        return self._kindle_defaults
 
     def _parse_protocol(self, protocol_str: str) -> Protocol:
         """Parse protocol string to Protocol enum."""
