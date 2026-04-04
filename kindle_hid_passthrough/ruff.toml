@@ -1,4 +1,4 @@
-line-length = 120
+line-length = 160
 
 [lint]
 select = ["E", "F", "W", "I"]

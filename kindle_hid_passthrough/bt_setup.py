@@ -19,6 +19,7 @@ import os
 import subprocess
 import time
 
+from kindle_detect import detect_kindle
 from logging_utils import log
 
 # Known BT kernel module patterns across Kindle versions
@@ -116,6 +117,9 @@ def prepare_bt(transport_spec=None, module_patterns=None,
     2. Kill Amazon's conflicting BT processes
     3. Wait for device to settle
 
+    Uses auto-detected Kindle hardware defaults when module_patterns
+    and kill_processes are not specified and not overridden in config.ini.
+
     Args:
         transport_spec: Transport string (e.g. 'file:/dev/stpbt') to
                        extract device path. If None, uses /dev/stpbt.
@@ -126,10 +130,21 @@ def prepare_bt(transport_spec=None, module_patterns=None,
     Returns:
         True if BT device is ready.
     """
-    # Extract device path from transport spec
+    # Use auto-detected Kindle defaults when not explicitly provided
+    kindle = detect_kindle()
+
+    # Extract device path from transport spec, or use detected default
     device_path = '/dev/stpbt'
     if transport_spec and transport_spec.startswith('file:'):
         device_path = transport_spec[5:]
+    elif kindle:
+        device_path = kindle.device_path
+
+    if module_patterns is None and kindle:
+        module_patterns = [kindle.kernel_module]
+
+    if kill_processes is None and kindle:
+        kill_processes = kindle.kill_processes
 
     log.info("Preparing Bluetooth hardware...")
 

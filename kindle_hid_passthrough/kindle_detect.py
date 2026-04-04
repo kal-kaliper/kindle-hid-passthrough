@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""
+Kindle model detection and hardware defaults.
+
+Identifies the Kindle model from the device serial number and provides
+hardware-specific defaults (BT device path, kernel module, processes to kill).
+
+Only BT-capable Kindles (Oasis 1 / 2016 onwards) are included.
+
+Device codes and model data sourced from NiLuJe's KindleTool:
+  https://github.com/NiLuJe/KindleTool
+Generation/platform mapping from KindleModding:
+  https://github.com/KindleModding/kindlemodding.github.io
+
+Serial decoding uses Crockford's base32 (charset: 0-9 A-H J-N P V-X,
+no I/O/Y/Z). Old serials (prefix B) encode device code as 2-char hex
+at positions 2-3. New serials (prefix G) encode as 3-char base32 at
+positions 3-5.
+"""
+
+import os
+from dataclasses import dataclass
+from typing import Optional
+
+from logging_utils import log
+
+USID_PATH = '/proc/usid'
+
+_B32_CHARS = '0123456789ABCDEFGHJKLMNPQRSTUVWX'
+_B32_LOOKUP = {c: i for i, c in enumerate(_B32_CHARS)}
+
+
+@dataclass
+class KindleDefaults:
+    """Hardware defaults for a Kindle model."""
+    device_path: str            # BT character device (e.g. /dev/stpbt)
+    kernel_module: str          # Primary kernel module filename
+    kill_processes: list        # Conflicting processes to stop
+    model_name: str             # Human-readable generation name
+
+
+# --- Hardware profiles ---
+
+_MTK_HW = dict(
+    device_path='/dev/stpbt',
+    kernel_module='wmt_cdev_bt.ko',
+    kill_processes=['bluetoothd', 'vhci_stpbt_bridge'],
+)
+
+# Broadcom BCM4343 over BSA (proprietary, not HCI-compatible).
+# These Kindles have BT hardware but use Broadcom's BSA protocol over UART,
+# which Bumble cannot speak. See: https://github.com/zampierilucas/kindle-hid-passthrough/issues/22
+_BRCM_HW = None
+
+
+# --- Generations with device codes ---
+# Each entry: (name, hw_profile, [device_codes])
+# Device codes are integers derived from KindleTool model_tuples.
+# hw_profile=None means detected but unsupported.
+
+_GENERATIONS = [
+    # NXP i.MX + Broadcom BCM4343 (8th-10th gen, BSA stack, unsupported)
+    ('Kindle Oasis 1',   _BRCM_HW, [0x20C, 0x20D, 0x219, 0x21A, 0x21B, 0x21C]),
+    ('Kindle Oasis 2',   _BRCM_HW, [0x295, 0x296, 0x297, 0x298, 0x2E1, 0x2E2, 0x2E6, 0x2E7, 0x2E8, 0x341, 0x342, 0x343, 0x344, 0x347, 0x34A]),
+    ('Kindle PW4',       _BRCM_HW, [
+        0x2F7, 0x361, 0x362, 0x363, 0x364, 0x365, 0x366, 0x367, 0x372, 0x373, 0x374, 0x375, 0x376, 0x402, 0x403,
+        0x4D8, 0x4D9, 0x4DA, 0x4DB, 0x4DC, 0x4DD, 0x2F4,
+    ]),
+    ('Kindle Basic 4',   _BRCM_HW, [0x414, 0x3CF, 0x3D0, 0x3D1, 0x3D2, 0x3AB]),
+    ('Kindle Oasis 3',   _BRCM_HW, [0x434, 0x3D8, 0x3D7, 0x3D6, 0x3D5, 0x3D4]),
+
+    # MediaTek CONSYS platforms
+    ('Kindle PW5',       _MTK_HW, [0x690, 0x700, 0x6FF, 0x7AD, 0x829, 0x82A, 0x971, 0x972, 0x9B3]),
+    ('Kindle Basic 5',   _MTK_HW, [0x84D, 0x8BB, 0x86A, 0x958, 0x957, 0x7F1, 0x84C]),
+    ('Kindle Scribe',    _MTK_HW, [0x8F2, 0x974, 0x8C3, 0x847, 0x975, 0x874, 0x875, 0x8E0]),
+    ('Kindle Basic 6',   _MTK_HW, [0xE85, 0xE86, 0xE84, 0xE83, 0x2909, 0xE82, 0xE75]),
+    ('Kindle PW6',       _MTK_HW, [0xC89, 0xC86, 0xC7F, 0xC7E, 0xE2A, 0xE25, 0xE23, 0xE28, 0xE45, 0xE5A]),
+    ('Kindle Scribe 2',  _MTK_HW, [0xFA0, 0xFA1, 0xFE5, 0xF9D, 0xFE4, 0xFE3, 0x102E, 0x102D]),
+    ('Kindle Colorsoft',  _MTK_HW, [0xE29, 0xE24, 0xE2B, 0xE26, 0xE22, 0xC9F, 0xE27, 0xE5B, 0xE46, 0x10A6, 0x10A5, 0x11D7]),
+    ('Kindle Scribe 3',  _MTK_HW, [0x12F0, 0x12EE, 0x12F4, 0x11E8, 0x11EA, 0x10A4]),
+    ('Kindle Scribe CS', _MTK_HW, [0x13BF, 0x12EF, 0x12F1, 0x11E9, 0x11EB, 0x10D7]),
+]
+
+# Flat lookup: device_code -> (name, hw_profile)
+_CODE_LOOKUP = {}
+for _name, _hw, _codes in _GENERATIONS:
+    for _code in _codes:
+        _CODE_LOOKUP[_code] = (_name, _hw)
+
+
+def _decode_device_code(serial: str) -> Optional[int]:
+    """Extract integer device code from a Kindle serial number.
+
+    Old serials (start with B): 2-char hex at positions 2-3.
+    New serials (start with G): 3-char Crockford base32 at positions 3-5.
+    """
+    if not serial or len(serial) < 6:
+        return None
+
+    serial = serial.upper()
+
+    if serial[0] == 'G':
+        code_str = serial[3:6]
+        try:
+            return ((_B32_LOOKUP[code_str[0]] << 10) |
+                    (_B32_LOOKUP[code_str[1]] << 5) |
+                    _B32_LOOKUP[code_str[2]])
+        except (KeyError, IndexError):
+            return None
+    else:
+        try:
+            return int(serial[2:4], 16)
+        except ValueError:
+            return None
+
+
+def read_serial() -> Optional[str]:
+    """Read the Kindle serial number from /proc/usid."""
+    try:
+        with open(USID_PATH, 'r') as f:
+            return f.read().strip()
+    except (OSError, IOError):
+        return None
+
+
+def detect_kindle(serial: str = None) -> Optional[KindleDefaults]:
+    """Detect the Kindle model and return hardware defaults.
+
+    Only returns a result for BT-capable models (Oasis 1 / 2016 onwards).
+
+    Args:
+        serial: Optional serial number override (for testing).
+
+    Returns:
+        KindleDefaults if a BT-capable model is recognized, None otherwise.
+    """
+    if serial is None:
+        serial = read_serial()
+    if not serial:
+        log.debug(f"Could not read Kindle serial from {USID_PATH}")
+        return None
+
+    device_code = _decode_device_code(serial)
+    if device_code is None:
+        log.warning("Could not decode device code from serial")
+        return None
+
+    result = _CODE_LOOKUP.get(device_code)
+    if result is None:
+        log.info(f"Unknown device code 0x{device_code:X} (pre-BT or unrecognized)")
+        return None
+
+    name, hw = result
+    if hw is None:
+        log.error(f"Detected {name} (code 0x{device_code:X}) - uses Broadcom BSA stack, not supported. "
+                   "See https://github.com/zampierilucas/kindle-hid-passthrough/issues/22")
+        return None
+
+    defaults = KindleDefaults(
+        device_path=hw['device_path'],
+        kernel_module=hw['kernel_module'],
+        kill_processes=list(hw['kill_processes']),
+        model_name=name,
+    )
+    log.info(f"Detected {name} (code 0x{device_code:X})")
+    return defaults
+
+
+def get_default_transport() -> Optional[str]:
+    """Get the default HCI transport spec for this Kindle.
+
+    Returns:
+        Transport string like 'file:/dev/stpbt' or None if unknown.
+    """
+    defaults = detect_kindle()
+    if defaults and os.path.exists(defaults.device_path):
+        return f'file:{defaults.device_path}'
+    return None
