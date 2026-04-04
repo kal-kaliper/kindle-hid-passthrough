@@ -137,7 +137,7 @@ def detect_kindle(serial: str = None) -> Optional[KindleDefaults]:
     if serial is None:
         serial = read_serial()
     if not serial:
-        log.debug("Could not read Kindle serial from %s", USID_PATH)
+        log.debug(f"Could not read Kindle serial from {USID_PATH}")
         return None
 
     device_code = _decode_device_code(serial)
@@ -147,14 +147,13 @@ def detect_kindle(serial: str = None) -> Optional[KindleDefaults]:
 
     result = _CODE_LOOKUP.get(device_code)
     if result is None:
-        log.info("Unknown device code 0x%X (pre-BT or unrecognized)", device_code)
+        log.info(f"Unknown device code 0x{device_code:X} (pre-BT or unrecognized)")
         return None
 
     name, hw = result
     if hw is None:
-        log.error("Detected %s (code 0x%X) - uses Broadcom BSA stack, not supported. "
-                   "See https://github.com/zampierilucas/kindle-hid-passthrough/issues/22",
-                   name, device_code)
+        log.error(f"Detected {name} (code 0x{device_code:X}) - uses Broadcom BSA stack, not supported. "
+                   "See https://github.com/zampierilucas/kindle-hid-passthrough/issues/22")
         return None
 
     defaults = KindleDefaults(
@@ -163,7 +162,7 @@ def detect_kindle(serial: str = None) -> Optional[KindleDefaults]:
         kill_processes=list(hw['kill_processes']),
         model_name=name,
     )
-    log.info("Detected %s (code 0x%X)", name, device_code)
+    log.info(f"Detected {name} (code 0x{device_code:X})")
     return defaults
 
 
