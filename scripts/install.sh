@@ -15,7 +15,7 @@ installUdevRules()
 {
   echo " -> Installing udev rules"
   mntroot rw
-  cp assets/dev_is_keyboard.sh /usr/local/bin/
+  cp scripts/dev_is_keyboard.sh /usr/local/bin/
   cp assets/99-hid-keyboard.rules /etc/udev/rules.d
   udevadm control --reload-rules
   mntroot ro
@@ -26,7 +26,7 @@ installUpstart()
 {
   echo " -> Installing upstart service"
   mntroot rw
-  cp kindle_hid_passthrough/hid-passthrough.upstart /etc/upstart/hid-passthrough.conf
+  cp assets/hid-passthrough.upstart /etc/upstart/hid-passthrough.conf
   mntroot ro
   echo " -> Ready."
 }
