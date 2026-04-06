@@ -12,7 +12,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import List, Optional
 
-from bumble.core import BT_BR_EDR_TRANSPORT, BT_HUMAN_INTERFACE_DEVICE_SERVICE, InvalidStateError
+from bumble.core import BT_BR_EDR_TRANSPORT, BT_LE_TRANSPORT, BT_HUMAN_INTERFACE_DEVICE_SERVICE, InvalidStateError
 from bumble.device import Device, Peer
 from bumble.gatt import (
     GATT_DEVICE_NAME_CHARACTERISTIC,
@@ -26,6 +26,10 @@ from bumble.gatt import (
 )
 from bumble.hci import (
     Address,
+    HCI_LE_Add_Device_To_Filter_Accept_List_Command,
+    HCI_LE_Clear_Filter_Accept_List_Command,
+    HCI_LE_Create_Connection_Cancel_Command,
+    HCI_LE_Create_Connection_Command,
     HCI_Reset_Command,
     HCI_Write_Class_Of_Device_Command,
     HCI_Write_Local_Name_Command,
@@ -1100,19 +1104,123 @@ class HIDHost:
     # ==================== BLE HANDLER ====================
 
     async def _run_ble_handler(self):
-        """Handle BLE connections."""
-        log.info(f"[BLE] Scanning for {len(self.ble_devices)} device(s)...")
+        """Handle BLE connections.
 
-        target_addresses = set()
-        for dev in self.ble_devices:
-            if dev.address != '*':
-                target_addresses.add(dev.address)
+        For known addresses: uses the HCI filter accept list so the controller
+        catches both directed and undirected advertising from bonded devices.
+        For wildcard '*': falls back to active scanning for discovery.
+        """
+        known_addresses = [dev.address for dev in self.ble_devices if dev.address != '*']
+        has_wildcard = any(dev.address == '*' for dev in self.ble_devices)
 
-        # Also include keystore addresses for BLE
-        # (they might have been paired but not in devices.conf)
+        if known_addresses:
+            await self._run_ble_accept_list_handler(known_addresses)
+        elif has_wildcard:
+            await self._run_ble_scan_handler(set())
+
+    async def _run_ble_accept_list_handler(self, addresses: list):
+        """Wait for BLE connections using the filter accept list.
+
+        Puts the controller in the initiating state with all known addresses
+        on the filter accept list. This catches both directed advertising
+        (peripheral-initiated reconnection) and undirected advertising.
+        """
+        # Set up filter accept list
+        await self.device.send_command(
+            HCI_LE_Clear_Filter_Accept_List_Command(), check_result=True)
+
+        for addr_str in addresses:
+            target = Address(addr_str)
+            await self.device.send_command(
+                HCI_LE_Add_Device_To_Filter_Accept_List_Command(
+                    address_type=target.address_type,
+                    address=target,
+                ), check_result=True)
+
+        log.info(f"[BLE] Waiting for {len(addresses)} device(s) (accept list)")
+
+        # Listen for connection events from Bumble's event system
+        pending = asyncio.get_running_loop().create_future()
+
+        def on_connection(connection):
+            if connection.transport == BT_LE_TRANSPORT and not pending.done():
+                pending.set_result(connection)
+
+        def on_failure(error):
+            if not pending.done():
+                pending.set_exception(error)
+
+        self.device.on(Device.EVENT_CONNECTION, on_connection)
+        self.device.on(Device.EVENT_CONNECTION_FAILURE, on_failure)
+
+        try:
+            # Tell Bumble we're in the initiating state
+            self.device.connect_own_address_type = OwnAddressType.PUBLIC
+            self.device.le_connecting = True
+
+            # Issue create connection with filter accept list policy
+            await self.device.send_command(
+                HCI_LE_Create_Connection_Command(
+                    le_scan_interval=96,        # 60ms / 0.625
+                    le_scan_window=96,           # 60ms / 0.625
+                    initiator_filter_policy=1,   # Use filter accept list
+                    peer_address_type=0,         # Ignored when filter_policy=1
+                    peer_address=Address.ANY,    # Ignored when filter_policy=1
+                    own_address_type=OwnAddressType.PUBLIC,
+                    connection_interval_min=12,  # 15ms / 1.25
+                    connection_interval_max=24,  # 30ms / 1.25
+                    max_latency=0,
+                    supervision_timeout=72,      # 720ms / 10
+                    min_ce_length=0,
+                    max_ce_length=0,
+                ), check_result=True)
+
+            # Wait for a device on the accept list to connect
+            connection = await asyncio.shield(pending)
+
+            if self._connection_future.done():
+                await connection.disconnect()
+                return
+
+            addr_str = str(connection.peer_address)
+            log.info(f"[BLE] Device connected: {self._format_device(addr_str)}")
+
+            self.connection = connection
+            self.peer = Peer(connection)
+            self.current_device_address = addr_str
+            self.connected_protocol = Protocol.BLE
+            connection.on('disconnection', self._on_disconnection)
+
+            await self._ble_restore_or_pair()
+
+            if not self._connection_future.done():
+                self._connection_future.set_result(connection)
+
+        except asyncio.CancelledError:
+            # Cancel the pending HCI connection
+            try:
+                await self.device.send_command(
+                    HCI_LE_Create_Connection_Cancel_Command())
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            log.warning(f"[BLE] Accept list connection failed: {e}")
+            try:
+                await self.device.send_command(
+                    HCI_LE_Create_Connection_Cancel_Command())
+            except Exception:
+                pass
+        finally:
+            self.device.le_connecting = False
+            self.device.remove_listener(Device.EVENT_CONNECTION, on_connection)
+            self.device.remove_listener(Device.EVENT_CONNECTION_FAILURE, on_failure)
+
+    async def _run_ble_scan_handler(self, target_addresses: set):
+        """Fallback BLE handler using active scanning for discovery."""
+        log.info(f"[BLE] Scanning for devices...")
 
         while not self._connection_future.done():
-            # Scan for devices
             found_device = None
 
             def on_advertisement(advertisement):
@@ -1121,7 +1229,7 @@ class HIDHost:
                     return
 
                 addr = normalize_addr(str(advertisement.address))
-                if addr in target_addresses:
+                if not target_addresses or addr in target_addresses:
                     found_device = advertisement
                     log.info(f"[BLE] Found target: {addr}")
 
@@ -1129,7 +1237,6 @@ class HIDHost:
 
             try:
                 await self.device.start_scanning()
-                # Scan for a few seconds
                 for _ in range(20):  # 10 seconds
                     if found_device or self._connection_future.done():
                         break
@@ -1144,7 +1251,6 @@ class HIDHost:
                 return
 
             if found_device:
-                # Connect to found device
                 max_attempts = 2
                 for attempt in range(1, max_attempts + 1):
                     try:
@@ -1163,7 +1269,6 @@ class HIDHost:
                         self.connected_protocol = Protocol.BLE
                         self.connection.on('disconnection', self._on_disconnection)
 
-                        # Authenticate
                         await self._ble_restore_or_pair()
 
                         if not self._connection_future.done():
@@ -1175,7 +1280,6 @@ class HIDHost:
                         if attempt < max_attempts:
                             await asyncio.sleep(2.0)
 
-            # Wait before next scan
             if not self._connection_future.done():
                 await asyncio.sleep(3.0)
 

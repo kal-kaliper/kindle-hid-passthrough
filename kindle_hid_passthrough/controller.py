@@ -191,6 +191,10 @@ class DaemonController:
     async def _do_disconnect(self):
         async with self._op_lock:
             try:
-                await self.daemon.suspend()
+                host = self.daemon.host
+                if host and host._is_connection_alive():
+                    await host.connection.disconnect()
+                else:
+                    logger.info("No active connection to disconnect")
             except Exception as e:
                 logger.error(f"Disconnect failed: {e}")
