@@ -107,13 +107,13 @@ class DaemonController:
         if self.is_pairing:
             return
         self.pair_result = None
+        self.is_pairing = True  # Set immediately so status polls see it
         asyncio.run_coroutine_threadsafe(
             self._do_pair(address, protocol, name), self.loop
         )
 
     async def _do_pair(self, address, protocol, name):
         async with self._op_lock:
-            self.is_pairing = True
             host = None
             try:
                 await self.daemon.suspend()
