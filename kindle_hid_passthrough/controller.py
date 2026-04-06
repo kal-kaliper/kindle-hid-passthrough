@@ -182,10 +182,23 @@ class DaemonController:
         if self.daemon._suspended:
             asyncio.run_coroutine_threadsafe(self.daemon.resume(), self.loop)
 
+    # ---- Stop ----
+
+    def request_stop(self):
+        """From HTTP thread: stop daemon (suspend, no resume)."""
+        asyncio.run_coroutine_threadsafe(self._do_stop(), self.loop)
+
+    async def _do_stop(self):
+        async with self._op_lock:
+            try:
+                await self.daemon.suspend()
+            except Exception as e:
+                logger.error(f"Stop failed: {e}")
+
     # ---- Disconnect ----
 
     def request_disconnect(self):
-        """From HTTP thread: suspend daemon (disconnects current device)."""
+        """From HTTP thread: drop connection, daemon keeps running."""
         asyncio.run_coroutine_threadsafe(self._do_disconnect(), self.loop)
 
     async def _do_disconnect(self):
