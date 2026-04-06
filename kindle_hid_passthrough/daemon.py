@@ -37,6 +37,7 @@ class HIDDaemon:
         self._host_task = None
         self._suspended = False
         self._resume_event = asyncio.Event()
+        self._paired_host = None  # HIDHost handed off from controller after pairing
 
     @property
     def connection_state(self) -> dict:
@@ -132,11 +133,20 @@ class HIDDaemon:
             skip_delay = False
 
             try:
-                logger.info("=== Starting connection ===")
-                self.host = HIDHost()
-                self._host_task = asyncio.create_task(
-                    self.host.run()
-                )
+                # Use handed-off host from controller pairing if available
+                if self._paired_host:
+                    logger.info("=== Continuing with paired device ===")
+                    self.host = self._paired_host
+                    self._paired_host = None
+                    self._host_task = asyncio.create_task(
+                        self.host.continue_after_pairing()
+                    )
+                else:
+                    logger.info("=== Starting connection ===")
+                    self.host = HIDHost()
+                    self._host_task = asyncio.create_task(
+                        self.host.run()
+                    )
                 await self._host_task
 
             except asyncio.CancelledError:

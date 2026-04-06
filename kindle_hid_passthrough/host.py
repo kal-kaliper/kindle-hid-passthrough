@@ -776,16 +776,18 @@ class HIDHost:
             )
             self.peer = Peer(self.connection)
             self.connection.on('disconnection', self._on_disconnection)
+            # Fresh connection needs encryption restored
+            await self._ble_restore_or_pair()
         else:
             log.info("[BLE] Using existing connection from pairing")
             if not self.peer:
                 self.peer = Peer(self.connection)
+            log.info("[BLE] Connection already encrypted")
 
-        # Restore encryption
-        await self._ble_restore_or_pair()
-
-        # Discover HID service if needed
-        if not self.report_map:
+        # Discover report characteristics for notification subscription.
+        # Even if report_map is cached from pairing, we need to discover
+        # the individual Report characteristics to subscribe to them.
+        if not self.hid_reports:
             await self._discover_ble_hid_service(process_reports=True)
 
         if not self.report_map:
@@ -1217,6 +1219,7 @@ class HIDHost:
 
         # Subscribe to reports
         await self._subscribe_to_ble_reports()
+        await self._ble_activate_hid_service()
 
     async def _read_ble_device_name(self):
         """Read BLE device name from Generic Access Service."""

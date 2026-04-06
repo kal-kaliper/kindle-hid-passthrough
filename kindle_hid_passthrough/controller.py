@@ -114,28 +114,30 @@ class DaemonController:
     async def _do_pair(self, address, protocol, name):
         async with self._op_lock:
             self.is_pairing = True
+            host = None
             try:
                 await self.daemon.suspend()
                 config.validate_keystore()
 
                 host = HIDHost()
-                try:
-                    success = await host.pair_device(address, protocol)
-                    if success:
-                        config.add_device(address, protocol, name)
-                        self.pair_result = {
-                            "ok": True,
-                            "address": address,
-                            "message": "Paired successfully",
-                        }
-                    else:
-                        self.pair_result = {
-                            "ok": False,
-                            "address": address,
-                            "error": "Pairing failed",
-                        }
-                finally:
-                    await host.cleanup()
+                success = await host.pair_device(address, protocol)
+                if success:
+                    config.add_device(address, protocol, name)
+                    self.pair_result = {
+                        "ok": True,
+                        "address": address,
+                        "message": "Paired successfully",
+                    }
+                    # Hand off host to daemon so it continues with the
+                    # active connection instead of scanning from scratch
+                    self.daemon._paired_host = host
+                    host = None  # Daemon owns it now
+                else:
+                    self.pair_result = {
+                        "ok": False,
+                        "address": address,
+                        "error": "Pairing failed",
+                    }
             except Exception as e:
                 logger.error(f"Pair failed: {e}")
                 self.pair_result = {
@@ -144,6 +146,8 @@ class DaemonController:
                     "error": str(e),
                 }
             finally:
+                if host:
+                    await host.cleanup()
                 self.is_pairing = False
                 await self.daemon.resume()
 
