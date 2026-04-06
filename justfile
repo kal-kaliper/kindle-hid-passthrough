@@ -39,7 +39,9 @@ deploy:
     ssh kindle "mkdir -p {{remote_dir}}/cache"
     @echo "Starting API server..."
     @just server
-    @echo "Deployment complete! Open BTManager app on Kindle."
+    @sleep 8
+    ssh kindle 'lipc-set-prop com.lab126.appmgrd start app://com.lzampier.btmanager'
+    @echo "Deployment complete!"
 
 # Kill daemon and close WAF app
 kill:
@@ -113,15 +115,6 @@ check:
 # Run mock API server for local WAF app testing
 mock-server:
     python3 {{src_dir}}/tests/mock_api_server.py
-
-# Open BTManager WAF app on Kindle
-open-waf:
-    ssh kindle 'lipc-set-prop com.lab126.appmgrd start app://com.lzampier.btmanager'
-
-# Deploy and open WAF app
-deploy-waf: deploy
-    @sleep 8
-    @just open-waf
 
 # Deploy and follow logs
 deploy-watch: deploy

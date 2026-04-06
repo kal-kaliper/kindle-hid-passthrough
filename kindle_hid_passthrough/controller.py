@@ -107,35 +107,37 @@ class DaemonController:
         if self.is_pairing:
             return
         self.pair_result = None
+        self.is_pairing = True  # Set immediately so status polls see it
         asyncio.run_coroutine_threadsafe(
             self._do_pair(address, protocol, name), self.loop
         )
 
     async def _do_pair(self, address, protocol, name):
         async with self._op_lock:
-            self.is_pairing = True
+            host = None
             try:
                 await self.daemon.suspend()
                 config.validate_keystore()
 
                 host = HIDHost()
-                try:
-                    success = await host.pair_device(address, protocol)
-                    if success:
-                        config.add_device(address, protocol, name)
-                        self.pair_result = {
-                            "ok": True,
-                            "address": address,
-                            "message": "Paired successfully",
-                        }
-                    else:
-                        self.pair_result = {
-                            "ok": False,
-                            "address": address,
-                            "error": "Pairing failed",
-                        }
-                finally:
-                    await host.cleanup()
+                success = await host.pair_device(address, protocol)
+                if success:
+                    config.add_device(address, protocol, name)
+                    self.pair_result = {
+                        "ok": True,
+                        "address": address,
+                        "message": "Paired successfully",
+                    }
+                    # Hand off host to daemon so it continues with the
+                    # active connection instead of scanning from scratch
+                    self.daemon._paired_host = host
+                    host = None  # Daemon owns it now
+                else:
+                    self.pair_result = {
+                        "ok": False,
+                        "address": address,
+                        "error": "Pairing failed",
+                    }
             except Exception as e:
                 logger.error(f"Pair failed: {e}")
                 self.pair_result = {
@@ -144,6 +146,8 @@ class DaemonController:
                     "error": str(e),
                 }
             finally:
+                if host:
+                    await host.cleanup()
                 self.is_pairing = False
                 await self.daemon.resume()
 
@@ -178,15 +182,32 @@ class DaemonController:
         if self.daemon._suspended:
             asyncio.run_coroutine_threadsafe(self.daemon.resume(), self.loop)
 
+    # ---- Stop ----
+
+    def request_stop(self):
+        """From HTTP thread: stop daemon (suspend, no resume)."""
+        asyncio.run_coroutine_threadsafe(self._do_stop(), self.loop)
+
+    async def _do_stop(self):
+        async with self._op_lock:
+            try:
+                await self.daemon.suspend()
+            except Exception as e:
+                logger.error(f"Stop failed: {e}")
+
     # ---- Disconnect ----
 
     def request_disconnect(self):
-        """From HTTP thread: suspend daemon (disconnects current device)."""
+        """From HTTP thread: drop connection, daemon keeps running."""
         asyncio.run_coroutine_threadsafe(self._do_disconnect(), self.loop)
 
     async def _do_disconnect(self):
         async with self._op_lock:
             try:
-                await self.daemon.suspend()
+                host = self.daemon.host
+                if host and host._is_connection_alive():
+                    await host.connection.disconnect()
+                else:
+                    logger.info("No active connection to disconnect")
             except Exception as e:
                 logger.error(f"Disconnect failed: {e}")

@@ -142,8 +142,8 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _handle_stop(self):
         controller = self._controller
-        controller.request_disconnect()
-        self._send_json({"ok": True, "message": "Daemon suspended"})
+        controller.request_stop()
+        self._send_json({"ok": True, "message": "Daemon stopped"})
 
     def _handle_devices(self):
         devices = _build_devices_json()
