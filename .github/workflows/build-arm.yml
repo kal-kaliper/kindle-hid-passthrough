@@ -52,6 +52,8 @@ jobs:
           cp -r assets/ output/
           cp -r illusion/ output/
           cp kindle_hid_passthrough/config.ini output/
+          # Symlink so both assets/ and scripts/ paths resolve dev_is_keyboard.sh
+          ln -s ../scripts/dev_is_keyboard.sh output/assets/dev_is_keyboard.sh
 
       - name: Show contents
         run: |

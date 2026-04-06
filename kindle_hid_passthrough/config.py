@@ -19,7 +19,7 @@ from kindle_detect import detect_kindle
 if TYPE_CHECKING:
     pass
 
-__version__ = "3.3.0"
+__version__ = "3.3.1"
 
 __all__ = ['config', 'Config', 'Protocol', 'get_fallback_hid_descriptor', 'normalize_addr', '__version__']
 
