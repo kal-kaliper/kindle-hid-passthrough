@@ -52,8 +52,9 @@ jobs:
           cp -r assets/ output/
           cp -r illusion/ output/
           cp kindle_hid_passthrough/config.ini output/
-          # Symlink so both assets/ and scripts/ paths resolve dev_is_keyboard.sh
-          ln -s ../scripts/dev_is_keyboard.sh output/assets/dev_is_keyboard.sh
+          # Copy so both assets/ and scripts/ paths resolve dev_is_keyboard.sh
+          # (FAT32 on /mnt/us/ doesn't support symlinks)
+          cp scripts/dev_is_keyboard.sh output/assets/dev_is_keyboard.sh
 
       - name: Show contents
         run: |
@@ -68,6 +69,32 @@ jobs:
         run: |
           tar -czvf "kindle-hid-passthrough-armv7.tar.gz" -C output .
           ls -lh *.tar.gz
+
+      - name: Validate KindleForge install compatibility
+        run: |
+          echo "Checking tarball contains all files expected by KindleForge install.sh..."
+          MISSING=0
+          for f in \
+            kindle-hid-passthrough \
+            assets/hid-passthrough.upstart \
+            assets/dev_is_keyboard.sh \
+            assets/99-hid-keyboard.rules \
+            scripts/dev_is_keyboard.sh \
+            illusion/BTManager.sh \
+            config.ini \
+            dist/main.bin; do
+            if ! tar -tzf kindle-hid-passthrough-armv7.tar.gz "./$f" >/dev/null 2>&1; then
+              echo "MISSING: $f"
+              MISSING=1
+            else
+              echo "OK: $f"
+            fi
+          done
+          if [ "$MISSING" -eq 1 ]; then
+            echo "::error::Tarball is missing files required by KindleForge install script"
+            exit 1
+          fi
+          echo "All required files present."
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
