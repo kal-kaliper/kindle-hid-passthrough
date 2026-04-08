@@ -1,0 +1,780 @@
+--[[--
+HID Passthrough daemon manager.
+
+Adds a "HID Passthrough" entry to Settings → Network that lets the user
+start, stop, and check the status of the kindle-hid-passthrough daemon
+(https://github.com/zampierilucas/kindle-hid-passthrough) without leaving
+KOReader.
+
+The daemon exposes a small HTTP API on http://localhost:8321 (the same one
+used by the BTManager WAF app). When it's running, we use that API for
+status and to stop it. When it's not running, the API is unreachable, so
+starting is done by spawning the binary directly with `--daemon`.
+
+@module koplugin.hidpassthrough
+--]]
+
+local Device = require("device")
+local Dispatcher = require("dispatcher")
+local Event = require("ui/event")
+local InfoMessage = require("ui/widget/infomessage")
+local InputText = require("ui/widget/inputtext")
+local UIManager = require("ui/uimanager")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local logger = require("logger")
+local util = require("util")
+local ffiutil = require("ffi/util")
+local _ = require("gettext")
+local T = require("ffi/util").template
+
+local socket = require("socket")
+local http = require("socket.http")
+local ltn12 = require("ltn12")
+
+local ffi = require("ffi")
+local C = ffi.C
+local bit = require("bit")
+pcall(require, "ffi/posix_h")
+pcall(require, "ffi/fbink_input_h")
+
+local HIDPassthrough = WidgetContainer:extend{
+    name = "hidpassthrough",
+    is_doc_only = false,
+
+    -- Defaults matching the upstream project layout. Override in
+    -- settings/hidpassthrough.lua if your install lives elsewhere.
+    DAEMON_BINARY = "/mnt/us/kindle_hid_passthrough/kindle-hid-passthrough",
+    API_HOST      = "127.0.0.1",
+    API_PORT      = 8321,
+    API_TIMEOUT   = 2, -- seconds
+}
+
+------------------------------------------------------------------------------
+-- HTTP helper
+------------------------------------------------------------------------------
+
+-- Tiny GET that returns the response body or (nil, err). We don't pull in a
+-- JSON parser; we just look for substrings, since the daemon's responses are
+-- short and well-known.
+function HIDPassthrough:_httpGet(path)
+    local url = string.format("http://%s:%d%s", self.API_HOST, self.API_PORT, path)
+    local body_chunks = {}
+
+    -- Per-request timeout. socket.http.TIMEOUT is module-global, so save
+    -- and restore it to avoid bleeding into the rest of KOReader.
+    local saved_timeout = http.TIMEOUT
+    http.TIMEOUT = self.API_TIMEOUT
+
+    local ok, code = http.request{
+        url = url,
+        sink = ltn12.sink.table(body_chunks),
+        create = function()
+            local s = socket.tcp()
+            s:settimeout(self.API_TIMEOUT)
+            return s
+        end,
+    }
+
+    http.TIMEOUT = saved_timeout
+
+    if not ok then
+        return nil, tostring(code)
+    end
+    if code ~= 200 then
+        return nil, "HTTP " .. tostring(code)
+    end
+    return table.concat(body_chunks)
+end
+
+------------------------------------------------------------------------------
+-- Daemon state
+------------------------------------------------------------------------------
+--
+-- kindle-hid-passthrough is two-tier:
+--
+--   * An always-on HTTP API server (port 8321) that survives between HID
+--     sessions and reports status / accepts /start and /stop commands.
+--   * The actual HID daemon, which the API server starts and stops on
+--     demand. Its state is reported in `daemon_running` from /status.
+--
+-- Spawning the binary directly (`kindle-hid-passthrough --daemon`) starts
+-- *both* layers in one go.
+--
+-- That gives us three states:
+--
+--   "off"        — API server not reachable. Nothing is running. To turn on,
+--                  spawn the binary; this brings up both layers.
+--   "api_only"   — API server up, HID daemon off. To turn on, POST /start.
+--   "on"         — Both layers running. To turn off, POST /stop (leaves the
+--                  API server alive, matching what BTManager does).
+--
+-- The user-facing checkmark is true only for "on".
+
+-- How long to wait for the daemon to come up before giving up. The bundled
+-- Python interpreter + bumble import can easily take 5-10s on first start.
+HIDPassthrough.START_TIMEOUT = 15
+HIDPassthrough.STOP_TIMEOUT = 5
+
+-- Returns state, body where state is "off" / "api_only" / "on".
+function HIDPassthrough:getState()
+    local body, err = self:_httpGet("/status")
+    if not body then
+        logger.dbg("HIDPassthrough: API unreachable:", err)
+        return "off", nil
+    end
+    if body:find('"daemon_running"%s*:%s*true') then
+        return "on", body
+    end
+    return "api_only", body
+end
+
+function HIDPassthrough:isRunning()
+    return self:getState() == "on"
+end
+
+------------------------------------------------------------------------------
+-- Keyboard wiring
+------------------------------------------------------------------------------
+-- TODO: Remove uevent handling once koreader/koreader-base#2327 and
+-- koreader/koreader#15248 are merged upstream. Once those land, KOReader
+-- will natively support uevent-based keyboard hot-plug on Kindle and
+-- the polling logic below becomes unnecessary.
+--
+-- The hard part. Background: KOReader's input layer on Kindle reads from a
+-- hardcoded list of /dev/input/event* devices opened at startup. The HID
+-- daemon creates a uhid device only when a BLE keyboard actually connects,
+-- which can happen long after the daemon started. KOReader's bundled
+-- externalkeyboard.koplugin handles exactly this kind of situation, but it
+-- self-disables on Kindle (it gates on Kobo USB-OTG sysfs paths and won't
+-- even register otherwise — see plugins/externalkeyboard.koplugin/main.lua,
+-- the early `return { disabled = true }` block).
+--
+-- We borrow upstream's actual mechanism — which works regardless of the
+-- USB-OTG gating — and apply it from this plugin instead:
+--
+--   1. Use FBInkInput's fbink_input_check() to ask the kernel "is this path
+--      a keyboard?". It returns an already-opened fd if yes.
+--   2. Hand that fd to Device.input:fdopen(fd, path, name) — the three-arg
+--      form that registers a pre-opened fd. (NOT Input:open(path), which
+--      doesn't work for hot-added devices on Kindle: the C backend ends up
+--      with a stale entry that fails the next epoll wait with ENODEV. We
+--      learned that the hard way.)
+--   3. Merge upstream's event_map_keyboard.lua into Device.input.event_map
+--      and flip Device.hasKeyboard / hasKeys / hasDPad to truthy stubs, so
+--      KOReader treats the new device as a real keyboard (event lookup,
+--      input dialogs, focus, etc.). Without this, key codes from the new
+--      fd would be silently dropped because the device's event_map has no
+--      entries for QWERTY scancodes.
+--   4. On removal, undo all of the above.
+--
+-- Since we can't subscribe to kernel uevents on Kindle the way the upstream
+-- plugin does on Kobo, we poll. The polling is cheap: a few ioctls and a
+-- directory listing every few seconds, only while the daemon is "on".
+
+HIDPassthrough.WATCHER_INTERVAL = 3 -- seconds
+
+-- Try to load the FBInkInput library. It's part of koreader-base on Kobo
+-- and Kindle, but we still wrap it in pcall so the plugin degrades cleanly
+-- on platforms where it isn't available — the start/stop UI keeps working.
+local FBInkInput
+do
+    local ok, lib = pcall(function()
+        return ffi.loadlib("fbink_input", 1)
+    end)
+    if ok then
+        FBInkInput = lib
+    else
+        logger.warn("HIDPassthrough: fbink_input not available, keyboard "
+            .. "auto-attach disabled:", tostring(lib))
+    end
+end
+
+-- Stub functions used to flip Device.has* properties on/off.
+local function yes() return true end
+local function no()  return false end
+
+-- Map of attached keyboard event paths -> { fd_object, original_caps_index }.
+-- The fd_object is whatever Device.input:fdopen returns, which we hand back
+-- to :close() on removal.
+HIDPassthrough._kb_attached = {}
+HIDPassthrough._kb_count = 0
+HIDPassthrough._kb_original_caps = nil
+
+-- Pull in the upstream keyboard event_map. Prefer the upstream copy (so we
+-- get any improvements automatically); fall back to our bundled copy if it
+-- isn't there.
+function HIDPassthrough:_loadKeyboardEventMap()
+    local upstream = "plugins/externalkeyboard.koplugin/event_map_keyboard.lua"
+    local f = io.open(upstream, "r")
+    if f then
+        f:close()
+        local ok, map = pcall(dofile, upstream)
+        if ok and type(map) == "table" then
+            return map
+        end
+        logger.warn("HIDPassthrough: failed to dofile upstream event_map:", map)
+    end
+    local bundled = "plugins/hidpassthrough.koplugin/event_map_keyboard.lua"
+    local ok, map = pcall(dofile, bundled)
+    if ok and type(map) == "table" then
+        return map
+    end
+    logger.warn("HIDPassthrough: failed to dofile bundled event_map:", map)
+    return nil
+end
+
+-- Snapshot the device-wide input caps so we can restore them when the last
+-- keyboard goes away. Idempotent across multiple keyboard connects.
+function HIDPassthrough:_snapshotDeviceCaps()
+    if self._kb_original_caps then return end
+    self._kb_original_caps = {
+        event_map       = Device.input.event_map,
+        keyboard_layout = Device.keyboard_layout,
+        hasKeyboard     = Device.hasKeyboard,
+        hasKeys         = Device.hasKeys,
+        hasFewKeys      = Device.hasFewKeys,
+        hasDPad         = Device.hasDPad,
+    }
+end
+
+function HIDPassthrough:_restoreDeviceCaps()
+    if not self._kb_original_caps then return end
+    Device.input.event_map = self._kb_original_caps.event_map
+    Device.keyboard_layout = self._kb_original_caps.keyboard_layout
+    Device.hasKeyboard     = self._kb_original_caps.hasKeyboard
+    Device.hasKeys         = self._kb_original_caps.hasKeys
+    Device.hasFewKeys      = self._kb_original_caps.hasFewKeys
+    Device.hasDPad         = self._kb_original_caps.hasDPad
+    self._kb_original_caps = nil
+end
+
+-- Ask FBInkInput whether `path` is a keyboard. Returns a table with fd,
+-- path, name, has_dpad on success, or nil if it isn't a keyboard or the
+-- check failed. Mirrors upstream externalkeyboard.koplugin's checkKeyboard.
+function HIDPassthrough:_checkKeyboard(path)
+    if not FBInkInput then return nil end
+    local ok, result = pcall(function()
+        local dev = FBInkInput.fbink_input_check(path, C.INPUT_KEYBOARD, 0, 0)
+        if dev == nil then return nil end
+        local r
+        if dev.matched then
+            r = {
+                fd       = tonumber(dev.fd),
+                path     = ffi.string(dev.path),
+                name     = ffi.string(dev.name),
+                has_dpad = bit.band(dev.type, C.INPUT_DPAD) ~= 0,
+            }
+        end
+        C.free(dev)
+        return r
+    end)
+    if not ok then
+        logger.dbg("HIDPassthrough: _checkKeyboard error for", path, ":", result)
+        return nil
+    end
+    return result
+end
+
+-- List /dev/input/event* paths.
+local function listEventPaths()
+    local paths = {}
+    local f = io.popen("ls /dev/input/event* 2>/dev/null")
+    if not f then return paths end
+    for line in f:lines() do
+        table.insert(paths, line)
+    end
+    f:close()
+    return paths
+end
+
+-- Attach a keyboard given a checkKeyboard result. Idempotent: skips if the
+-- path is already attached.
+function HIDPassthrough:_attachKeyboard(info)
+    if self._kb_attached[info.path] then return end
+
+    local ok, fd = pcall(Device.input.fdopen, Device.input,
+        info.fd, info.path, info.name)
+    if not ok then
+        logger.warn("HIDPassthrough: fdopen failed for", info.path, ":", fd)
+        return
+    end
+
+    self:_snapshotDeviceCaps()
+
+    local event_map = self:_loadKeyboardEventMap()
+    if event_map then
+        local merged = {}
+        util.tableMerge(merged, Device.input.event_map)
+        util.tableMerge(merged, event_map)
+        Device.input.event_map = merged
+    end
+
+    Device.hasKeyboard = yes
+    Device.hasKeys     = yes
+    Device.hasFewKeys  = no
+    if info.has_dpad then
+        Device.hasDPad = yes
+    end
+
+    self._kb_attached[info.path] = { fd = fd, has_dpad = info.has_dpad }
+    self._kb_count = self._kb_count + 1
+    logger.info("HIDPassthrough: attached keyboard", info.name, "@", info.path,
+        "(total:", self._kb_count, ")")
+
+    if self._kb_count == 1 then
+        UIManager:show(InfoMessage:new{
+            text = _("Keyboard connected"),
+            timeout = 1,
+        })
+        -- Tell every visible widget that a physical keyboard exists now,
+        -- so input fields enable hardware-keyboard handling. This is the
+        -- same dance the upstream external keyboard plugin does.
+        InputText.initInputEvents()
+        UIManager:broadcastEvent(Event:new("PhysicalKeyboardConnected"))
+    end
+end
+
+-- Detach a keyboard by path. Closes the fd via Input:close, decrements the
+-- count, and if it was the last one, restores device caps and broadcasts
+-- the disconnect event.
+function HIDPassthrough:_detachKeyboard(path)
+    local entry = self._kb_attached[path]
+    if not entry then return end
+
+    local ok, err = pcall(Device.input.close, Device.input, path)
+    if not ok then
+        logger.warn("HIDPassthrough: close failed for", path, ":", err)
+    end
+
+    self._kb_attached[path] = nil
+    self._kb_count = self._kb_count - 1
+    logger.info("HIDPassthrough: detached keyboard", path,
+        "(remaining:", self._kb_count, ")")
+
+    if self._kb_count == 0 then
+        self:_restoreDeviceCaps()
+        UIManager:show(InfoMessage:new{
+            text = _("Keyboard disconnected"),
+            timeout = 1,
+        })
+        InputText.initInputEvents()
+        UIManager:broadcastEvent(Event:new("PhysicalKeyboardDisconnected"))
+    end
+end
+
+-- TODO: Remove uevent handling once koreader/koreader-base#2327 and
+-- koreader/koreader#15248 are merged upstream.
+-- One reconciliation pass: check every existing /dev/input/event* against
+-- fbink_input_check, attach any that are keyboards we don't know about,
+-- and detach any we do know about that have disappeared.
+function HIDPassthrough:_reconcileKeyboards()
+    if not self._kb_watcher_active then return end
+    if not FBInkInput then return end
+
+    local seen = {}
+    for _, path in ipairs(listEventPaths()) do
+        seen[path] = true
+        if not self._kb_attached[path] then
+            local info = self:_checkKeyboard(path)
+            if info then
+                self:_attachKeyboard(info)
+            end
+        end
+    end
+
+    -- Detach anything we have that's no longer present.
+    local gone = {}
+    for path in pairs(self._kb_attached) do
+        if not seen[path] then table.insert(gone, path) end
+    end
+    for _, path in ipairs(gone) do
+        self:_detachKeyboard(path)
+    end
+
+    UIManager:scheduleIn(self.WATCHER_INTERVAL, self._reconcileKeyboardsCb)
+end
+
+function HIDPassthrough:_startKeyboardWatcher()
+    if self._kb_watcher_active then return end
+    if not FBInkInput then
+        logger.info("HIDPassthrough: keyboard watcher not started "
+            .. "(FBInkInput unavailable)")
+        return
+    end
+    self._kb_watcher_active = true
+    -- Bind a stable callback so UIManager:unschedule could find it if needed.
+    -- We don't actually unschedule by reference (the active flag handles it),
+    -- but it keeps the closure allocation out of the hot loop.
+    self._reconcileKeyboardsCb = function() self:_reconcileKeyboards() end
+    logger.info("HIDPassthrough: starting keyboard watcher")
+    UIManager:scheduleIn(1, self._reconcileKeyboardsCb)
+end
+
+function HIDPassthrough:_stopKeyboardWatcher()
+    if not self._kb_watcher_active then return end
+    self._kb_watcher_active = false
+    -- Detach everything we have. Snapshot keys first because _detachKeyboard
+    -- mutates the table.
+    local paths = {}
+    for path in pairs(self._kb_attached) do table.insert(paths, path) end
+    for _, path in ipairs(paths) do
+        self:_detachKeyboard(path)
+    end
+    logger.info("HIDPassthrough: keyboard watcher stopped")
+end
+
+------------------------------------------------------------------------------
+-- Start / stop
+------------------------------------------------------------------------------
+
+-- Spawn the binary detached. Used only when the API server itself is down.
+function HIDPassthrough:_spawnBinary()
+    if not util.pathExists(self.DAEMON_BINARY) then
+        return false, T(_("Daemon binary not found at %1."), self.DAEMON_BINARY)
+    end
+    -- Detached background launch via setsid so it survives KOReader exiting.
+    -- The exit code of this command is meaningless: the subshell backgrounds
+    -- the process and returns immediately.
+    local cmd = string.format(
+        "(setsid %s --daemon </dev/null >/dev/null 2>&1 &) 2>/dev/null || "
+        .. "(%s --daemon </dev/null >/dev/null 2>&1 &)",
+        self.DAEMON_BINARY, self.DAEMON_BINARY
+    )
+    logger.info("HIDPassthrough: spawning daemon:", cmd)
+    os.execute(cmd)
+    return true
+end
+
+-- Wait until getState() reports the desired state, or timeout.
+function HIDPassthrough:_waitForState(target, timeout)
+    for i = 1, timeout do
+        ffiutil.sleep(1)
+        local state = self:getState()
+        logger.dbg("HIDPassthrough: waiting for", target, "got", state, "tick", i)
+        if state == target then
+            return true
+        end
+    end
+    return false
+end
+
+function HIDPassthrough:start()
+    local state = self:getState()
+
+    if state == "on" then
+        -- Daemon already running. Still make sure the watcher is going, in
+        -- case the user toggled through "on -> off (watcher stops) -> on"
+        -- without us knowing about the first transition.
+        self:_startKeyboardWatcher()
+        return true, _("HID Passthrough daemon is already running.")
+    end
+
+    local ok, msg = self:_doStart(state)
+    if ok then
+        self:_startKeyboardWatcher()
+    end
+    return ok, msg
+end
+
+-- The original start logic, factored out so start() can wrap it with input
+-- device tracking.
+function HIDPassthrough:_doStart(state)
+    if state == "off" then
+        -- API server not up. Spawn the binary, which brings up both layers.
+        local ok, err = self:_spawnBinary()
+        if not ok then return false, err end
+
+        if self:_waitForState("on", self.START_TIMEOUT) then
+            return true, _("HID Passthrough daemon started.")
+        end
+
+        -- Didn't reach "on". Figure out which sub-failure to report.
+        local final = self:getState()
+        if final == "off" then
+            return false, _("Daemon failed to start: API server never came up. "
+                .. "Try running the binary manually from a shell to see the error.")
+        end
+        -- final == "api_only": API server is alive but HID daemon didn't start.
+        -- One last attempt via /start, in case it just needs a nudge.
+        logger.info("HIDPassthrough: API up but daemon off, calling /start")
+        if self:_httpGet("/start") and self:_waitForState("on", self.START_TIMEOUT) then
+            return true, _("HID Passthrough daemon started.")
+        end
+        return false, T(_("API server is up but the HID daemon would not start "
+            .. "within %1 seconds. Check /var/log/hid_passthrough.log."),
+            tostring(self.START_TIMEOUT))
+    end
+
+    -- state == "api_only": just ask the API server to start the daemon.
+    logger.info("HIDPassthrough: API up, calling /start")
+    local body, err = self:_httpGet("/start")
+    if not body then
+        return false, T(_("API call to /start failed: %1"), tostring(err))
+    end
+    if self:_waitForState("on", self.START_TIMEOUT) then
+        return true, _("HID Passthrough daemon started.")
+    end
+    return false, T(_("/start was accepted but daemon did not come up within "
+        .. "%1 seconds. Check /var/log/hid_passthrough.log."),
+        tostring(self.START_TIMEOUT))
+end
+
+function HIDPassthrough:stop()
+    local state = self:getState()
+
+    if state ~= "on" then
+        -- Either nothing is running, or only the API server is up (which is
+        -- the idle state we want). Either way, no work to do.
+        return true, _("HID Passthrough daemon is not running.")
+    end
+
+    -- Detach keyboards *before* asking the daemon to stop, so the input
+    -- read loop doesn't see fds vanish under it. _stopKeyboardWatcher
+    -- closes every keyboard fd we own and restores Device caps.
+    self:_stopKeyboardWatcher()
+
+    -- Ask the API server to stop the HID daemon. The API server itself stays
+    -- up, matching the BTManager behavior — that way the next /start is fast.
+    local body, err = self:_httpGet("/stop")
+    if not body then
+        return false, T(_("API call to /stop failed: %1"), tostring(err))
+    end
+
+    -- Wait for daemon_running to flip to false.
+    for i = 1, self.STOP_TIMEOUT do
+        ffiutil.sleep(1)
+        if self:getState() ~= "on" then
+            return true, _("HID Passthrough daemon stopped.")
+        end
+        logger.dbg("HIDPassthrough: waiting for stop, tick", i)
+    end
+    return false, _("Daemon did not stop within timeout.")
+end
+
+function HIDPassthrough:toggle()
+    if self:isRunning() then
+        return self:stop()
+    else
+        return self:start()
+    end
+end
+
+------------------------------------------------------------------------------
+-- Info dialog: parse a few fields out of /status for display
+------------------------------------------------------------------------------
+
+local function extractField(body, key)
+    if not body then return nil end
+    -- Try string value first.
+    local v = body:match('"' .. key .. '"%s*:%s*"([^"]*)"')
+    if v then return v end
+    -- Then numeric / boolean.
+    v = body:match('"' .. key .. '"%s*:%s*([%w%.%-]+)')
+    return v
+end
+
+local function countDevices(body)
+    if not body then return nil end
+    -- Count opening braces inside the "devices" array.
+    local arr = body:match('"devices"%s*:%s*(%b[])')
+    if not arr then return nil end
+    local n = 0
+    for _ in arr:gmatch("{") do n = n + 1 end
+    return n
+end
+
+function HIDPassthrough:showInfo()
+    local state, body = self:getState()
+    local lines = {}
+
+    if state == "on" then
+        table.insert(lines, _("Status: HID daemon running"))
+    elseif state == "api_only" then
+        table.insert(lines, _("Status: API server up, HID daemon stopped"))
+    else
+        table.insert(lines, _("Status: not running"))
+    end
+
+    if body then
+        local version = extractField(body, "version")
+        if version then
+            table.insert(lines, T(_("Version: %1"), version))
+        end
+
+        local n_devices = countDevices(body)
+        if n_devices then
+            table.insert(lines, T(_("Configured devices: %1"), tostring(n_devices)))
+        end
+
+        local connected = extractField(body, "connected_device")
+        if connected and connected ~= "" and connected ~= "null" then
+            table.insert(lines, T(_("Connected: %1"), connected))
+        end
+
+        if body:find('"scanning"%s*:%s*true') then
+            table.insert(lines, _("Currently scanning…"))
+        end
+        if body:find('"pairing"%s*:%s*true') then
+            table.insert(lines, _("Currently pairing…"))
+        end
+    end
+
+    table.insert(lines, "")
+    table.insert(lines, T(_("Binary: %1"), self.DAEMON_BINARY))
+    table.insert(lines, T(_("API: http://%1:%2"), self.API_HOST, tostring(self.API_PORT)))
+
+    UIManager:show(InfoMessage:new{
+        text = table.concat(lines, "\n"),
+    })
+end
+
+------------------------------------------------------------------------------
+-- Menu integration
+------------------------------------------------------------------------------
+
+function HIDPassthrough:onDispatcherRegisterActions()
+    -- These show up in the gesture manager under "General" category, so the
+    -- user can bind any of them to corner taps, swipes, multiswipes, or
+    -- physical buttons.
+    Dispatcher:registerAction("hidpassthrough_start", {
+        category = "none",
+        event    = "HIDPassthroughStart",
+        title    = _("HID Passthrough: Start daemon"),
+        general  = true,
+    })
+    Dispatcher:registerAction("hidpassthrough_stop", {
+        category = "none",
+        event    = "HIDPassthroughStop",
+        title    = _("HID Passthrough: Stop daemon"),
+        general  = true,
+    })
+    Dispatcher:registerAction("hidpassthrough_toggle", {
+        category = "none",
+        event    = "HIDPassthroughToggle",
+        title    = _("HID Passthrough: Toggle daemon"),
+        general  = true,
+    })
+end
+
+-- Run a start/stop/toggle action triggered by a gesture. We can't call the
+-- blocking methods directly from the dispatcher's callback because start()
+-- can wait up to 15 seconds for the daemon to come up, which would freeze
+-- the UI mid-gesture. So we show an immediate toast acknowledging the
+-- action and defer the real work to the next UI tick.
+function HIDPassthrough:_runActionAsync(label, fn)
+    UIManager:show(InfoMessage:new{
+        text = label,
+        timeout = 1,
+    })
+    UIManager:nextTick(function()
+        local ok, msg = fn(self)
+        UIManager:show(InfoMessage:new{
+            text = msg,
+            timeout = ok and 2 or 4,
+        })
+    end)
+end
+
+function HIDPassthrough:onHIDPassthroughStart()
+    self:_runActionAsync(_("Starting HID Passthrough daemon…"), self.start)
+end
+
+function HIDPassthrough:onHIDPassthroughStop()
+    self:_runActionAsync(_("Stopping HID Passthrough daemon…"), self.stop)
+end
+
+function HIDPassthrough:onHIDPassthroughToggle()
+    local label = self:isRunning()
+        and _("Stopping HID Passthrough daemon…")
+        or  _("Starting HID Passthrough daemon…")
+    self:_runActionAsync(label, self.toggle)
+end
+
+function HIDPassthrough:init()
+    self:onDispatcherRegisterActions()
+    self.ui.menu:registerToMainMenu(self)
+
+    -- The daemon may already be running from a previous session (upstart,
+    -- kterm, or a leftover API server from an earlier KOReader run). If so,
+    -- kick the watcher so any keyboard connected later gets picked up. We
+    -- defer the HTTP probe to avoid blocking plugin init.
+    UIManager:scheduleIn(2, function()
+        if self:isRunning() then
+            logger.info("HIDPassthrough: daemon already running on init, "
+                .. "starting keyboard watcher")
+            self:_startKeyboardWatcher()
+        end
+    end)
+end
+
+-- Called when KOReader tears down. Leave the daemon running (the API server
+-- is designed to outlive client UIs, and you may well want it up for the
+-- next session), but cancel our scheduled tasks and detach our fds so we
+-- don't leave KOReader polling vanishing devices on the way out.
+function HIDPassthrough:onCloseWidget()
+    if self._kb_watcher_active then
+        logger.info("HIDPassthrough: KOReader closing, stopping keyboard watcher")
+        self:_stopKeyboardWatcher()
+    end
+end
+
+function HIDPassthrough:_doToggle(touchmenu_instance)
+    local ok, msg = self:toggle()
+    UIManager:show(InfoMessage:new{
+        text = msg,
+        timeout = ok and 2 or 4,
+    })
+    if touchmenu_instance then
+        touchmenu_instance:updateItems()
+    end
+end
+
+function HIDPassthrough:addToMainMenu(menu_items)
+    menu_items.hid_passthrough = {
+        text = _("HID Passthrough"),
+        -- Land in Settings → Network alongside SSH.
+        sorting_hint = "network",
+        -- Top-level checked state mirrors the daemon, so users can see at
+        -- a glance from the Network menu whether it's up.
+        checked_func = function() return self:isRunning() end,
+        -- Long-press the parent entry to toggle without descending.
+        hold_callback = function(touchmenu_instance)
+            self:_doToggle(touchmenu_instance)
+        end,
+        sub_item_table = {
+            {
+                text = _("HID Passthrough daemon"),
+                checked_func = function() return self:isRunning() end,
+                check_callback_updates_menu = true,
+                callback = function(touchmenu_instance)
+                    self:_doToggle(touchmenu_instance)
+                end,
+            },
+            {
+                text = _("Show daemon status"),
+                keep_menu_open = true,
+                callback = function() self:showInfo() end,
+            },
+            {
+                text = _("About HID Passthrough"),
+                keep_menu_open = true,
+                callback = function()
+                    UIManager:show(InfoMessage:new{
+                        text = T(_([[Manages the kindle-hid-passthrough Bluetooth HID daemon.
+
+Binary: %1
+API:    http://%2:%3
+
+The daemon must already be installed on the device. See:
+https://github.com/zampierilucas/kindle-hid-passthrough]]),
+                            self.DAEMON_BINARY,
+                            self.API_HOST,
+                            tostring(self.API_PORT)),
+                    })
+                end,
+            },
+        },
+    }
+end
+
+return HIDPassthrough
