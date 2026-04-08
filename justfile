@@ -30,7 +30,7 @@ deploy:
         assets/99-hid-keyboard.rules \
         scripts/dev_is_keyboard.sh \
         illusion/BTManager/* \
-    ) | ssh kindle "tar xf - -C /"
+    ) | ssh kindle "mkdir -p /usr/local/bin && tar xf - -C /"
     ssh kindle "chmod +x /usr/local/bin/dev_is_keyboard.sh"
     -ssh kindle "udevadm control --reload-rules" 2>/dev/null || true
     @echo "Clearing Python bytecode cache..."

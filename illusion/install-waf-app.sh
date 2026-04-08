@@ -85,7 +85,7 @@ echo "5. Starting daemon..."
 # Stop existing instances
 pkill -f "ld-linux-armhf." 2>/dev/null
 sleep 1
-"$BINARY" --daemon &
+"$BINARY" --daemon >/dev/null 2>&1 &
 sleep 1
 echo "   Daemon started"
 
