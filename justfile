@@ -154,6 +154,15 @@ pair-ble:
 run:
     ssh kindle "{{python}} {{remote_dir}}/main.py"
 
+# Deploy KOReader plugin to Kindle
+deploy-koreader:
+    @echo "Deploying KOReader plugin..."
+    (cd {{src_dir}} && tar cf - \
+        --transform='s|^koreader-plugin/hidpassthrough.koplugin/|mnt/us/koreader/plugins/hidpassthrough.koplugin/|' \
+        koreader-plugin/hidpassthrough.koplugin/ \
+    ) | ssh kindle "tar xf - -C /"
+    @echo "KOReader plugin deployed!"
+
 # Remove autostart (removes upstart config)
 remove-autostart:
     @echo "Removing autostart..."

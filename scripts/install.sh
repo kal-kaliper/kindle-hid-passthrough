@@ -22,6 +22,9 @@ installAll()
   installUpstart
   installMainFiles
   installWAFApp
+  if [ -d /mnt/us/koreader/plugins/ ]; then
+    installKOReaderPlugin
+  fi
   echo ""
   echo "Installation complete. Open 'BT Manager' from the Kindle library."
 }
@@ -75,6 +78,17 @@ installWAFApp()
   else
     echo "ERROR: /mnt/us/kindle_hid_passthrough/illusion/install-waf-app.sh not found"
   fi
+}
+
+installKOReaderPlugin()
+{
+  if [ ! -d /mnt/us/koreader/plugins/ ]; then
+    echo " -> KOReader not found, skipping plugin install"
+    return
+  fi
+  echo " -> Installing KOReader plugin"
+  cp -r koreader-plugin/hidpassthrough.koplugin /mnt/us/koreader/plugins/hidpassthrough.koplugin
+  echo " -> Ready."
 }
 
 uninstallAll()
@@ -140,13 +154,14 @@ print_menu()
   printf " 5) Install upstart (auto-start on boot)\n"
   printf " 6) Install BTManager app\n"
   printf " 7) Set custom keyboard layout\n"
-  printf " 8) Uninstall everything\n"
-  printf " 9) Quit\n"
+  printf " 8) Install KOReader plugin\n"
+  printf " 9) Uninstall everything\n"
+  printf "10) Quit\n"
 }
 
 while :; do
   print_menu
-  printf "Enter choice [1-9]: "
+  printf "Enter choice [1-10]: "
   read choice
   case "$choice" in
     1)
@@ -171,9 +186,12 @@ while :; do
       setLayout
       ;;
     8)
-      uninstallAll
+      installKOReaderPlugin
       ;;
     9)
+      uninstallAll
+      ;;
+    10)
       echo "Exiting."
       break
       ;;
