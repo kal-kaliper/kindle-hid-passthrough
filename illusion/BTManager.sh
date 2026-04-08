@@ -65,7 +65,7 @@ start_helper() {
 
     if [ -f "$BINARY" ]; then
         log_msg "Starting daemon"
-        "$BINARY" --daemon &
+        "$BINARY" --daemon >/dev/null 2>&1 &
         sleep 1
         log_msg "Daemon started"
     else

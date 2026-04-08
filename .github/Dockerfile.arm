@@ -107,7 +107,6 @@ RUN printf '%s\n' \
     '    char ld_path[PATH_MAX];' \
     '    char bin_path[PATH_MAX];' \
     '    char lib_path[PATH_MAX];' \
-    '    char preload_env[PATH_MAX];' \
     '    ssize_t len;' \
     '' \
     '    len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);' \
@@ -126,7 +125,6 @@ RUN printf '%s\n' \
     '    snprintf(lib_path, sizeof(lib_path), "%s/libsyscall_wrapper.so", dir);' \
     '' \
     '    /* Set LD_PRELOAD for syscall compatibility shim */' \
-    '    snprintf(preload_env, sizeof(preload_env), "%s:%s/dist/libsyscall_wrapper.so", lib_path, dir);' \
     '    setenv("LD_PRELOAD", lib_path, 1);' \
     '    setenv("KINDLE_HID_BASE", dir, 1);' \
     '' \
