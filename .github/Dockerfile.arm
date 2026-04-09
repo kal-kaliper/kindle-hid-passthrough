@@ -40,7 +40,7 @@ COPY kindle_hid_passthrough/*.py /build/kindle_hid_passthrough/
 COPY kindle_hid_passthrough/config.ini /build/kindle_hid_passthrough/
 
 # ARM-specific compiler flags to fix branch range errors
-ENV CFLAGS="-mword-relocations -mlong-calls -ffunction-sections -fdata-sections"
+ENV CFLAGS="-O3 -mword-relocations -mlong-calls -ffunction-sections -fdata-sections"
 ENV LDFLAGS="-Wl,--gc-sections"
 
 # Build syscall wrapper for Kindle kernel compatibility
@@ -65,7 +65,7 @@ RUN printf '%s\n' \
 RUN python3 -m nuitka \
     --mode=standalone \
     --jobs=$(nproc) \
-    --lto=no \
+    --lto=yes \
     --show-progress \
     --output-dir=/build/nuitka-out \
     --include-package=kindle_hid_passthrough \
