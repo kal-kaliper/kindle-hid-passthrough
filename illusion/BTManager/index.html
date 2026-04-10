@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
-    <title>HID Passthrough</title>
+    <title>BT Manager</title>
     <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -15,42 +15,92 @@
 
     <div id="messageBar" class="message-bar"></div>
 
-    <div class="status-panel">
-        <button id="btnToggleDaemon" class="toggle" aria-label="Toggle Daemon">
+    <!-- Bluetooth toggle row -->
+    <div class="toggle-row">
+        <span class="toggle-label">Bluetooth</span>
+        <button id="btnToggle" class="toggle" aria-label="Toggle Bluetooth">
             <span class="toggle-knob"></span>
         </button>
-        <div class="status-row">
-            <span class="status-label">Daemon: </span>
-            <span id="statusDaemon" class="status-value unknown">checking...</span>
+    </div>
+
+    <!-- Main content (hidden when BT off) -->
+    <div id="mainContent">
+        <!-- Connected devices section -->
+        <div id="connectedSection" style="display:none;">
+            <div class="section-label">Connected</div>
+            <div id="connectedList" class="device-list"></div>
         </div>
-        <div class="status-row">
-            <span class="status-label">Devices: </span>
-            <span id="statusDevices" class="status-value unknown">--</span>
+
+        <!-- Paired devices section -->
+        <div id="pairedSection" style="display:none;">
+            <div class="section-label">Paired</div>
+            <div id="pairedList" class="device-list"></div>
+        </div>
+
+        <!-- Scan button -->
+        <div class="scan-btn-wrap">
+            <button id="btnScan" class="btn btn-scan">Scan for Devices</button>
+        </div>
+
+        <!-- Available devices section (hidden until scan) -->
+        <div id="availableSection" style="display:none;">
+            <div class="section-label-row">
+                <span class="section-label">Available</span>
+                <span id="scanIndicator" class="scan-indicator">Scanning...</span>
+            </div>
+            <div id="availableList" class="device-list"></div>
         </div>
     </div>
 
-    <div class="section-header">Paired Devices</div>
-
-    <div id="deviceList" class="device-list device-list-scroll">
-        <div class="loading">Loading devices...</div>
+    <!-- Off state (shown when BT off) -->
+    <div id="offState" style="display:none;">
+        <div class="off-message">Bluetooth is off</div>
+        <div class="off-hint">Turn on to manage devices</div>
     </div>
 
-    <div class="btn-row">
-        <button id="btnScan" class="btn btn-half btn-start">Scan</button>
-        <button id="btnLogs" class="btn btn-half btn-stop">Debug</button>
-    </div>
-
-    <div class="scan-section">
-        <div id="scanStatus" class="scan-status" style="display:none;"></div>
-        <div id="scanResults" class="device-list"></div>
-    </div>
-
+    <!-- Footer -->
     <div id="footer" class="footer">
-        HID Passthrough
+        <span id="footerVersion">BT Manager</span> &middot; <span id="footerDebug" class="footer-link">Debug</span>
     </div>
 
-    <!-- Overlays (hidden by default) -->
+    <!-- Device detail overlay -->
+    <div id="deviceOverlay" class="device-overlay">
+        <div class="header">
+            <h1 id="detailName">Device</h1>
+            <button id="btnDetailClose" class="btn-close">&#x2715;</button>
+        </div>
+        <div class="detail-body">
+            <div class="detail-row">
+                <span class="detail-label">Status</span>
+                <span id="detailStatus" class="detail-value"></span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Protocol</span>
+                <span id="detailProtocol" class="detail-value"></span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Address</span>
+                <span id="detailAddress" class="detail-value detail-mono"></span>
+            </div>
+            <div id="detailHid" style="display:none;">
+                <div class="section-label">HID</div>
+                <div class="detail-row">
+                    <span class="detail-label">UHID Device</span>
+                    <span id="detailUhid" class="detail-value"></span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Input</span>
+                    <span id="detailInputPaths" class="detail-value detail-mono"></span>
+                </div>
+            </div>
+            <div class="detail-actions">
+                <button id="btnDetailAction" class="btn btn-action">Connect</button>
+                <button id="btnDetailRemove" class="btn btn-danger">Remove Device</button>
+            </div>
+        </div>
+    </div>
 
+    <!-- Pair overlay (unchanged) -->
     <div id="pairOverlay" class="pair-overlay">
         <div class="log-header">
             <span class="log-title">Pairing</span>
@@ -65,6 +115,7 @@
         </div>
     </div>
 
+    <!-- Debug log overlay (unchanged) -->
     <div id="logOverlay" class="log-overlay">
         <div class="log-header">
             <span class="log-title">Debug</span>
@@ -85,6 +136,7 @@
         </div>
     </div>
 
+    <!-- Confirm dialog (unchanged) -->
     <div id="confirmOverlay" class="overlay">
         <div class="dialog">
             <p id="dialogMessage">Are you sure?</p>

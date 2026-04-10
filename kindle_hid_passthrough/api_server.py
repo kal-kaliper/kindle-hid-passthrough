@@ -123,6 +123,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._handle_disconnect()
             case '/logs':
                 self._handle_logs(param('lines'))
+            case '/device-info':
+                self._handle_device_info(param('addr'))
             case _:
                 self._send_json({"ok": False, "error": "Not found"})
 
@@ -146,6 +148,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         }
         if status.get("connected_device"):
             resp["connected_device"] = status["connected_device"]
+            if status.get("uhid_name"):
+                resp["uhid_name"] = status["uhid_name"]
+            if status.get("input_paths"):
+                resp["input_paths"] = status["input_paths"]
+            if status.get("descriptor_size"):
+                resp["descriptor_size"] = status["descriptor_size"]
         self._send_json(resp)
 
     def _handle_start(self):
@@ -309,3 +317,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "lines": short})
         except OSError as e:
             self._send_json({"ok": False, "error": str(e)})
+
+    def _handle_device_info(self, address):
+        if not address:
+            self._send_json({"ok": False, "error": "No address provided"})
+            return
+
+        addr = normalize_addr(address)
+        cache = DeviceCache(config.cache_dir).load(addr)
+        resp = {"ok": True, "address": addr, "cached": cache is not None}
+        if cache:
+            if cache.get("device_name"):
+                resp["device_name"] = cache["device_name"]
+            if cache.get("report_map"):
+                resp["descriptor_size"] = len(bytes.fromhex(cache["report_map"]))
+        self._send_json(resp)

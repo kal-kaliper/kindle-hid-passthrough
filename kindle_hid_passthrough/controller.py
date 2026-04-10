@@ -51,6 +51,12 @@ class DaemonController:
             status["connected_device"] = conn.get("address")
             status["connected_protocol"] = conn.get("protocol")
             status["connected_name"] = conn.get("name")
+            if conn.get("uhid_name"):
+                status["uhid_name"] = conn["uhid_name"]
+            if conn.get("input_paths"):
+                status["input_paths"] = conn["input_paths"]
+            if conn.get("descriptor_size"):
+                status["descriptor_size"] = conn["descriptor_size"]
 
         status["scanning"] = self.is_scanning
         status["pairing"] = self.is_pairing
