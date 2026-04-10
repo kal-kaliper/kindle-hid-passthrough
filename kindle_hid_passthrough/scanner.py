@@ -240,7 +240,7 @@ class Scanner:
             is_hid = False
             major_class_name = "Unknown"
             try:
-                _, major_class, minor_class = DeviceClass.split_class_of_device(class_of_device)
+                _, major_class, _minor_class = DeviceClass.split_class_of_device(class_of_device)
                 major_class_name = DeviceClass.major_device_class_name(major_class)
                 is_hid = major_class_name == "Peripheral"
             except Exception:

@@ -54,7 +54,7 @@ class APIServer(ThreadingMixIn, HTTPServer):
 class RequestHandler(BaseHTTPRequestHandler):
     """HTTP request handler for BTManager API."""
 
-    def log_message(self, format, *args):
+    def log_message(self, _format, *args):
         """Suppress default stderr logging."""
         pass
 

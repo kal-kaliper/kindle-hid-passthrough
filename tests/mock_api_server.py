@@ -174,7 +174,7 @@ class MockHandler(SimpleHTTPRequestHandler):
             result = os.path.join(result, p)
         return result
 
-    def log_message(self, format, *args):
+    def log_message(self, _format, *args):
         pass
 
 

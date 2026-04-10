@@ -594,7 +594,7 @@ class HIDHost:
         # Track link key generation
         link_key_received = asyncio.Event()
 
-        def on_device_link_key(bd_addr, link_key, key_type):
+        def on_device_link_key(_bd_addr, link_key, key_type):
             log.success(f"[Classic] Link key received: type={key_type}")
             link_key_received.set()
 
