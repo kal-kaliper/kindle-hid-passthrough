@@ -75,6 +75,10 @@ RUN python3 -m nuitka \
     --nofollow-import-to=pytest \
     --nofollow-import-to=unittest \
     --nofollow-import-to=setuptools \
+    --nofollow-import-to=grpc \
+    --nofollow-import-to=google \
+    --nofollow-import-to=email \
+    --nofollow-import-to=usb \
     kindle_hid_passthrough/main.py
 
 # Copy the build container's dynamic linker and core glibc libs into the dist.

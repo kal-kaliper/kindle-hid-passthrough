@@ -49,6 +49,26 @@ jobs:
           docker rm "$CONTAINER_ID"
           chmod +x output/kindle-hid-passthrough output/dist/main.bin output/dist/ld-linux-armhf.so.3
 
+      - name: Strip unused dependencies from dist
+        run: |
+          echo "=== Before cleanup ==="
+          du -sh output/dist/
+
+          # gRPC: bumble optional dep, not used (saves ~13.5 MB)
+          rm -rf output/dist/grpc/
+
+          # CJK codecs: not needed on Kindle (saves ~0.7 MB)
+          rm -f output/dist/_codecs_jp.so \
+               output/dist/_codecs_cn.so \
+               output/dist/_codecs_hk.so \
+               output/dist/_codecs_kr.so \
+               output/dist/_codecs_tw.so \
+               output/dist/_codecs_iso2022.so \
+               output/dist/_multibytecodec.so
+
+          echo "=== After cleanup ==="
+          du -sh output/dist/
+
       - name: Add scripts and assets
         run: |
           cp -r scripts/ output/
