@@ -13,7 +13,7 @@ import logging
 import os
 import subprocess
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from kindle_detect import detect_kindle
 
@@ -173,13 +173,6 @@ class Config:
 
         return None
 
-    @property
-    def kindle_defaults(self):
-        """Return detected Kindle hardware defaults, or None."""
-        if not hasattr(self, '_kindle_defaults'):
-                self._kindle_defaults = detect_kindle()
-        return self._kindle_defaults
-
     def _parse_protocol(self, protocol_str: str) -> Protocol:
         """Parse protocol string to Protocol enum."""
         if protocol_str in ('classic', 'br/edr', 'bredr'):
@@ -331,15 +324,6 @@ class Config:
         except Exception as e:
             logger.error(f"Failed to save device: {e}")
 
-    def get_device_config(self) -> Optional[tuple]:
-        """Load first device address, protocol, and name from devices.conf.
-
-        Returns:
-            Tuple of (address, protocol, name) or None if not configured
-        """
-        devices = self.get_all_devices()
-        return devices[0] if devices else None
-
     def get_all_devices(self) -> list:
         """Load all devices from devices.conf.
 
@@ -369,40 +353,6 @@ class Config:
                     devices.append((address, protocol, name))
 
         return devices
-
-    def is_device_allowed(self, address: str) -> tuple:
-        """Check if a device address is in the allowed list.
-
-        Args:
-            address: Device address to check (may have /P suffix from Bumble)
-
-        Returns:
-            Tuple of (allowed: bool, protocol: Protocol or None)
-        """
-        devices = self.get_all_devices()
-        if not devices:
-            return (False, None)
-
-        addr_norm = normalize_addr(address)
-
-        for dev_addr, protocol, _ in devices:
-            if dev_addr == '*':
-                return (True, protocol)
-            if addr_norm == dev_addr:
-                return (True, protocol)
-
-        return (False, None)
-
-
-def get_configured_protocols() -> set:
-    """Get the set of protocols configured in devices.conf.
-
-    Returns:
-        Set of Protocol enums (may contain BLE, CLASSIC, or both)
-    """
-    devices = config.get_all_devices()
-    return {d[1] for d in devices}
-
 
 def get_fallback_hid_descriptor() -> bytes:
     """Return a generic fallback HID report descriptor.
