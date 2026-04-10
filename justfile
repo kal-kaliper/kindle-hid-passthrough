@@ -42,7 +42,6 @@ deploy:
     ssh kindle "mkdir -p {{remote_dir}}/cache"
     @echo "Starting API server..."
     @just server
-    @sleep 8
     ssh kindle 'lipc-set-prop com.lab126.appmgrd start app://com.lzampier.btmanager'
     @echo "Deployment complete!"
 
@@ -170,7 +169,6 @@ _install-tarball tarball:
     ssh kindle "/usr/sbin/mntroot ro"
     @echo "Starting daemon..."
     ssh kindle "/sbin/initctl start hid-passthrough"
-    @sleep 8
     ssh kindle 'lipc-set-prop com.lab126.appmgrd start app://com.lzampier.btmanager'
     @echo "Install complete!"
 

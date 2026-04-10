@@ -16,6 +16,9 @@
     <div id="messageBar" class="message-bar"></div>
 
     <div class="status-panel">
+        <button id="btnToggleDaemon" class="toggle" aria-label="Toggle Daemon">
+            <span class="toggle-knob"></span>
+        </button>
         <div class="status-row">
             <span class="status-label">Daemon: </span>
             <span id="statusDaemon" class="status-value unknown">checking...</span>
@@ -24,11 +27,6 @@
             <span class="status-label">Devices: </span>
             <span id="statusDevices" class="status-value unknown">--</span>
         </div>
-    </div>
-
-    <div class="btn-row">
-        <button id="btnStart" class="btn btn-half btn-start">Start Daemon</button>
-        <button id="btnStop" class="btn btn-half btn-stop">Stop Daemon</button>
     </div>
 
     <div class="section-header">Paired Devices</div>

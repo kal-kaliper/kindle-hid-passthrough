@@ -24,10 +24,24 @@ __all__ = ['APIServer', 'RequestHandler', 'PORT']
 PORT = 8321
 
 
+_devices_cache = None
+_devices_mtime = 0
+
+
 def _build_devices_json():
-    """Parse devices.conf into a list of dicts."""
+    """Parse devices.conf into a list of dicts, cached by file mtime."""
+    global _devices_cache, _devices_mtime
+
+    try:
+        mtime = os.path.getmtime(config.devices_config_file)
+    except OSError:
+        mtime = 0
+
+    if _devices_cache is not None and mtime == _devices_mtime:
+        return _devices_cache
+
     devices = config.get_all_devices()
-    return [
+    _devices_cache = [
         {
             "address": addr,
             "protocol": proto.value,
@@ -35,6 +49,8 @@ def _build_devices_json():
         }
         for addr, proto, name in devices
     ]
+    _devices_mtime = mtime
+    return _devices_cache
 
 
 class APIServer(ThreadingMixIn, HTTPServer):

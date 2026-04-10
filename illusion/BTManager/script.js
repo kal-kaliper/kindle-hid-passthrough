@@ -17,6 +17,9 @@ var BTManager = (function() {
     var confirmAction = null;
     var confirmAddr = null;
     var lastStatus = null;
+    var lastStatusJson = "";
+    var versionSet = false;
+    var daemonRunning = false;
     var isScanning = false;
     var isPairing = false;
     var scanPollTimer = null;
@@ -119,26 +122,37 @@ var BTManager = (function() {
                 setStatus("statusDaemon", "unknown", "unknown");
                 setStatus("statusDevices", "--", "unknown");
                 renderDeviceList(null);
+                lastStatusJson = "";
                 return;
             }
+
+            var json = JSON.stringify(data);
+            if (json === lastStatusJson) return;
+            lastStatusJson = json;
+
+            daemonRunning = data.daemon_running;
+            var toggleBtn = getEl("btnToggleDaemon");
 
             if (data.scanning) {
                 setStatus("statusDaemon", "scanning...", "running");
             } else if (data.pairing) {
                 setStatus("statusDaemon", "pairing...", "running");
-            } else if (data.daemon_running) {
+            } else if (daemonRunning) {
                 setStatus("statusDaemon", "running", "running");
             } else {
                 setStatus("statusDaemon", "stopped", "stopped");
             }
+
+            toggleBtn.className = daemonRunning ? "toggle on" : "toggle";
 
             var count = data.devices ? data.devices.length : 0;
             setStatus("statusDevices", count + " configured", "");
 
             renderDeviceList(data.devices, data.connected_device || null);
 
-            if (data.version) {
+            if (!versionSet && data.version) {
                 getEl("footer").innerHTML = "HID Passthrough v" + escapeHtml(data.version);
+                versionSet = true;
             }
 
             lastStatus = data;
@@ -193,40 +207,42 @@ var BTManager = (function() {
 
     // ---- Actions ----
 
-    function startDaemon() {
-        pressBtn("btnStart");
-        showMessage("Starting daemon...", false);
-        request("/start", function(data, err) {
-            releaseBtn("btnStart");
-            if (err) {
-                showMessage("Error: " + err, true);
-                return;
-            }
-            if (data && data.ok) {
-                showMessage("Daemon started", false);
-            } else {
-                showMessage(data && data.error ? data.error : "Failed to start", true);
-            }
-            setTimeout(updateStatus, 1500);
-        });
-    }
-
-    function stopDaemon() {
-        pressBtn("btnStop");
-        showMessage("Stopping daemon...", false);
-        request("/stop", function(data, err) {
-            releaseBtn("btnStop");
-            if (err) {
-                showMessage("Error: " + err, true);
-                return;
-            }
-            if (data && data.ok) {
-                showMessage("Daemon stopped", false);
-            } else {
-                showMessage(data && data.error ? data.error : "Failed to stop", true);
-            }
-            setTimeout(updateStatus, 1000);
-        });
+    function toggleDaemon() {
+        var btn = getEl("btnToggleDaemon");
+        pressBtn(btn);
+        if (daemonRunning) {
+            showMessage("Stopping daemon...", false);
+            request("/stop", function(data, err) {
+                releaseBtn(btn);
+                if (err) {
+                    showMessage("Error: " + err, true);
+                    return;
+                }
+                if (data && data.ok) {
+                    showMessage("Daemon stopped", false);
+                } else {
+                    showMessage(data && data.error ? data.error : "Failed to stop", true);
+                }
+                lastStatusJson = "";
+                setTimeout(updateStatus, 1000);
+            });
+        } else {
+            showMessage("Starting daemon...", false);
+            request("/start", function(data, err) {
+                releaseBtn(btn);
+                if (err) {
+                    showMessage("Error: " + err, true);
+                    return;
+                }
+                if (data && data.ok) {
+                    showMessage("Daemon started", false);
+                } else {
+                    showMessage(data && data.error ? data.error : "Failed to start", true);
+                }
+                lastStatusJson = "";
+                setTimeout(updateStatus, 1500);
+            });
+        }
     }
 
     function connectDevice(addr, protocol) {
@@ -594,8 +610,7 @@ var BTManager = (function() {
 
     function bindEvents() {
         bindBtn("btnBack", quit);
-        bindBtn("btnStart", startDaemon);
-        bindBtn("btnStop", stopDaemon);
+        bindBtn("btnToggleDaemon", toggleDaemon);
         bindBtn("btnScan", startScan);
         bindBtn("btnPairClose", cancelPair);
         bindBtn("btnLogs", showLogs);
