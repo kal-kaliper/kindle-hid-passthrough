@@ -23,7 +23,7 @@ Usage:
     await host.run()
 """
 
-from config import Protocol, __version__, config
+from config import Protocol, __version__, config, get_version
 from device_cache import DeviceCache
 from host import HIDHost
 from logging_utils import log
@@ -35,4 +35,5 @@ __all__ = [
     'log',
     'DeviceCache',
     '__version__',
+    'get_version',
 ]

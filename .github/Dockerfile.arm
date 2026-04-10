@@ -38,6 +38,7 @@ WORKDIR /build
 # Copy source
 COPY kindle_hid_passthrough/*.py /build/kindle_hid_passthrough/
 COPY kindle_hid_passthrough/config.ini /build/kindle_hid_passthrough/
+COPY kindle_hid_passthrough/BUILD_SHA /build/kindle_hid_passthrough/
 
 # ARM-specific compiler flags to fix branch range errors
 ENV CFLAGS="-O3 -mword-relocations -mlong-calls -ffunction-sections -fdata-sections"
@@ -70,6 +71,7 @@ RUN python3 -m nuitka \
     --output-dir=/build/nuitka-out \
     --include-package=kindle_hid_passthrough \
     --include-data-file=kindle_hid_passthrough/config.ini=kindle_hid_passthrough/config.ini \
+    --include-data-file=kindle_hid_passthrough/BUILD_SHA=kindle_hid_passthrough/BUILD_SHA \
     --nofollow-import-to=pytest \
     --nofollow-import-to=unittest \
     --nofollow-import-to=setuptools \

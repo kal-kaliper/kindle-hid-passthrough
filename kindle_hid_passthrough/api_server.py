@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
 
-from config import Protocol, __version__, config, normalize_addr
+from config import Protocol, config, get_version, normalize_addr
 from device_cache import DeviceCache
 from logging_utils import log
 
@@ -124,7 +124,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             "daemon_running": status.get("daemon_running", False),
             "device_count": len(devices),
             "devices": devices,
-            "version": __version__,
+            "version": get_version(),
             "scanning": status.get("scanning", False),
             "pairing": status.get("pairing", False),
         }

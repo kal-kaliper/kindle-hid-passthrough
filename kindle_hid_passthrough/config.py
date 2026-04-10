@@ -11,6 +11,7 @@ import configparser
 import json
 import logging
 import os
+import subprocess
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -21,7 +22,37 @@ if TYPE_CHECKING:
 
 __version__ = "3.3.3"
 
-__all__ = ['config', 'Config', 'Protocol', 'get_fallback_hid_descriptor', 'normalize_addr', '__version__']
+
+def _get_git_sha() -> Optional[str]:
+    try:
+        sha = subprocess.check_output(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            stderr=subprocess.DEVNULL,
+            cwd=os.path.dirname(__file__),
+        ).decode().strip()
+        return sha
+    except Exception:
+        return None
+
+
+def _get_build_sha() -> Optional[str]:
+    sha_file = os.path.join(os.path.dirname(__file__), 'BUILD_SHA')
+    if os.path.isfile(sha_file):
+        try:
+            with open(sha_file) as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return None
+
+
+def get_version() -> str:
+    sha = _get_git_sha() or _get_build_sha()
+    if sha:
+        return f"{__version__}-{sha}"
+    return __version__
+
+__all__ = ['config', 'Config', 'Protocol', 'get_fallback_hid_descriptor', 'normalize_addr', '__version__', 'get_version']
 
 
 def normalize_addr(address: str) -> str:

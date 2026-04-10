@@ -43,7 +43,7 @@ from bumble.pairing import PairingConfig, PairingDelegate
 from bumble.sdp import Client as SDPClient
 from bumble.transport import open_transport
 
-from config import Protocol, __version__, config, get_fallback_hid_descriptor, normalize_addr
+from config import Protocol, config, get_fallback_hid_descriptor, get_version, normalize_addr
 from device_cache import DeviceCache
 from logging_utils import log
 from bt_setup import prepare_bt
@@ -183,7 +183,7 @@ class HIDHost:
 
     async def start(self):
         """Initialize the Bumble device with both protocols."""
-        log.info(f"HID Host v{__version__}")
+        log.info(f"HID Host v{get_version()}")
 
         # Ensure BT hardware is available
         prepare_bt(

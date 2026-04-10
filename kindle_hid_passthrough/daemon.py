@@ -19,7 +19,7 @@ import threading
 sys.path.insert(0, '/mnt/us/kindle_hid_passthrough')
 
 from api_server import APIServer, RequestHandler, PORT
-from config import __version__, config, normalize_addr
+from config import config, get_version, normalize_addr
 from controller import DaemonController
 from host import HIDHost
 from logging_utils import log, setup_daemon_logging
@@ -115,7 +115,7 @@ class HIDDaemon:
             if not self.running:
                 return
 
-        logger.info(f"HID Daemon v{__version__}")
+        logger.info(f"HID Daemon v{get_version()}")
 
         while self.running:
             # Handle suspension
@@ -247,7 +247,7 @@ async def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, on_signal)
 
-    log.info(f"Kindle HID Passthrough v{__version__} (daemon)")
+    log.info(f"Kindle HID Passthrough v{get_version()} (daemon)")
     daemon_task = asyncio.create_task(daemon.run())
 
     await asyncio.wait(

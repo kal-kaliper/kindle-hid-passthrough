@@ -15,6 +15,8 @@ default:
 deploy:
     @echo "Deploying to Kindle..."
     @just kill
+    @echo "Writing build SHA..."
+    git -C {{src_dir}} rev-parse --short HEAD > {{src_dir}}/kindle_hid_passthrough/BUILD_SHA
     @echo "Remounting filesystems as writable..."
     ssh kindle "/usr/sbin/mntroot rw && mount -o remount,rw /mnt/base-us"
     @echo "Copying all files via tar pipe..."
@@ -26,6 +28,7 @@ deploy:
         --transform='s|^illusion/BTManager/|mnt/us/kindle_hid_passthrough/illusion/BTManager/|' \
         kindle_hid_passthrough/*.py \
         kindle_hid_passthrough/config.ini \
+        kindle_hid_passthrough/BUILD_SHA \
         kindle_hid_passthrough/hid-passthrough-dev.upstart \
         assets/99-hid-keyboard.rules \
         scripts/dev_is_keyboard.sh \
