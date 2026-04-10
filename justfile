@@ -138,3 +138,107 @@ remove-autostart:
     ssh kindle "/usr/sbin/mntroot rw"
     ssh kindle "rm -f {{upstart_conf}}"
     @echo "Autostart removed."
+
+# --- Install from pre-built tarball ---
+
+repo := "zampierilucas/kindle-hid-passthrough"
+artifact_name := "kindle-hid-passthrough-armv7"
+tarball_name := "kindle-hid-passthrough-armv7.tar.gz"
+
+# Install a pre-built tarball onto Kindle over SSH
+_install-tarball tarball:
+    @echo "Installing {{tarball}} to Kindle..."
+    @just kill
+    @echo "Remounting filesystems as writable..."
+    ssh kindle "/usr/sbin/mntroot rw && mount -o remount,rw /mnt/base-us"
+    @echo "Extracting files to Kindle..."
+    ssh kindle "mkdir -p {{remote_dir}}"
+    cat {{tarball}} | ssh kindle "tar xzf - -C {{remote_dir}}"
+    @echo "Installing system files..."
+    ssh kindle "mkdir -p /usr/local/bin && \
+        cp {{remote_dir}}/assets/hid-passthrough.upstart /etc/upstart/hid-passthrough.conf && \
+        cp {{remote_dir}}/scripts/dev_is_keyboard.sh /usr/local/bin/dev_is_keyboard.sh && \
+        chmod +x /usr/local/bin/dev_is_keyboard.sh && \
+        cp {{remote_dir}}/assets/99-hid-keyboard.rules /etc/udev/rules.d/ && \
+        /usr/sbin/udevadm control --reload-rules"
+    @echo "Installing WAF app..."
+    ssh kindle "cd {{remote_dir}} && sh illusion/install-waf-app.sh"
+    @echo "Remounting read-only..."
+    ssh kindle "/usr/sbin/mntroot ro"
+    @echo "Starting daemon..."
+    ssh kindle "/sbin/initctl start hid-passthrough"
+    @sleep 8
+    ssh kindle 'lipc-set-prop com.lab126.appmgrd start app://com.lzampier.btmanager'
+    @echo "Install complete!"
+
+# Install from GitHub release (default: latest)
+install-release version="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    version="{{version}}"
+    if [ -z "$version" ]; then
+        echo "Fetching latest release..."
+        version=$(curl -sfL "https://api.github.com/repos/{{repo}}/releases/latest" | grep '"tag_name"' | cut -d'"' -f4)
+        if [ -z "$version" ]; then
+            echo "ERROR: Could not determine latest release version" >&2
+            exit 1
+        fi
+    fi
+    echo "Downloading release $version..."
+    curl -sfL -o "$tmpdir/{{tarball_name}}" \
+        "https://github.com/{{repo}}/releases/download/${version}/{{tarball_name}}"
+    echo "Downloaded to $tmpdir/{{tarball_name}}"
+    just _install-tarball "$tmpdir/{{tarball_name}}"
+
+# Install from latest CI build artifact
+install-ci branch="main":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    echo "Finding latest successful CI run on {{branch}}..."
+    run_id=$(gh run list \
+        --repo "{{repo}}" \
+        --workflow build-arm.yml \
+        --branch "{{branch}}" \
+        --status success \
+        --limit 1 \
+        --json databaseId \
+        --jq '.[0].databaseId')
+    if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+        echo "ERROR: No successful CI run found on branch '{{branch}}'" >&2
+        exit 1
+    fi
+    echo "Downloading artifact from run $run_id..."
+    gh run download "$run_id" \
+        --repo "{{repo}}" \
+        --name "{{artifact_name}}" \
+        --dir "$tmpdir"
+    tarball=$(find "$tmpdir" -name "{{tarball_name}}" -print -quit)
+    if [ -z "$tarball" ]; then
+        echo "ERROR: Tarball not found in downloaded artifact" >&2
+        ls -la "$tmpdir"/
+        exit 1
+    fi
+    just _install-tarball "$tarball"
+
+# Uninstall system integration (upstart, udev, WAF app) but leave code in place
+uninstall:
+    @echo "Uninstalling system integration..."
+    @just kill
+    @echo "Remounting filesystems as writable..."
+    ssh kindle "/usr/sbin/mntroot rw"
+    @echo "Removing upstart config..."
+    -ssh kindle "rm -f {{upstart_conf}}"
+    @echo "Removing udev rules..."
+    -ssh kindle "rm -f /etc/udev/rules.d/99-hid-keyboard.rules"
+    -ssh kindle "/usr/sbin/udevadm control --reload-rules"
+    @echo "Removing helper script..."
+    -ssh kindle "rm -f /usr/local/bin/dev_is_keyboard.sh"
+    @echo "Removing WAF app scriptlet..."
+    -ssh kindle "rm -f /mnt/us/documents/BTManager.sh"
+    @echo "Remounting read-only..."
+    -ssh kindle "/usr/sbin/mntroot ro"
+    @echo "Uninstall complete. Code left at {{remote_dir}}/"
