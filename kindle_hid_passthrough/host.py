@@ -12,7 +12,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import List, Optional
 
-from bumble.core import BT_BR_EDR_TRANSPORT, BT_LE_TRANSPORT, BT_HUMAN_INTERFACE_DEVICE_SERVICE, InvalidStateError
+from bumble.core import BT_BR_EDR_TRANSPORT, BT_LE_TRANSPORT, BT_HUMAN_INTERFACE_DEVICE_SERVICE, InvalidStateError, TimeoutError as BumbleTimeoutError
 from bumble.device import Device, Peer
 from bumble.gatt import (
     GATT_DEVICE_NAME_CHARACTERISTIC,
@@ -495,8 +495,9 @@ class HIDHost:
 
         target = Address(address)
         try:
-            self.connection = await asyncio.wait_for(
-                self.device.connect(target, own_address_type=OwnAddressType.PUBLIC),
+            self.connection = await self.device.connect(
+                target,
+                own_address_type=OwnAddressType.PUBLIC,
                 timeout=config.connect_timeout,
             )
         except Exception as e:
@@ -576,12 +577,13 @@ class HIDHost:
 
         try:
             target_address = Address(address, Address.PUBLIC_DEVICE_ADDRESS)
-            self.connection = await asyncio.wait_for(
-                self.device.connect(target_address, transport=BT_BR_EDR_TRANSPORT),
-                timeout=config.connect_timeout
+            self.connection = await self.device.connect(
+                target_address,
+                transport=BT_BR_EDR_TRANSPORT,
+                timeout=config.connect_timeout,
             )
             log.success(f"[Classic] Connected to {address}")
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, BumbleTimeoutError):
             log.error(f"[Classic] Connection timeout after {config.connect_timeout}s")
             return False
         except Exception as e:
@@ -774,9 +776,10 @@ class HIDHost:
         if not self.connection:
             log.info(f"[BLE] Reconnecting to {self.current_device_address}...")
             target = Address(self.current_device_address)
-            self.connection = await asyncio.wait_for(
-                self.device.connect(target, own_address_type=OwnAddressType.PUBLIC),
-                timeout=config.connect_timeout
+            self.connection = await self.device.connect(
+                target,
+                own_address_type=OwnAddressType.PUBLIC,
+                timeout=config.connect_timeout,
             )
             self.peer = Peer(self.connection)
             self.connection.on('disconnection', self._on_disconnection)
@@ -1255,9 +1258,10 @@ class HIDHost:
                 for attempt in range(1, max_attempts + 1):
                     try:
                         log.info(f"[BLE] Connecting to {found_device.address} (Attempt {attempt}/{max_attempts})...")
-                        self.connection = await asyncio.wait_for(
-                            self.device.connect(found_device.address, own_address_type=OwnAddressType.PUBLIC),
-                            timeout=config.connect_timeout
+                        self.connection = await self.device.connect(
+                            found_device.address,
+                            own_address_type=OwnAddressType.PUBLIC,
+                            timeout=config.connect_timeout,
                         )
 
                         if self._connection_future.done():
