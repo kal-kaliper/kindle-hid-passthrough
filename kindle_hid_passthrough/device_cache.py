@@ -11,7 +11,7 @@ Author: Lucas Zampieri <lzampier@redhat.com>
 import json
 import logging
 import os
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -142,24 +142,3 @@ class DeviceCache:
             except Exception as e:
                 logger.warning(f"Failed to clear all caches: {e}")
 
-    def list_cached_devices(self) -> List[str]:
-        """List all devices with cached data
-
-        Returns:
-            List of device addresses (formatted with colons)
-        """
-        devices = []
-        try:
-            for filename in os.listdir(self.cache_dir):
-                if filename.endswith('.json'):
-                    # Convert filename back to address format
-                    addr = filename[:-5].replace('_', ':')
-                    devices.append(addr)
-        except Exception as e:
-            logger.warning(f"Failed to list cached devices: {e}")
-
-        return devices
-
-
-# Backwards compatibility alias
-GATTCache = DeviceCache

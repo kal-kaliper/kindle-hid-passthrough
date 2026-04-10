@@ -10,9 +10,8 @@ Author: Lucas Zampieri <lzampier@redhat.com>
 
 import logging
 import os
-import select
 import struct
-from typing import Callable, Optional
+from typing import Optional
 
 __all__ = ['UHIDDevice', 'UHIDError', 'Bus']
 
@@ -22,28 +21,14 @@ logger = logging.getLogger(__name__)
 UHID_CREATE2 = 11
 UHID_DESTROY = 1
 UHID_INPUT2 = 12
-UHID_START = 2
-UHID_STOP = 3
-UHID_OPEN = 4
-UHID_CLOSE = 5
-UHID_OUTPUT = 6
-
 # Maximum sizes
 HID_MAX_DESCRIPTOR_SIZE = 4096
 UHID_DATA_MAX = 4096
 
-# Event struct size for reading
-UHID_EVENT_SIZE = 4 + 4380  # type + largest union member
-
 
 class Bus:
     """Bus types for HID devices."""
-    PCI = 0x01
-    ISAPNP = 0x02
-    USB = 0x03
-    HIL = 0x04
     BLUETOOTH = 0x05
-    VIRTUAL = 0x06
 
 
 class UHIDError(Exception):
@@ -113,14 +98,6 @@ class UHIDDevice:
 
         self._fd: Optional[int] = None
         self._created = False
-        self._started = False
-
-        # Callbacks for kernel events
-        self.on_start: Optional[Callable[[], None]] = None
-        self.on_stop: Optional[Callable[[], None]] = None
-        self.on_open: Optional[Callable[[], None]] = None
-        self.on_close: Optional[Callable[[], None]] = None
-        self.on_output: Optional[Callable[[bytes, int], None]] = None
 
         self._open_uhid()
         self._create_device()
@@ -226,79 +203,6 @@ class UHIDDevice:
         except OSError:
             pass
         self._fd = None
-
-    def poll_events(self, timeout: float = 0) -> bool:
-        """Poll for kernel events (OUTPUT reports, etc.).
-
-        Args:
-            timeout: Timeout in seconds (0 = non-blocking)
-
-        Returns:
-            True if an event was processed, False otherwise
-        """
-        if self._fd is None:
-            return False
-
-        readable, _, _ = select.select([self._fd], [], [], timeout)
-
-        if not readable:
-            return False
-
-        try:
-            data = os.read(self._fd, UHID_EVENT_SIZE)
-            if len(data) < 4:
-                return False
-
-            event_type = struct.unpack_from('< L', data)[0]
-            self._handle_event(event_type, data)
-            return True
-        except OSError:
-            return False
-
-    def _handle_event(self, event_type: int, data: bytes):
-        """Handle kernel event."""
-        if event_type == UHID_START:
-            self._started = True
-            logger.debug("UHID_START received")
-            if self.on_start:
-                self.on_start()
-
-        elif event_type == UHID_STOP:
-            self._started = False
-            logger.debug("UHID_STOP received")
-            if self.on_stop:
-                self.on_stop()
-
-        elif event_type == UHID_OPEN:
-            logger.debug("UHID_OPEN received")
-            if self.on_open:
-                self.on_open()
-
-        elif event_type == UHID_CLOSE:
-            logger.debug("UHID_CLOSE received")
-            if self.on_close:
-                self.on_close()
-
-        elif event_type == UHID_OUTPUT:
-            # Parse output report
-            # Format: data(4096s) size(H) rtype(B)
-            if len(data) >= 4 + UHID_DATA_MAX + 3:
-                output_data = data[4:4+UHID_DATA_MAX]
-                size, rtype = struct.unpack_from('< H B', data, 4 + UHID_DATA_MAX)
-                output_data = output_data[:size]
-                logger.debug(f"UHID_OUTPUT received: {output_data.hex()} (type={rtype})")
-                if self.on_output:
-                    self.on_output(output_data, rtype)
-
-    @property
-    def is_created(self) -> bool:
-        """Check if device is created."""
-        return self._created
-
-    @property
-    def is_started(self) -> bool:
-        """Check if device is started (kernel acknowledged)."""
-        return self._started
 
     @property
     def fd(self) -> Optional[int]:

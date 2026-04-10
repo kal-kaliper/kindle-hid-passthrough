@@ -164,15 +164,3 @@ def detect_kindle(serial: str = None) -> Optional[KindleDefaults]:
     )
     log.info(f"Detected {name} (code 0x{device_code:X})")
     return defaults
-
-
-def get_default_transport() -> Optional[str]:
-    """Get the default HCI transport spec for this Kindle.
-
-    Returns:
-        Transport string like 'file:/dev/stpbt' or None if unknown.
-    """
-    defaults = detect_kindle()
-    if defaults and os.path.exists(defaults.device_path):
-        return f'file:{defaults.device_path}'
-    return None

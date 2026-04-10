@@ -97,13 +97,6 @@ class HIDLogger:
         if self._console_output and self.logger.isEnabledFor(logging.DEBUG):
             print(color(formatted, 'cyan'))
 
-    def detail(self, msg: str):
-        """Log detail message without timestamp (cyan, indented)"""
-        self.logger.info(msg)
-
-        if self._console_output:
-            print(color(f"    {msg}", 'cyan'))
-
     def raw(self, msg: str):
         """Print raw message without formatting"""
         if self._console_output:
