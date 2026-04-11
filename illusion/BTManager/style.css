@@ -399,7 +399,7 @@ html {
 
 .message-bar {
     display: none;
-    position: fixed;
+    position: absolute;
     bottom: 0;
     left: 0;
     width: 100%;
@@ -425,7 +425,7 @@ html {
 
 .overlay {
     display: none;
-    position: fixed;
+    position: absolute;
     top: 0;
     left: 0;
     width: 100%;

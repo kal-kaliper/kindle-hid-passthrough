@@ -11,6 +11,7 @@ Port 8321 on localhost.
 import json
 import os
 import socket
+import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
@@ -26,6 +27,7 @@ PORT = 8321
 
 _devices_cache = None
 _devices_mtime = 0
+_devices_lock = threading.Lock()
 
 
 def _build_devices_json():
@@ -37,20 +39,21 @@ def _build_devices_json():
     except OSError:
         mtime = 0
 
-    if _devices_cache is not None and mtime == _devices_mtime:
-        return _devices_cache
+    with _devices_lock:
+        if _devices_cache is not None and mtime == _devices_mtime:
+            return _devices_cache
 
-    devices = config.get_all_devices()
-    _devices_cache = [
-        {
-            "address": addr,
-            "protocol": proto.value,
-            **({"name": name} if name else {}),
-        }
-        for addr, proto, name in devices
-    ]
-    _devices_mtime = mtime
-    return _devices_cache
+        devices = config.get_all_devices()
+        _devices_cache = [
+            {
+                "address": addr,
+                "protocol": proto.value,
+                **({"name": name} if name else {}),
+            }
+            for addr, proto, name in devices
+        ]
+        _devices_mtime = mtime
+        return _devices_cache
 
 
 class APIServer(ThreadingMixIn, HTTPServer):
@@ -123,8 +126,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._handle_disconnect()
             case '/logs':
                 self._handle_logs(param('lines'))
-            case '/device-info':
-                self._handle_device_info(param('addr'))
             case _:
                 self._send_json({"ok": False, "error": "Not found"})
 
@@ -318,17 +319,3 @@ class RequestHandler(BaseHTTPRequestHandler):
         except OSError as e:
             self._send_json({"ok": False, "error": str(e)})
 
-    def _handle_device_info(self, address):
-        if not address:
-            self._send_json({"ok": False, "error": "No address provided"})
-            return
-
-        addr = normalize_addr(address)
-        cache = DeviceCache(config.cache_dir).load(addr)
-        resp = {"ok": True, "address": addr, "cached": cache is not None}
-        if cache:
-            if cache.get("device_name"):
-                resp["device_name"] = cache["device_name"]
-            if cache.get("report_map"):
-                resp["descriptor_size"] = len(bytes.fromhex(cache["report_map"]))
-        self._send_json(resp)

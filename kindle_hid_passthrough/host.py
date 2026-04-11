@@ -1469,6 +1469,8 @@ class HIDHost:
                 product=0,
             )
             log.success(f"UHID device created: {name}")
+            asyncio.get_event_loop().call_later(
+                0.5, self.uhid_device.discover_input_paths)
         except Exception as e:
             log.error(f"Failed to create UHID device: {e}")
 

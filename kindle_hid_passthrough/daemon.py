@@ -7,7 +7,7 @@ Maintains connection with auto-reconnect.
 
 For use with init scripts / systemd.
 
-Author: Lucas Zampieri <lzampier@redhat.com>
+Author: Lucas Zampieri
 """
 
 import asyncio

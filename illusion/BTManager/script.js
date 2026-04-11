@@ -710,7 +710,7 @@ var BTManager = (function() {
             // Device row tap -> detail overlay
             var row = target;
             while (row && row !== document) {
-                if (row.getAttribute && row.getAttribute("data-addr")) {
+                if (row.className && row.className.indexOf("device-row") !== -1 && row.getAttribute("data-addr")) {
                     addr = row.getAttribute("data-addr");
                     proto = row.getAttribute("data-proto");
                     name = row.getAttribute("data-name");

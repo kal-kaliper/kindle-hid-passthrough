@@ -5,7 +5,7 @@ UHID Handler
 Manages virtual HID devices via Linux UHID interface.
 Allows BLE/Classic HID devices to appear as native Linux input devices.
 
-Author: Lucas Zampieri <lzampier@redhat.com>
+Author: Lucas Zampieri
 """
 
 import logging
@@ -147,54 +147,34 @@ class UHIDDevice:
             if written != len(event):
                 raise UHIDError(f"Incomplete write: {written} != {len(event)}")
             self._created = True
-            self._discover_input_paths()
             logger.info(f"Created UHID device: {self.name} "
                        f"(vendor=0x{self.vendor:04x}, product=0x{self.product:04x}, "
-                       f"rd_size={len(self.report_descriptor)}, "
-                       f"inputs={self.input_paths})")
+                       f"rd_size={len(self.report_descriptor)})")
 
         except OSError as e:
             raise UHIDError(f"Failed to create device: {e}")
 
-    def _discover_input_paths(self):
-        """Find /dev/input/eventX paths created by this UHID device.
+    def discover_input_paths(self):
+        """Find /dev/input/eventX paths for this UHID device.
 
-        Retries briefly since the kernel needs time to register the input
-        device after UHID_CREATE2.
+        Parses /proc/bus/input/devices for entries matching this device's name.
+        Called externally after an async delay to give the kernel time to
+        register the input device after UHID_CREATE2.
         """
-        import time
-        for attempt in range(5):
-            self.input_paths = self._parse_input_devices()
-            if self.input_paths:
-                return
-            time.sleep(0.1)
-
-    def _parse_input_devices(self):
-        """Parse /proc/bus/input/devices for entries matching this device name."""
-        paths = []
+        self.input_paths = []
         try:
-            with open('/proc/bus/input/devices', 'r') as f:
-                block = ""
-                for line in f:
-                    if line.strip() == "":
-                        if self.name in block:
-                            for bline in block.splitlines():
-                                if bline.startswith("H: Handlers="):
-                                    for tok in bline.split("=", 1)[1].split():
-                                        if tok.startswith("event"):
-                                            paths.append("/dev/input/" + tok)
-                        block = ""
-                    else:
-                        block += line
-                if self.name in block:
-                    for bline in block.splitlines():
-                        if bline.startswith("H: Handlers="):
-                            for tok in bline.split("=", 1)[1].split():
-                                if tok.startswith("event"):
-                                    paths.append("/dev/input/" + tok)
+            content = open('/proc/bus/input/devices').read()
         except OSError:
-            pass
-        return paths
+            return
+
+        for block in content.split("\n\n"):
+            if self.name not in block:
+                continue
+            for line in block.splitlines():
+                if line.startswith("H: Handlers="):
+                    for tok in line.split("=", 1)[1].split():
+                        if tok.startswith("event"):
+                            self.input_paths.append("/dev/input/" + tok)
 
     def send_input(self, data: bytes):
         """Send HID input report to the kernel.
