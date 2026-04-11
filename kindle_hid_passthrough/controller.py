@@ -9,7 +9,7 @@ disconnect) from the HTTP server thread via asyncio.run_coroutine_threadsafe().
 import asyncio
 import logging
 
-from config import Protocol, config, normalize_addr
+from config import Protocol, config
 from host import HIDHost
 from scanner import Scanner
 
@@ -86,7 +86,7 @@ class DaemonController:
                 scanner = Scanner()
                 scanner.on_device_found = self._on_device_found
                 await scanner.start()
-                devices = await scanner.scan(duration=10.0)
+                await scanner.scan(duration=10.0)
                 await scanner.cleanup()
 
                 self.scan_result = {

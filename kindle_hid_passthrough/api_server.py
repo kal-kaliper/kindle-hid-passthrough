@@ -17,7 +17,6 @@ from urllib.parse import parse_qs, urlparse
 
 from config import Protocol, config, get_version, normalize_addr
 from device_cache import DeviceCache
-from logging_utils import log
 
 __all__ = ['APIServer', 'RequestHandler', 'PORT']
 

@@ -47,7 +47,7 @@ from config import Protocol, config, get_fallback_hid_descriptor, get_version, n
 from device_cache import DeviceCache
 from logging_utils import log
 from bt_setup import prepare_bt
-from uhid_handler import Bus, UHIDDevice, UHIDError
+from uhid_handler import Bus, UHIDDevice
 
 __all__ = ['HIDHost']
 
@@ -1221,7 +1221,7 @@ class HIDHost:
 
     async def _run_ble_scan_handler(self, target_addresses: set):
         """Fallback BLE handler using active scanning for discovery."""
-        log.info(f"[BLE] Scanning for devices...")
+        log.info("[BLE] Scanning for devices...")
 
         while not self._connection_future.done():
             found_device = None
