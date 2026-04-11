@@ -29,8 +29,9 @@ RUN pip install --no-cache-dir \
     bumble==0.0.226 \
     aiofiles>=23.0.0
 
-# Enable ccache
+# Enable ccache and Nuitka's own caching
 ENV CCACHE_DIR=/ccache
+ENV NUITKA_CACHE_DIR=/nuitka-cache
 ENV PATH="/usr/lib/ccache:${PATH}"
 
 WORKDIR /build
@@ -63,7 +64,9 @@ RUN printf '%s\n' \
     strip /build/libsyscall_wrapper.so
 
 # Build with Nuitka in standalone mode (creates directory with all deps)
-RUN python3 -m nuitka \
+RUN --mount=type=cache,target=/nuitka-cache \
+    --mount=type=cache,target=/ccache \
+    python3 -m nuitka \
     --mode=standalone \
     --jobs=$(nproc) \
     --lto=yes \
