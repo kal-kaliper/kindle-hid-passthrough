@@ -21,18 +21,37 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+        id: setup-buildx
+
+      - name: Restore Nuitka build cache
+        uses: actions/cache@v4
+        id: cache-nuitka
+        with:
+          path: cache-nuitka
+          key: nuitka-cache-${{ runner.arch }}
+          restore-keys: nuitka-cache-
+
+      - name: Inject buildkit cache
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.setup-buildx.outputs.name }}
+          cache-dir: cache-nuitka
+          dockerfile: .github/Dockerfile.arm
+          skip-extraction: ${{ steps.cache-nuitka.outputs.cache-hit }}
 
       - name: Write build SHA
         run: git rev-parse --short HEAD > kindle_hid_passthrough/BUILD_SHA
 
       - name: Build ARMv7 binary with Docker
-        run: |
-          docker build \
-            --platform linux/arm/v7 \
-            -f .github/Dockerfile.arm \
-            -t kindle-hid-passthrough-builder \
-            --load \
-            .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/Dockerfile.arm
+          platforms: linux/arm/v7
+          tags: kindle-hid-passthrough-builder
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Extract binaries
         run: |

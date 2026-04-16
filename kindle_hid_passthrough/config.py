@@ -13,7 +13,7 @@ import logging
 import os
 import subprocess
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from kindle_detect import detect_kindle
 

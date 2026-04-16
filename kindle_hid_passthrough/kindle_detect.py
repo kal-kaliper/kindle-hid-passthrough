@@ -18,7 +18,6 @@ at positions 2-3. New serials (prefix G) encode as 3-char base32 at
 positions 3-5.
 """
 
-import os
 from dataclasses import dataclass
 from typing import Optional
 

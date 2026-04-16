@@ -13,9 +13,64 @@ import os
 import struct
 from typing import Optional
 
-__all__ = ['UHIDDevice', 'UHIDError', 'Bus']
+__all__ = ['UHIDDevice', 'UHIDError', 'Bus', 'strip_digitizer_collections']
 
 logger = logging.getLogger(__name__)
+
+def strip_digitizer_collections(descriptor: bytes) -> bytes:
+    """Strip Digitizer (0x0D) top-level collections from a HID descriptor.
+
+    The Kindle kernel lacks CONFIG_HID_MULTITOUCH, so hid-core silently
+    drops the entire UHID device when the descriptor contains Digitizer
+    collections. Removing them lets hid-generic claim the rest.
+    """
+    kept = []
+    i = 0
+    usage_page = 0
+    seg_start = 0
+    depth = 0
+
+    while i < len(descriptor):
+        b = descriptor[i]
+        size = b & 0x03
+        if size == 3:
+            size = 4
+        item_type = (b >> 2) & 0x03
+        tag = (b >> 4) & 0x0F
+
+        if i + 1 + size > len(descriptor):
+            break
+
+        if size == 1:
+            val = descriptor[i + 1]
+        elif size == 2:
+            val = int.from_bytes(descriptor[i + 1:i + 3], 'little')
+        elif size == 4:
+            val = int.from_bytes(descriptor[i + 1:i + 5], 'little')
+        else:
+            val = 0
+
+        if item_type == 1 and tag == 0 and depth == 0:
+            usage_page = val
+        if item_type == 0 and tag == 10:
+            depth += 1
+        if item_type == 0 and tag == 12:
+            depth -= 1
+            if depth == 0:
+                end = i + 1 + size
+                if usage_page != 0x0D:
+                    kept.append(descriptor[seg_start:end])
+                seg_start = end
+
+        i += 1 + size
+
+    if not kept or len(kept) == len(descriptor):
+        return descriptor
+
+    result = b''.join(kept)
+    if result != descriptor:
+        logger.info(f"Stripped digitizer collection(s) ({len(descriptor)} -> {len(result)} bytes)")
+    return result
 
 # UHID constants from linux/uhid.h
 UHID_CREATE2 = 11
