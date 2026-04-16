@@ -47,7 +47,7 @@ from config import Protocol, config, get_fallback_hid_descriptor, get_version, n
 from device_cache import DeviceCache
 from logging_utils import log
 from bt_setup import prepare_bt
-from uhid_handler import Bus, UHIDDevice
+from uhid_handler import Bus, UHIDDevice, strip_digitizer_collections
 
 __all__ = ['HIDHost']
 
@@ -1461,9 +1461,10 @@ class HIDHost:
 
         try:
             name = self.device_name or "HID Device"
+            descriptor = strip_digitizer_collections(self.report_map)
             self.uhid_device = UHIDDevice(
                 name=name,
-                report_descriptor=self.report_map,
+                report_descriptor=descriptor,
                 bus=Bus.BLUETOOTH,
                 vendor=0,
                 product=0,
