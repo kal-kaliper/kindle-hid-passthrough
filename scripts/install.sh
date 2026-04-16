@@ -35,7 +35,7 @@ installUpstart()
 pairDevice()
 {
   lipc-set-prop -s com.lab126.btfd BTenable 0:1
-  ./kindle-hid-passthrough --pair
+  ./kindle-hid-passthrough --pair 2>&1 | grep -v "libenvload.so"
 }
 
 listDevices()
