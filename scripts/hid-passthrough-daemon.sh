@@ -17,7 +17,6 @@ alert() {
 }
 
 start() {
-  lipc-set-prop -s com.lab126.btfd BTenable 0:1
   alert "Starting HID Passthrough" "The HID passthrough daemon is starting. Please wait for the keyboard to connect..."
   /mnt/us/kindle_hid_passthrough/$PROCESS_NAME --daemon &
 }

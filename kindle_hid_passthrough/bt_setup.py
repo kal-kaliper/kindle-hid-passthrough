@@ -2,14 +2,13 @@
 """
 Bluetooth hardware setup for Kindle.
 
-Ensures the BT kernel module is loaded and Amazon's conflicting
-BT processes are stopped before opening the HCI transport.
+Ensures the BT kernel module is loaded and any process holding the HCI
+device is evicted before opening the transport.
 
 Auto-detects kernel version and module paths. Override via config.ini:
 
     [bluetooth]
     module_patterns = wmt_cdev_bt.ko, bt_drv.ko
-    kill_processes = bluetoothd, vhci_stpbt_bridge
     settle_time = 0.5
 
 """
@@ -26,12 +25,6 @@ from logging_utils import log
 DEFAULT_MODULE_PATTERNS = [
     'wmt_cdev_bt.ko',   # MediaTek (PW4/5, Kindle 10/11, Scribe)
     'bt_drv.ko',         # Older Freescale/NXP Kindles
-]
-
-# Known Amazon BT processes that hold /dev/stpbt
-DEFAULT_KILL_PROCESSES = [
-    'bluetoothd',
-    'vhci_stpbt_bridge',
 ]
 
 
@@ -84,19 +77,30 @@ def _is_module_loaded(module_path):
     return False
 
 
-def _kill_processes(names=None):
-    """Kill conflicting BT processes.
+def _free_device(device_path):
+    """Kill whatever userspace process is holding the BT device.
+
+    Uses fuser(1), which queries the kernel for open file descriptors
+    on the device. This avoids hardcoding Amazon's process names
+    (bluetoothd, acsbtfd, btif_rxd, etc.) which differ across
+    firmwares. Kernel threads don't appear in fuser output, which is
+    correct since they can't be killed from userspace anyway.
 
     Returns:
-        Number of processes killed.
+        True if fuser ran (regardless of whether anything was killed).
     """
-    names = names or DEFAULT_KILL_PROCESSES
-    killed = 0
-    for name in names:
-        if _run(['killall', name]):
-            log.info(f"Killed {name}")
-            killed += 1
-    return killed
+    try:
+        r = subprocess.run(['fuser', '-k', device_path],
+                           capture_output=True, timeout=5)
+        # fuser returns 0 if a process was found+signalled, 1 if no
+        # process held the file. Both are success for our purposes.
+        if r.returncode == 0:
+            holders = r.stderr.decode(errors='replace').strip()
+            log.info(f"Evicted holders of {device_path}: {holders}")
+        return True
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log.warning(f"fuser unavailable or timed out: {e}")
+        return False
 
 
 def _is_device_free(device_path):
@@ -109,23 +113,21 @@ def _is_device_free(device_path):
         return False
 
 
-def prepare_bt(transport_spec=None, module_patterns=None,
-               kill_processes=None, settle_time=0.5):
+def prepare_bt(transport_spec=None, module_patterns=None, settle_time=0.5):
     """Prepare Bluetooth hardware for use.
 
     1. Load BT kernel module if not already loaded
-    2. Kill Amazon's conflicting BT processes
+    2. Evict whatever process is holding the HCI device (via fuser)
     3. Wait for device to settle
 
     Uses auto-detected Kindle hardware defaults when module_patterns
-    and kill_processes are not specified and not overridden in config.ini.
+    is not specified and not overridden in config.ini.
 
     Args:
         transport_spec: Transport string (e.g. 'file:/dev/stpbt') to
                        extract device path. If None, uses /dev/stpbt.
         module_patterns: List of module filename patterns to search for.
-        kill_processes: List of process names to kill.
-        settle_time: Seconds to wait after killing processes.
+        settle_time: Seconds to wait after evicting holders.
 
     Returns:
         True if BT device is ready.
@@ -142,9 +144,6 @@ def prepare_bt(transport_spec=None, module_patterns=None,
 
     if module_patterns is None and kindle:
         module_patterns = [kindle.kernel_module]
-
-    if kill_processes is None and kindle:
-        kill_processes = kindle.kill_processes
 
     log.info("Preparing Bluetooth hardware...")
 
@@ -172,11 +171,9 @@ def prepare_bt(transport_spec=None, module_patterns=None,
         log.info(f"{device_path} is available")
         return True
 
-    # Step 3: Device is busy - kill conflicting processes
-    log.info(f"{device_path} is busy, stopping conflicting processes...")
-    killed = _kill_processes(kill_processes)
-
-    if killed > 0 and settle_time > 0:
+    # Step 3: Device is busy - evict whoever holds it
+    log.info(f"{device_path} is busy, evicting holder...")
+    if _free_device(device_path) and settle_time > 0:
         time.sleep(settle_time)
 
     # Step 4: Verify
