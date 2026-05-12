@@ -234,14 +234,14 @@ class Config:
 
         addr_norm = normalize_addr(address)
         removed = False
-        keys_to_remove = []
-        for key in data:
-            if normalize_addr(key) == addr_norm:
-                keys_to_remove.append(key)
 
-        for key in keys_to_remove:
-            del data[key]
-            removed = True
+        # Bumble's JsonKeyStore nests entries under a namespace (e.g. "__DEFAULT__").
+        for namespace in data.values():
+            if not isinstance(namespace, dict):
+                continue
+            for key in [k for k in namespace if normalize_addr(k) == addr_norm]:
+                del namespace[key]
+                removed = True
 
         if removed:
             try:
