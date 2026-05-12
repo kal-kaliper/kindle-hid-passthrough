@@ -124,7 +124,6 @@ class Config:
 
         # Bluetooth hardware setup
         self.bt_module_patterns = self._get_list('bluetooth', 'module_patterns', None)
-        self.bt_kill_processes = self._get_list('bluetooth', 'kill_processes', None)
         self.bt_settle_time = float(self._get('bluetooth', 'settle_time', '0.5'))
 
         # Device identity

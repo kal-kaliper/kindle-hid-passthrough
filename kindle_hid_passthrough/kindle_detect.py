@@ -34,7 +34,6 @@ class KindleDefaults:
     """Hardware defaults for a Kindle model."""
     device_path: str            # BT character device (e.g. /dev/stpbt)
     kernel_module: str          # Primary kernel module filename
-    kill_processes: list        # Conflicting processes to stop
     model_name: str             # Human-readable generation name
 
 
@@ -43,7 +42,6 @@ class KindleDefaults:
 _MTK_HW = dict(
     device_path='/dev/stpbt',
     kernel_module='wmt_cdev_bt.ko',
-    kill_processes=['bluetoothd', 'vhci_stpbt_bridge'],
 )
 
 # Broadcom BCM4343 over BSA (proprietary, not HCI-compatible).
@@ -158,7 +156,6 @@ def detect_kindle(serial: str = None) -> Optional[KindleDefaults]:
     defaults = KindleDefaults(
         device_path=hw['device_path'],
         kernel_module=hw['kernel_module'],
-        kill_processes=list(hw['kill_processes']),
         model_name=name,
     )
     log.info(f"Detected {name} (code 0x{device_code:X})")

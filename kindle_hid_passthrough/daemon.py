@@ -19,6 +19,7 @@ import threading
 sys.path.insert(0, '/mnt/us/kindle_hid_passthrough')
 
 from api_server import APIServer, RequestHandler, PORT
+from bt_setup import prepare_bt
 from config import config, get_version, normalize_addr
 from controller import DaemonController
 from host import HIDHost
@@ -241,6 +242,11 @@ class HIDDaemon:
 
 async def main():
     setup_daemon_logging(config.log_file)
+
+    prepare_bt(
+        module_patterns=config.bt_module_patterns,
+        settle_time=config.bt_settle_time,
+    )
 
     daemon = HIDDaemon()
     controller = DaemonController(daemon)
