@@ -1,11 +1,26 @@
 #!/bin/sh
 
+installMainFiles()
+{
+  echo " -> Installing main program files"
+  mkdir -p /mnt/us/kindle_hid_passthrough/dist
+  mkdir -p /mnt/us/kindle_hid_passthrough/illusion/BTManager
+  mkdir -p /mnt/us/kindle_hid_passthrough/cache
+  cp -r dist/* /mnt/us/kindle_hid_passthrough/dist/
+  cp kindle-hid-passthrough /mnt/us/kindle_hid_passthrough/
+  cp libsyscall_wrapper.so /mnt/us/kindle_hid_passthrough/
+  cp config.ini /mnt/us/kindle_hid_passthrough/
+  chmod +x /mnt/us/kindle_hid_passthrough/kindle-hid-passthrough
+  echo " -> Ready."
+}
+
 installAll()
 {
   echo ""
   echo "=== Full Install ==="
   installUdevRules
   installUpstart
+  installMainFiles
   installWAFApp
   echo ""
   echo "Installation complete. Open 'BT Manager' from the Kindle library."
@@ -52,10 +67,14 @@ setLayout()
 
 installWAFApp()
 {
-  if [ -f illusion/install-waf-app.sh ]; then
-    /bin/sh illusion/install-waf-app.sh
+  echo " -> Installing BTManager app"
+  cp -r illusion/BTManager/* /mnt/us/kindle_hid_passthrough/illusion/BTManager/
+  cp illusion/BTManager.sh /mnt/us/kindle_hid_passthrough/illusion/BTManager.sh
+  cp illusion/install-waf-app.sh /mnt/us/kindle_hid_passthrough/illusion/install-waf-app.sh
+  if [ -f /mnt/us/kindle_hid_passthrough/illusion/install-waf-app.sh ]; then
+    /bin/sh /mnt/us/kindle_hid_passthrough/illusion/install-waf-app.sh
   else
-    echo "ERROR: illusion/install-waf-app.sh not found"
+    echo "ERROR: /mnt/us/kindle_hid_passthrough/illusion/install-waf-app.sh not found"
   fi
 }
 

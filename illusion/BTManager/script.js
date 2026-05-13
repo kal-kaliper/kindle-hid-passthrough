@@ -649,7 +649,9 @@ var BTManager = (function() {
 
     function quit() {
         pressBtn("btnBack");
-        if (typeof kindle !== "undefined" && kindle.appmgr && kindle.appmgr.back) {
+        if (typeof kindle !== "undefined" && kindle.appmgr && kindle.appmgr.startApplication) {
+            kindle.appmgr.startApplication("com.lab126.booklet.home");
+        } else if (typeof kindle !== "undefined" && kindle.appmgr && kindle.appmgr.back) {
             kindle.appmgr.back();
         }
     }
