@@ -141,6 +141,13 @@ class HIDHost:
         self.hid_host = None  # For Classic
         self.connected_protocol = None
 
+        # Tasks spawned by event listeners (e.g. on_classic_connection).
+        # These aren't owned by daemon._host_task, so cleanup() must cancel
+        # them explicitly — otherwise they keep running on a torn-down host
+        # and crash on stale attribute access (e.g. self.hid_host is None
+        # while the loop at host.py l2cap_intr_channel still dereferences it).
+        self._connection_tasks: set = set()
+
         # Device state
         self.current_device_address = None
         self.device_name = None
@@ -934,11 +941,14 @@ class HIDHost:
 
         def on_connection_event(connection):
             # Only handle Classic connections here
-            if hasattr(connection, 'transport') and connection.transport == BT_BR_EDR_TRANSPORT:
-                asyncio.create_task(on_classic_connection(connection))
-            elif not hasattr(connection, 'transport'):
-                # Assume Classic if no transport attribute (older Bumble)
-                asyncio.create_task(on_classic_connection(connection))
+            is_classic = (hasattr(connection, 'transport')
+                          and connection.transport == BT_BR_EDR_TRANSPORT) \
+                          or not hasattr(connection, 'transport')
+            if not is_classic:
+                return
+            task = asyncio.create_task(on_classic_connection(connection))
+            self._connection_tasks.add(task)
+            task.add_done_callback(self._connection_tasks.discard)
 
         # Store reference so we can remove it on handler restart
         self._classic_connection_listener = on_connection_event
@@ -1479,6 +1489,21 @@ class HIDHost:
 
     async def cleanup(self):
         """Clean up resources."""
+        # Cancel any in-flight connection handler tasks first, so they don't
+        # race with the teardown below. Without this, an on_classic_connection
+        # task can still be awaiting auth / HID channels while we null out
+        # self.hid_host, then crash on the next attribute access.
+        if self._connection_tasks:
+            pending = list(self._connection_tasks)
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            try:
+                await asyncio.gather(*pending, return_exceptions=True)
+            except Exception:
+                pass
+            self._connection_tasks.clear()
+
         if self.uhid_device:
             try:
                 self.uhid_device.destroy()

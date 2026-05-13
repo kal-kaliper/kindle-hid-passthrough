@@ -215,5 +215,12 @@ class DaemonController:
                     await host.connection.disconnect()
                 else:
                     logger.info("No active connection to disconnect")
+                # Cancel the host task so daemon.run() loops back and re-reads
+                # devices.conf. Without this, a host stuck in an attempt-
+                # reconnect loop (e.g. for a just-removed device) keeps trying
+                # the stale address forever, because its classic_devices list
+                # was loaded once at host creation.
+                if self.daemon._host_task and not self.daemon._host_task.done():
+                    self.daemon._host_task.cancel()
             except Exception as e:
                 logger.error(f"Disconnect failed: {e}")
