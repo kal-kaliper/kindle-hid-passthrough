@@ -26,6 +26,7 @@ deploy:
         --transform='s|^assets/99-hid-keyboard.rules|etc/udev/rules.d/99-hid-keyboard.rules|' \
         --transform='s|^scripts/dev_is_keyboard.sh|usr/local/bin/dev_is_keyboard.sh|' \
         --transform='s|^illusion/BTManager/|mnt/us/kindle_hid_passthrough/illusion/BTManager/|' \
+        --transform='s|^illusion/BTManager.sh|mnt/us/kindle_hid_passthrough/illusion/BTManager.sh|' \
         kindle_hid_passthrough/*.py \
         kindle_hid_passthrough/config.ini \
         kindle_hid_passthrough/BUILD_SHA \
@@ -33,6 +34,7 @@ deploy:
         assets/99-hid-keyboard.rules \
         scripts/dev_is_keyboard.sh \
         illusion/BTManager/* \
+        illusion/BTManager.sh \
     ) | ssh kindle "mkdir -p /usr/local/bin && tar xf - -C /"
     ssh kindle "chmod +x /usr/local/bin/dev_is_keyboard.sh"
     -ssh kindle "udevadm control --reload-rules" 2>/dev/null || true
@@ -42,10 +44,26 @@ deploy:
     ssh kindle "mkdir -p {{remote_dir}}/cache"
     @echo "Clearing WAF cache..."
     -ssh kindle "rm -rf /var/local/mesquite/com.lzampier.btmanager /var/local/mesquite/BTManager" 2>/dev/null
+    @just register-waf
     @echo "Starting API server..."
     @just server
     ssh kindle 'lipc-set-prop com.lab126.appmgrd start app://com.lzampier.btmanager'
     @echo "Deployment complete!"
+
+# Register BTManager WAF app in appreg.db and install scriptlet (idempotent)
+register-waf:
+    @echo "Registering BTManager WAF app..."
+    ssh kindle 'APP_ID="com.lzampier.btmanager"; \
+        APP_DIR="{{remote_dir}}/illusion/BTManager"; \
+        SCRIPTLET="{{remote_dir}}/illusion/BTManager.sh"; \
+        chmod +x "$SCRIPTLET" 2>/dev/null; \
+        sqlite3 /var/local/appreg.db "INSERT OR IGNORE INTO interfaces (interface) VALUES (\"application\"); \
+            INSERT OR IGNORE INTO handlerIds (handlerId) VALUES (\"$APP_ID\"); \
+            INSERT OR IGNORE INTO associations (handlerId, interface, contentId, defaultAssoc) VALUES (\"$APP_ID\", \"application\", \"GL:$APP_ID\", 0); \
+            INSERT OR REPLACE INTO properties (handlerId, name, value) VALUES (\"$APP_ID\", \"lipcId\", \"$APP_ID\"); \
+            INSERT OR REPLACE INTO properties (handlerId, name, value) VALUES (\"$APP_ID\", \"command\", \"/usr/bin/mesquite -l $APP_ID -c file://$APP_DIR/\"); \
+            INSERT OR REPLACE INTO properties (handlerId, name, value) VALUES (\"$APP_ID\", \"supportedOrientation\", \"U\");"; \
+        cp "$SCRIPTLET" /mnt/us/documents/BTManager.sh && chmod +x /mnt/us/documents/BTManager.sh'
 
 # Kill daemon and close WAF app
 kill:
