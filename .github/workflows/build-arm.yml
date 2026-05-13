@@ -55,6 +55,8 @@ jobs:
           load: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          summary: false
+          record: false
 
       - name: Extract binaries
         run: |
