@@ -139,6 +139,16 @@ class HIDDaemon:
 
             skip_delay = False
 
+            # Idle until a new pairing instead of busy-looping the radio.
+            if not config.get_all_devices():
+                logger.info("No devices configured, waiting for pairing...")
+                self._resume_event.clear()
+                await self._resume_event.wait()
+                if not self.running:
+                    break
+                self.load_device()
+                continue
+
             try:
                 # Use handed-off host from controller pairing if available
                 if self._paired_host:
