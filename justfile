@@ -245,6 +245,38 @@ install-ci branch="main":
     fi
     just _install-tarball "$tarball"
 
+# Bump __version__, commit to main, tag, and push (usage: just version-bump 3.3.5)
+version-bump version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version="{{version}}"
+    if ! echo "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo "ERROR: version must be X.Y.Z (got: $version)" >&2
+        exit 1
+    fi
+    cd {{src_dir}}
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "ERROR: working tree not clean" >&2
+        exit 1
+    fi
+    branch=$(git rev-parse --abbrev-ref HEAD)
+    if [ "$branch" != "main" ]; then
+        echo "ERROR: must be on main (got: $branch)" >&2
+        exit 1
+    fi
+    git pull --ff-only origin main
+    sed -i -E "s/^__version__ = \".*\"/__version__ = \"$version\"/" kindle_hid_passthrough/config.py
+    if ! grep -q "^__version__ = \"$version\"$" kindle_hid_passthrough/config.py; then
+        echo "ERROR: failed to update version in config.py" >&2
+        exit 1
+    fi
+    git add kindle_hid_passthrough/config.py
+    git commit -s -m "chore: bump version to $version"
+    git tag "v$version"
+    git push origin main
+    git push origin "v$version"
+    echo "Bumped to $version and pushed tag v$version"
+
 # Uninstall system integration (upstart, udev, WAF app) but leave code in place
 uninstall:
     @echo "Uninstalling system integration..."
