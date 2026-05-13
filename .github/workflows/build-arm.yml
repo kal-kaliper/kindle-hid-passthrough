@@ -75,6 +75,7 @@ jobs:
           cp -r scripts/ output/
           cp -r assets/ output/
           cp -r illusion/ output/
+          cp -r koreader-plugin/ output/
           cp kindle_hid_passthrough/config.ini output/
           # Copy so both assets/ and scripts/ paths resolve dev_is_keyboard.sh
           # (FAT32 on /mnt/us/ doesn't support symlinks)
@@ -105,6 +106,8 @@ jobs:
             assets/99-hid-keyboard.rules \
             scripts/dev_is_keyboard.sh \
             illusion/BTManager.sh \
+            koreader-plugin/hidpassthrough.koplugin/main.lua \
+            koreader-plugin/hidpassthrough.koplugin/_meta.lua \
             config.ini \
             dist/main.bin; do
             if ! tar -tzf kindle-hid-passthrough-armv7.tar.gz "./$f" >/dev/null 2>&1; then
