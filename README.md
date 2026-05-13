@@ -62,6 +62,14 @@ A built-in Kindle app for managing Bluetooth HID devices from the touchscreen �
 
 Installed automatically via KindleForge. For manual installs, use option 6 in `scripts/install.sh`.
 
+### KOReader plugin
+
+If you use KOReader, a bundled plugin gives you the same scan / pair / connect / disconnect / logs / cache controls from inside KOReader — no need to exit. Open via **cog icon (Settings) → Network → HID Passthrough**.
+
+![KOReader plugin menu](koreader-plugin/screenshots/menu.png)
+
+Auto-installed via the interactive installer when `/mnt/us/koreader/plugins/` exists. See [`koreader-plugin/README.md`](koreader-plugin/README.md) for details.
+
 ## Usage
 
 ### Pairing a device
