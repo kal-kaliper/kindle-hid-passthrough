@@ -5,7 +5,7 @@ UHID Handler
 Manages virtual HID devices via Linux UHID interface.
 Allows BLE/Classic HID devices to appear as native Linux input devices.
 
-Author: Lucas Zampieri <lzampier@redhat.com>
+Author: Lucas Zampieri
 """
 
 import logging
@@ -153,6 +153,7 @@ class UHIDDevice:
 
         self._fd: Optional[int] = None
         self._created = False
+        self.input_paths: list = []
 
         self._open_uhid()
         self._create_device()
@@ -207,6 +208,28 @@ class UHIDDevice:
 
         except OSError as e:
             raise UHIDError(f"Failed to create device: {e}")
+
+    def discover_input_paths(self):
+        """Find /dev/input/eventX paths for this UHID device.
+
+        Parses /proc/bus/input/devices for entries matching this device's name.
+        Called externally after an async delay to give the kernel time to
+        register the input device after UHID_CREATE2.
+        """
+        self.input_paths = []
+        try:
+            content = open('/proc/bus/input/devices').read()
+        except OSError:
+            return
+
+        for block in content.split("\n\n"):
+            if self.name not in block:
+                continue
+            for line in block.splitlines():
+                if line.startswith("H: Handlers="):
+                    for tok in line.split("=", 1)[1].split():
+                        if tok.startswith("event"):
+                            self.input_paths.append("/dev/input/" + tok)
 
     def send_input(self, data: bytes):
         """Send HID input report to the kernel.

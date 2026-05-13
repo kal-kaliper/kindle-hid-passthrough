@@ -17,6 +17,8 @@ var BTManager = (function() {
     var confirmAction = null;
     var confirmAddr = null;
     var lastStatus = null;
+    var lastStatusJson = "";
+    var versionSet = false;
     var isScanning = false;
     var isPairing = false;
     var scanPollTimer = null;
@@ -24,6 +26,11 @@ var BTManager = (function() {
     var logPollTimer = null;
     var logsVisible = false;
     var pairLogTimer = null;
+    var btOn = false;
+    var scanResultCount = 0;
+
+    // Currently viewed device in detail overlay
+    var detailDevice = null;
 
     // ---- XHR Helper ----
 
@@ -97,12 +104,6 @@ var BTManager = (function() {
         }, MESSAGE_TIMEOUT);
     }
 
-    function setStatus(id, text, className) {
-        var el = getEl(id);
-        el.innerHTML = text;
-        el.className = "status-value " + (className || "");
-    }
-
     function escapeHtml(str) {
         if (!str) return "";
         return str.replace(/&/g, "&amp;")
@@ -111,160 +112,231 @@ var BTManager = (function() {
                   .replace(/"/g, "&quot;");
     }
 
+    // ---- Toggle ----
+
+    function setToggleUI(on) {
+        btOn = on;
+        var toggle = getEl("btnToggle");
+        if (on) {
+            toggle.className = "toggle on";
+        } else {
+            toggle.className = "toggle";
+        }
+        getEl("mainContent").style.display = on ? "block" : "none";
+        getEl("offState").style.display = on ? "none" : "block";
+    }
+
+    function toggleBluetooth() {
+        if (btOn) {
+            showMessage("Turning off...", false);
+            request("/stop", function(data, err) {
+                if (err) {
+                    showMessage("Error: " + err, true);
+                    return;
+                }
+                if (data && data.ok) {
+                    setToggleUI(false);
+                    showMessage("Bluetooth off", false);
+                } else {
+                    showMessage(data && data.error ? data.error : "Failed", true);
+                }
+                lastStatusJson = "";
+                setTimeout(updateStatus, 1000);
+            });
+        } else {
+            showMessage("Turning on...", false);
+            request("/start", function(data, err) {
+                if (err) {
+                    showMessage("Error: " + err, true);
+                    return;
+                }
+                if (data && data.ok) {
+                    setToggleUI(true);
+                    showMessage("Bluetooth on", false);
+                } else {
+                    showMessage(data && data.error ? data.error : "Failed", true);
+                }
+                lastStatusJson = "";
+                setTimeout(updateStatus, 1500);
+            });
+        }
+    }
+
     // ---- Status Polling ----
 
     function updateStatus() {
         request("/status", function(data, err) {
             if (err) {
-                setStatus("statusDaemon", "unknown", "unknown");
-                setStatus("statusDevices", "--", "unknown");
-                renderDeviceList(null);
+                setToggleUI(false);
+                lastStatusJson = "";
                 return;
             }
 
-            if (data.scanning) {
-                setStatus("statusDaemon", "scanning...", "running");
-            } else if (data.pairing) {
-                setStatus("statusDaemon", "pairing...", "running");
-            } else if (data.daemon_running) {
-                setStatus("statusDaemon", "running", "running");
-            } else {
-                setStatus("statusDaemon", "stopped", "stopped");
-            }
+            var json = JSON.stringify(data);
+            if (json === lastStatusJson) return;
+            lastStatusJson = json;
 
-            var count = data.devices ? data.devices.length : 0;
-            setStatus("statusDevices", count + " configured", "");
+            var running = data.daemon_running || data.scanning || data.pairing;
+            setToggleUI(running);
 
-            renderDeviceList(data.devices, data.connected_device || null);
+            renderDeviceLists(data.devices, data.connected_device || null);
 
-            if (data.version) {
-                getEl("footer").innerHTML = "HID Passthrough v" + escapeHtml(data.version);
+            if (!versionSet && data.version) {
+                getEl("footerVersion").innerHTML = "v" + escapeHtml(data.version);
+                versionSet = true;
             }
 
             lastStatus = data;
         });
     }
 
-    // ---- Device List ----
+    // ---- Device Lists (3-tier) ----
 
-    function renderDeviceList(devices, connectedAddr) {
-        var container = getEl("deviceList");
+    function renderDeviceLists(devices, connectedAddr) {
+        var connected = [];
+        var paired = [];
 
-        if (!devices || devices.length === 0) {
-            container.innerHTML = '<div class="device-empty">No devices configured</div>';
-            return;
+        if (devices) {
+            for (var i = 0; i < devices.length; i++) {
+                var dev = devices[i];
+                var isConn = connectedAddr && dev.address &&
+                    dev.address.toUpperCase() === connectedAddr.toUpperCase();
+                if (isConn) {
+                    connected.push(dev);
+                } else {
+                    paired.push(dev);
+                }
+            }
         }
 
+        // Connected section
+        var connSection = getEl("connectedSection");
+        var connList = getEl("connectedList");
+        if (connected.length > 0) {
+            connSection.style.display = "block";
+            connList.innerHTML = renderDeviceRows(connected, true);
+        } else {
+            connSection.style.display = "none";
+        }
+
+        // Paired section
+        var pairedSection = getEl("pairedSection");
+        var pairedList = getEl("pairedList");
+        if (paired.length > 0) {
+            pairedSection.style.display = "block";
+            pairedList.innerHTML = renderDeviceRows(paired, false);
+        } else {
+            pairedSection.style.display = "none";
+        }
+    }
+
+    function renderDeviceRows(devices, isConnected) {
         var html = "";
         for (var i = 0; i < devices.length; i++) {
             var dev = devices[i];
-            var addr = escapeHtml(dev.address || "unknown");
+            var addr = escapeHtml(dev.address || "");
             var proto = escapeHtml(dev.protocol || "");
-            var name = escapeHtml(dev.name || "");
-            var displayName = name || addr;
-            var isConnected = connectedAddr && dev.address &&
-                dev.address.toUpperCase() === connectedAddr.toUpperCase();
+            var name = escapeHtml(dev.name || "") || addr;
 
-            html += '<div class="device-item' + (isConnected ? ' device-connected' : '') + '">';
-            html += '<button class="device-remove" data-addr="' + escapeHtml(dev.address) + '">Remove</button>';
-            if (isConnected) {
-                html += '<button class="device-disconnect" data-addr="' + escapeHtml(dev.address) + '">Disconnect</button>';
-            } else {
-                html += '<button class="device-connect" data-addr="' + escapeHtml(dev.address) + '" data-proto="' + proto + '">Connect</button>';
-            }
-            html += '<div class="device-info">';
-            html += '<div class="device-name">' + displayName;
-            if (isConnected) {
-                html += ' <span class="device-status-tag">Connected</span>';
-            }
-            html += '</div>';
-            html += '<div>';
-            html += '<span class="device-addr">' + addr + '</span>';
-            if (proto) {
-                html += '<span class="device-proto">[' + proto + ']</span>';
-            }
-            html += '</div>';
-            html += '</div>';
+            html += '<div class="device-row" data-addr="' + addr + '" data-proto="' + proto + '" data-name="' + escapeHtml(dev.name || "") + '" data-connected="' + (isConnected ? '1' : '0') + '">';
+            html += '<span class="device-row-chevron">&#x276F;</span>';
+            html += '<div class="device-row-name' + (isConnected ? '' : ' idle') + '">' + name + '</div>';
+            html += '<div class="device-row-sub">' + proto.toUpperCase() + '</div>';
             html += '</div>';
         }
-
-        container.innerHTML = html;
+        return html;
     }
 
-    // ---- Actions ----
+    // ---- Device Detail Overlay ----
 
-    function startDaemon() {
-        pressBtn("btnStart");
-        showMessage("Starting daemon...", false);
-        request("/start", function(data, err) {
-            releaseBtn("btnStart");
-            if (err) {
-                showMessage("Error: " + err, true);
-                return;
+    function showDeviceDetail(addr, proto, name, isConnected) {
+        detailDevice = { addr: addr, proto: proto, name: name, connected: isConnected };
+        window.scrollTo(0, 0);
+
+        getEl("detailName").innerHTML = escapeHtml(name) || escapeHtml(addr);
+        getEl("detailStatus").innerHTML = isConnected ? "&#x25CF; Connected" : "&#x25CB; Not Connected";
+        getEl("detailProtocol").innerHTML = escapeHtml(proto).toUpperCase();
+        getEl("detailAddress").innerHTML = escapeHtml(addr);
+
+        var actionBtn = getEl("btnDetailAction");
+        if (isConnected) {
+            actionBtn.innerHTML = "Disconnect";
+        } else {
+            actionBtn.innerHTML = "Connect";
+        }
+
+        // HID info
+        var hidSection = getEl("detailHid");
+        hidSection.style.display = "none";
+
+        if (isConnected && lastStatus) {
+            var uhid = lastStatus.uhid_name;
+            var inputs = lastStatus.input_paths;
+            if (uhid || inputs) {
+                getEl("detailUhid").innerHTML = escapeHtml(uhid || "--");
+                getEl("detailInputPaths").innerHTML = inputs && inputs.length ? escapeHtml(inputs.join(", ")) : "--";
+                hidSection.style.display = "block";
             }
-            if (data && data.ok) {
-                showMessage("Daemon started", false);
-            } else {
-                showMessage(data && data.error ? data.error : "Failed to start", true);
-            }
-            setTimeout(updateStatus, 1500);
-        });
+        }
+
+        getEl("deviceOverlay").className = "device-overlay visible";
     }
 
-    function stopDaemon() {
-        pressBtn("btnStop");
-        showMessage("Stopping daemon...", false);
-        request("/stop", function(data, err) {
-            releaseBtn("btnStop");
-            if (err) {
-                showMessage("Error: " + err, true);
-                return;
-            }
-            if (data && data.ok) {
-                showMessage("Daemon stopped", false);
-            } else {
-                showMessage(data && data.error ? data.error : "Failed to stop", true);
-            }
-            setTimeout(updateStatus, 1000);
-        });
+    function hideDeviceDetail() {
+        getEl("deviceOverlay").className = "device-overlay";
+        detailDevice = null;
     }
 
-    function connectDevice(addr, protocol) {
-        showMessage("Connecting to " + addr + "...", false);
-        var url = "/connect?addr=" + encodeURIComponent(addr);
-        if (protocol) url += "&protocol=" + encodeURIComponent(protocol);
-        request(url, function(data, err) {
-            if (err) {
-                showMessage("Error: " + err, true);
-                return;
-            }
-            if (data && data.ok) {
-                showMessage("Connecting...", false);
-            } else {
-                showMessage(data && data.error ? data.error : "Failed to connect", true);
-            }
-            setTimeout(updateStatus, 2000);
-        });
+    function detailAction() {
+        if (!detailDevice) return;
+        if (detailDevice.connected) {
+            showMessage("Disconnecting...", false);
+            request("/disconnect?addr=" + encodeURIComponent(detailDevice.addr), function(data, err) {
+                if (err) {
+                    showMessage("Error: " + err, true);
+                    return;
+                }
+                if (data && data.ok) {
+                    showMessage("Disconnected", false);
+                    hideDeviceDetail();
+                } else {
+                    showMessage(data && data.error ? data.error : "Failed", true);
+                }
+                lastStatusJson = "";
+                setTimeout(updateStatus, 1000);
+            });
+        } else {
+            showMessage("Connecting...", false);
+            var url = "/connect?addr=" + encodeURIComponent(detailDevice.addr);
+            if (detailDevice.proto) url += "&protocol=" + encodeURIComponent(detailDevice.proto);
+            request(url, function(data, err) {
+                if (err) {
+                    showMessage("Error: " + err, true);
+                    return;
+                }
+                if (data && data.ok) {
+                    showMessage("Connecting...", false);
+                    hideDeviceDetail();
+                } else {
+                    showMessage(data && data.error ? data.error : "Failed", true);
+                }
+                lastStatusJson = "";
+                setTimeout(updateStatus, 2000);
+            });
+        }
     }
 
-    function disconnectDevice(addr) {
-        showMessage("Disconnecting " + addr + "...", false);
-        request("/disconnect?addr=" + encodeURIComponent(addr), function(data, err) {
-            if (err) {
-                showMessage("Error: " + err, true);
-                return;
-            }
-            if (data && data.ok) {
-                showMessage("Disconnected", false);
-            } else {
-                showMessage(data && data.error ? data.error : "Failed to disconnect", true);
-            }
-            setTimeout(updateStatus, 1000);
-        });
+    function detailRemove() {
+        if (!detailDevice) return;
+        confirmAddr = detailDevice.addr;
+        showConfirm(
+            "Remove device?<br/><span class=\"dialog-addr\">" + escapeHtml(detailDevice.addr) + "</span>",
+            "remove"
+        );
     }
 
     function removeDevice(addr) {
-        showMessage("Removing " + addr + "...", false);
+        showMessage("Removing...", false);
         request("/remove?addr=" + encodeURIComponent(addr), function(data, err) {
             releaseBtn("dialogConfirmBtn");
             if (err) {
@@ -272,58 +344,30 @@ var BTManager = (function() {
                 return;
             }
             if (data && data.ok) {
-                showMessage("Device removed: " + addr, false);
+                showMessage("Device removed", false);
+                hideDeviceDetail();
             } else {
-                showMessage(data && data.error ? data.error : "Failed to remove", true);
+                showMessage(data && data.error ? data.error : "Failed", true);
             }
+            lastStatusJson = "";
             setTimeout(updateStatus, 500);
         });
     }
 
-    function clearCache() {
-        showMessage("Clearing cache...", false);
-        request("/clear-cache", function(data, err) {
-            releaseBtn("dialogConfirmBtn");
-            if (err) {
-                showMessage("Error: " + err, true);
-                return;
-            }
-            if (data && data.ok) {
-                var msg = "Cache cleared";
-                if (data.files_removed) {
-                    msg += " (" + data.files_removed + " files)";
-                }
-                showMessage(msg, false);
-            } else {
-                showMessage(data && data.error ? data.error : "Failed to clear cache", true);
-            }
-        });
-    }
-
-    // ---- Quit ----
-
-    function quit() {
-        pressBtn("btnBack");
-        if (typeof kindle !== "undefined" && kindle.appmgr && kindle.appmgr.back) {
-            kindle.appmgr.back();
-        }
-    }
-
-    // ---- Scan & Pair ----
+    // ---- Scan ----
 
     function startScan() {
         if (isScanning || isPairing) return;
         isScanning = true;
 
         var btn = getEl("btnScan");
-        pressBtn(btn);
-        btn.innerHTML = "Scanning...";
-        btn.disabled = true;
+        btn.innerHTML = "Stop Scan";
+        btn.className = "btn btn-scan scanning";
 
-        var statusEl = getEl("scanStatus");
-        statusEl.innerHTML = "Scanning for BLE &amp; Classic HID devices...";
-        statusEl.style.display = "block";
-        getEl("scanResults").innerHTML = "";
+        scanResultCount = 0;
+        getEl("availableSection").style.display = "block";
+        getEl("scanIndicator").innerHTML = "Scanning...";
+        getEl("availableList").innerHTML = "";
 
         request("/scan", function(data, err) {
             if (err) {
@@ -331,23 +375,37 @@ var BTManager = (function() {
                 resetScanUI();
                 return;
             }
-            // Start polling for results
             pollScanStatus();
         });
+    }
+
+    function stopScan() {
+        request("/scan-stop", function() {});
+        resetScanUI();
+        if (scanResultCount === 0) {
+            getEl("availableSection").style.display = "none";
+        }
+    }
+
+    function toggleScan() {
+        if (isScanning) {
+            stopScan();
+        } else {
+            startScan();
+        }
     }
 
     function pollScanStatus() {
         scanPollTimer = setTimeout(function() {
             request("/scan-status", function(data, err) {
                 if (err) {
-                    showMessage("Scan poll error: " + err, true);
+                    showMessage("Scan error: " + err, true);
                     resetScanUI();
                     return;
                 }
                 if (data && data.scanning) {
-                    // Still scanning - show results found so far
                     if (data.devices && data.devices.length > 0) {
-                        renderScanResults(data.devices);
+                        renderAvailableDevices(data.devices);
                     }
                     pollScanStatus();
                     return;
@@ -355,8 +413,10 @@ var BTManager = (function() {
                 // Scan complete
                 resetScanUI();
                 if (data && data.ok && data.devices) {
-                    renderScanResults(data.devices);
-                    if (data.devices.length === 0) {
+                    if (data.devices.length > 0) {
+                        renderAvailableDevices(data.devices);
+                    } else {
+                        getEl("availableSection").style.display = "none";
                         showMessage("No HID devices found", false);
                     }
                 } else {
@@ -369,18 +429,18 @@ var BTManager = (function() {
     function resetScanUI() {
         isScanning = false;
         var btn = getEl("btnScan");
-        releaseBtn(btn);
         btn.innerHTML = "Scan for Devices";
-        btn.disabled = false;
-        getEl("scanStatus").style.display = "none";
+        btn.className = "btn btn-scan";
+        getEl("scanIndicator").innerHTML = "";
         if (scanPollTimer) {
             clearTimeout(scanPollTimer);
             scanPollTimer = null;
         }
     }
 
-    function renderScanResults(devices) {
-        var container = getEl("scanResults");
+    function renderAvailableDevices(devices) {
+        var container = getEl("availableList");
+        scanResultCount = devices ? devices.length : 0;
         if (!devices || devices.length === 0) {
             container.innerHTML = '<div class="device-empty">No devices found</div>';
             return;
@@ -392,36 +452,27 @@ var BTManager = (function() {
             var addr = escapeHtml(dev.address || "");
             var name = escapeHtml(dev.name || "Unknown");
             var proto = escapeHtml(dev.protocol || "ble");
-            var rssi = dev.rssi !== undefined ? dev.rssi : "";
 
-            html += '<div class="scan-device-item">';
-            html += '<button class="btn-pair" data-addr="' + addr + '" data-proto="' + proto + '" data-name="' + name + '">';
-            html += 'Pair</button>';
-            html += '<div class="scan-device-info">';
-            html += '<div class="scan-device-name">' + name + '</div>';
-            html += '<div>';
-            html += '<span class="scan-device-meta">' + addr + ' [' + proto + ']</span>';
-            if (rssi !== "") {
-                html += '<span class="scan-device-rssi">RSSI: ' + rssi + '</span>';
-            }
-            html += '</div>';
-            html += '</div>';
+            html += '<div class="available-row">';
+            html += '<button class="btn-pair" data-addr="' + addr + '" data-proto="' + proto + '" data-name="' + name + '">Pair</button>';
+            html += '<div class="available-name">' + name + '</div>';
+            html += '<div class="available-sub">' + proto.toUpperCase() + '</div>';
             html += '</div>';
         }
 
         container.innerHTML = html;
     }
 
+    // ---- Pair (unchanged logic) ----
+
     function startPair(addr, protocol, name) {
         if (isPairing) return;
         if (isScanning) {
-            // Stop scan before pairing
             request("/scan-stop", function() {});
             resetScanUI();
         }
         isPairing = true;
 
-        // Show overlay with live logs (scroll to top so header/X visible)
         window.scrollTo(0, 0);
         getEl("pairMessage").innerHTML = "Pairing...";
         getEl("pairAddr").innerHTML = escapeHtml(addr);
@@ -445,21 +496,20 @@ var BTManager = (function() {
         pairPollTimer = setTimeout(function() {
             request("/pair-status", function(data, err) {
                 if (err) {
-                    showMessage("Pair poll error: " + err, true);
+                    showMessage("Pair error: " + err, true);
                     resetPairUI();
                     return;
                 }
                 if (data && data.pairing) {
-                    // Still pairing, update message and poll again
                     getEl("pairMessage").innerHTML = "Pairing in progress...";
                     pollPairStatus();
                     return;
                 }
-                // Pairing complete
                 resetPairUI();
                 if (data && data.ok) {
                     showMessage("Paired: " + (data.address || ""), false);
-                    getEl("scanResults").innerHTML = "";
+                    getEl("availableList").innerHTML = "";
+                    getEl("availableSection").style.display = "none";
                     updateStatus();
                 } else {
                     showMessage(data && data.error ? data.error : "Pairing failed", true);
@@ -502,7 +552,7 @@ var BTManager = (function() {
         });
     }
 
-    // ---- Log Viewer (fullscreen overlay) ----
+    // ---- Log Viewer (unchanged) ----
 
     function showLogs() {
         logsVisible = true;
@@ -547,24 +597,34 @@ var BTManager = (function() {
         });
     }
 
+    // ---- Cache ----
+
+    function clearCache() {
+        showMessage("Clearing cache...", false);
+        request("/clear-cache", function(data, err) {
+            releaseBtn("dialogConfirmBtn");
+            if (err) {
+                showMessage("Error: " + err, true);
+                return;
+            }
+            if (data && data.ok) {
+                var msg = "Cache cleared";
+                if (data.files_removed) {
+                    msg += " (" + data.files_removed + " files)";
+                }
+                showMessage(msg, false);
+            } else {
+                showMessage(data && data.error ? data.error : "Failed", true);
+            }
+        });
+    }
+
     // ---- Confirm Dialog ----
 
     function showConfirm(message, action) {
         getEl("dialogMessage").innerHTML = message;
         getEl("confirmOverlay").className = "overlay visible";
         confirmAction = action;
-    }
-
-    function confirmRemoveDevice(addr) {
-        confirmAddr = addr;
-        showConfirm(
-            "Remove device?<br/><span class=\"dialog-addr\">" + escapeHtml(addr) + "</span>",
-            "remove"
-        );
-    }
-
-    function confirmClearCache() {
-        showConfirm("Clear all cached HID descriptors?", "cache");
     }
 
     function confirmOk() {
@@ -585,6 +645,15 @@ var BTManager = (function() {
         confirmAddr = null;
     }
 
+    // ---- Quit ----
+
+    function quit() {
+        pressBtn("btnBack");
+        if (typeof kindle !== "undefined" && kindle.appmgr && kindle.appmgr.back) {
+            kindle.appmgr.back();
+        }
+    }
+
     // ---- Event Binding ----
 
     function bindBtn(id, fn) {
@@ -594,15 +663,19 @@ var BTManager = (function() {
 
     function bindEvents() {
         bindBtn("btnBack", quit);
-        bindBtn("btnStart", startDaemon);
-        bindBtn("btnStop", stopDaemon);
-        bindBtn("btnScan", startScan);
+        bindBtn("btnToggle", toggleBluetooth);
+        bindBtn("btnScan", toggleScan);
+        bindBtn("footerDebug", showLogs);
+        bindBtn("btnDetailClose", hideDeviceDetail);
+        bindBtn("btnDetailAction", detailAction);
+        bindBtn("btnDetailRemove", detailRemove);
         bindBtn("btnPairClose", cancelPair);
-        bindBtn("btnLogs", showLogs);
         bindBtn("btnLogClose", hideLogs);
         bindBtn("btnLogUp", scrollLogsUp);
         bindBtn("btnLogDown", scrollLogsDown);
-        bindBtn("btnClearCache", confirmClearCache);
+        bindBtn("btnClearCache", function() {
+            showConfirm("Clear all cached HID descriptors?", "cache");
+        });
 
         // Clear placeholder on first tap for keyboard test area
         var testInput = getEl("keyboardTest");
@@ -619,26 +692,33 @@ var BTManager = (function() {
         bindBtn("dialogCancelBtn", confirmCancel);
         bindBtn("dialogConfirmBtn", confirmOk);
 
-        // Event delegation for dynamically created buttons
+        // Event delegation for dynamically created elements
         document.addEventListener("click", function(e) {
             var target = e.target;
             if (!target) return;
-            var addr, proto;
-            if (target.className && target.className.indexOf("device-disconnect") !== -1) {
-                addr = target.getAttribute("data-addr");
-                if (addr) disconnectDevice(addr);
-            } else if (target.className && target.className.indexOf("device-connect") !== -1) {
-                addr = target.getAttribute("data-addr");
-                proto = target.getAttribute("data-proto");
-                if (addr) connectDevice(addr, proto || "ble");
-            } else if (target.className && target.className.indexOf("device-remove") !== -1) {
-                addr = target.getAttribute("data-addr");
-                if (addr) confirmRemoveDevice(addr);
-            } else if (target.className && target.className.indexOf("btn-pair") !== -1) {
+            var addr, proto, name;
+
+            // Pair button in available list (check BEFORE device row walk-up)
+            if (target.className && target.className.indexOf("btn-pair") !== -1) {
                 addr = target.getAttribute("data-addr");
                 proto = target.getAttribute("data-proto");
-                var name = target.getAttribute("data-name");
+                name = target.getAttribute("data-name");
                 if (addr) startPair(addr, proto || "ble", name || "");
+                return;
+            }
+
+            // Device row tap -> detail overlay
+            var row = target;
+            while (row && row !== document) {
+                if (row.className && row.className.indexOf("device-row") !== -1 && row.getAttribute("data-addr")) {
+                    addr = row.getAttribute("data-addr");
+                    proto = row.getAttribute("data-proto");
+                    name = row.getAttribute("data-name");
+                    var isConn = row.getAttribute("data-connected") === "1";
+                    showDeviceDetail(addr, proto, name, isConn);
+                    return;
+                }
+                row = row.parentNode;
             }
         }, false);
 
@@ -688,22 +768,17 @@ var BTManager = (function() {
         updateStatus();
         pollTimer = setInterval(updateStatus, POLL_INTERVAL);
 
-        // Block all page scrolling globally — Kindle WebKit 533 doesn't
-        // support position:fixed, so we prevent body scroll entirely.
-        // The log viewer scrolls internally via its own scroll buttons.
         document.addEventListener("touchmove", function(e) {
             e.preventDefault();
         }, false);
     }
 
-    // Start when DOM is ready
     if (document.readyState === "complete" || document.readyState === "interactive") {
         init();
     } else {
         document.addEventListener("DOMContentLoaded", init, false);
     }
 
-    // Public API (for debugging)
     return {
         refresh: updateStatus
     };

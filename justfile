@@ -40,9 +40,10 @@ deploy:
     ssh kindle "rm -rf {{remote_dir}}/__pycache__"
     @echo "Creating cache directory..."
     ssh kindle "mkdir -p {{remote_dir}}/cache"
+    @echo "Clearing WAF cache..."
+    -ssh kindle "rm -rf /var/local/mesquite/com.lzampier.btmanager /var/local/mesquite/BTManager" 2>/dev/null
     @echo "Starting API server..."
     @just server
-    @sleep 8
     ssh kindle 'lipc-set-prop com.lab126.appmgrd start app://com.lzampier.btmanager'
     @echo "Deployment complete!"
 
@@ -170,7 +171,6 @@ _install-tarball tarball:
     ssh kindle "/usr/sbin/mntroot ro"
     @echo "Starting daemon..."
     ssh kindle "/sbin/initctl start hid-passthrough"
-    @sleep 8
     ssh kindle 'lipc-set-prop com.lab126.appmgrd start app://com.lzampier.btmanager'
     @echo "Install complete!"
 

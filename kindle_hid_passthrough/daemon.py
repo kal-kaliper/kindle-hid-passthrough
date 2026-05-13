@@ -7,7 +7,7 @@ Maintains connection with auto-reconnect.
 
 For use with init scripts / systemd.
 
-Author: Lucas Zampieri <lzampier@redhat.com>
+Author: Lucas Zampieri
 """
 
 import asyncio
@@ -43,12 +43,19 @@ class HIDDaemon:
     def connection_state(self) -> dict:
         """Current connection state for API."""
         if self.host and self.host._is_connection_alive() and not self._suspended:
-            return {
+            state = {
                 "connected": True,
                 "address": normalize_addr(self.host.current_device_address) if self.host.current_device_address else None,
                 "protocol": self.host.connected_protocol.value if self.host.connected_protocol else None,
                 "name": self.host.device_name,
             }
+            if self.host.uhid_device:
+                state["uhid_name"] = self.host.uhid_device.name
+                if self.host.uhid_device.input_paths:
+                    state["input_paths"] = self.host.uhid_device.input_paths
+            if self.host.report_map:
+                state["descriptor_size"] = len(self.host.report_map)
+            return state
         return {"connected": False}
 
     async def suspend(self):
