@@ -14,21 +14,21 @@ installAll()
 installUdevRules()
 {
   echo " -> Installing udev rules"
-  mntroot rw
+  /usr/sbin/mntroot rw
   mkdir -p /usr/local/bin
   cp scripts/dev_is_keyboard.sh /usr/local/bin/
   cp assets/99-hid-keyboard.rules /etc/udev/rules.d
-  udevadm control --reload-rules
-  mntroot ro
+  /usr/sbin/udevadm control --reload-rules
+  /usr/sbin/mntroot ro
   echo " -> Ready."
 }
 
 installUpstart()
 {
   echo " -> Installing upstart service"
-  mntroot rw
+  /usr/sbin/mntroot rw
   cp assets/hid-passthrough.upstart /etc/upstart/hid-passthrough.conf
-  mntroot ro
+  /usr/sbin/mntroot ro
   echo " -> Ready."
 }
 
@@ -77,11 +77,12 @@ uninstallAll()
   APPREG_DB="/var/local/appreg.db"
 
   echo " -> Stopping daemon"
-  stop hid-passthrough 2>/dev/null
+  /sbin/stop hid-passthrough 2>/dev/null
   pkill -f "kindle-hid-passthrough" 2>/dev/null
+  pkill -f "main.py --daemon" 2>/dev/null
   pkill -f "ld-linux-armhf." 2>/dev/null
 
-  mntroot rw
+  /usr/sbin/mntroot rw
 
   echo " -> Removing upstart config"
   rm -f /etc/upstart/hid-passthrough.conf
@@ -89,7 +90,7 @@ uninstallAll()
   echo " -> Removing udev rules"
   rm -f /etc/udev/rules.d/99-hid-keyboard.rules
   rm -f /usr/local/bin/dev_is_keyboard.sh
-  udevadm control --reload-rules 2>/dev/null
+  /usr/sbin/udevadm control --reload-rules 2>/dev/null
 
   echo " -> Unregistering WAF app"
   if [ -f "$APPREG_DB" ]; then
@@ -101,7 +102,7 @@ EOF
   fi
   rm -f "$SCRIPTLET_DEST"
 
-  mntroot ro
+  /usr/sbin/mntroot ro
 
   echo " -> Removing install directory $INSTALL_DIR"
   cd /tmp
