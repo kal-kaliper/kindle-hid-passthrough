@@ -180,14 +180,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         result = config.remove_device(address)
         if result["removed"]:
-            # Always nudge the daemon's connection loop so it re-reads
-            # devices.conf. request_disconnect now both drops an active
-            # connection (if any) and cancels the host task, which handles:
-            #   - device currently connected: drops it
-            #   - device in attempt-reconnect loop: cancels the loop
-            #   - daemon idle: no-op (host_task is None)
             self._controller.request_disconnect()
-            # Clear descriptor cache for this device
             DeviceCache(config.cache_dir).clear(normalize_addr(address))
             self._send_json({
                 "ok": True,

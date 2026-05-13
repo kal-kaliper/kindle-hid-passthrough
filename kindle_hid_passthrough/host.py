@@ -141,11 +141,8 @@ class HIDHost:
         self.hid_host = None  # For Classic
         self.connected_protocol = None
 
-        # Tasks spawned by event listeners (e.g. on_classic_connection).
-        # These aren't owned by daemon._host_task, so cleanup() must cancel
-        # them explicitly — otherwise they keep running on a torn-down host
-        # and crash on stale attribute access (e.g. self.hid_host is None
-        # while the loop at host.py l2cap_intr_channel still dereferences it).
+        # Connection-handler tasks; cleanup() cancels them so they don't
+        # run past teardown and dereference torn-down state.
         self._connection_tasks: set = set()
 
         # Device state
@@ -1489,10 +1486,7 @@ class HIDHost:
 
     async def cleanup(self):
         """Clean up resources."""
-        # Cancel any in-flight connection handler tasks first, so they don't
-        # race with the teardown below. Without this, an on_classic_connection
-        # task can still be awaiting auth / HID channels while we null out
-        # self.hid_host, then crash on the next attribute access.
+        # Cancel connection handlers before nulling shared state below.
         if self._connection_tasks:
             pending = list(self._connection_tasks)
             for task in pending:

@@ -91,8 +91,6 @@ function HIDPassthrough:_httpGet(path)
     return table.concat(body_chunks)
 end
 
--- Same as _httpGet, but parses the body as JSON via rapidjson. Returns
--- (table, nil) on success or (nil, err) on transport / parse failure.
 function HIDPassthrough:_httpGetJson(path)
     local body, err = self:_httpGet(path)
     if not body then return nil, err end
@@ -643,19 +641,10 @@ function HIDPassthrough:showInfo()
     })
 end
 
-------------------------------------------------------------------------------
--- Device operations (scan / pair / connect / disconnect / remove / logs)
-------------------------------------------------------------------------------
--- Mirrors the BTManager WAF app (illusion/BTManager/script.js): same HTTP
--- endpoints, same polling cadences (2s), same flow.
-
 HIDPassthrough.SCAN_POLL_INTERVAL = 2
 HIDPassthrough.PAIR_POLL_INTERVAL = 2
-HIDPassthrough.SCAN_TIMEOUT_TICKS = 30 -- 60s
+HIDPassthrough.SCAN_TIMEOUT_TICKS = 30
 
--- Tiny URL-encoder. We can't rely on a particular signature of urlEncode
--- across KOReader versions, and our inputs (BT addresses, short device names,
--- "ble"/"classic") are simple enough that this two-liner is plenty.
 local function urlEncode(s)
     if s == nil then return "" end
     return (tostring(s):gsub("[^%w%-_.~]", function(c)
@@ -663,8 +652,6 @@ local function urlEncode(s)
     end))
 end
 
--- Cancel any in-flight scan or pair polling. Called when the user backs out
--- of a flow, when the plugin shuts down, or when starting a new flow.
 function HIDPassthrough:_cancelPolls()
     if self._scan_poll_cb then
         UIManager:unschedule(self._scan_poll_cb)
@@ -683,7 +670,6 @@ local function infoToast(text, is_error)
     })
 end
 
--- Build a human label for a device row.
 local function deviceLabel(dev)
     local name = dev.name
     if name == nil or name == "" then name = dev.address or "?" end
@@ -694,18 +680,10 @@ local function deviceLabel(dev)
     return name
 end
 
--- Replace a Menu's items in-place. Used to live-update scan results as more
--- devices come in while polling.
 local function setMenuItems(menu, items, title)
     menu:switchItemTable(title, items, 1)
 end
 
-------------------------------------------------------------------------------
--- Scan flow
-------------------------------------------------------------------------------
-
--- Open the scan results menu (empty initially), kick off /scan, and start
--- polling /scan-status every 2s. Tapping a result starts the pair flow.
 function HIDPassthrough:scanForDevices()
     if not self:isRunning() then
         infoToast(_("Daemon is not running. Start it first."), true)
@@ -723,14 +701,12 @@ function HIDPassthrough:scanForDevices()
         onClose = function()
             self:_cancelPolls()
             UIManager:close(menu)
-            -- Best-effort stop on backing out, matching what the WAF does.
             self:_httpGet("/scan-stop")
         end,
     }
     self._scan_menu = menu
     UIManager:show(menu)
 
-    -- Kick off the scan, then start polling.
     local body, err = self:_httpGet("/scan")
     if not body then
         UIManager:close(menu)
@@ -759,20 +735,17 @@ function HIDPassthrough:_doPollScan(tick)
 
     local devices = data.devices or {}
     if data.scanning then
-        -- Live-update the menu so users see results stream in.
         if #devices > 0 then
             setMenuItems(self._scan_menu, self:_buildScanItems(devices),
                 T(_("Scanning… (%1)"), tostring(#devices)))
         end
         if tick >= self.SCAN_TIMEOUT_TICKS then
             self:_httpGet("/scan-stop")
-            -- Fall through next tick will end the scan.
         end
         self:_pollScan(tick + 1)
         return
     end
 
-    -- Scan complete.
     if data.ok and #devices > 0 then
         setMenuItems(self._scan_menu, self:_buildScanItems(devices),
             T(_("Scan Results (%1)"), tostring(#devices)))
@@ -809,16 +782,12 @@ function HIDPassthrough:_buildScanItems(devices)
     return items
 end
 
-------------------------------------------------------------------------------
--- Pair flow
-------------------------------------------------------------------------------
-
 function HIDPassthrough:pairDevice(addr, protocol, name)
     self:_cancelPolls()
 
     local msg = InfoMessage:new{
         text = T(_("Pairing %1…"), addr),
-        dismissable = true, -- allow back-out
+        dismissable = true,
     }
     self._pair_msg = msg
     UIManager:show(msg)
@@ -854,7 +823,6 @@ function HIDPassthrough:_doPollPair(tick)
     end
 
     if data.pairing then
-        -- Keep polling. Safety net: 60s cap.
         if tick > 30 then
             if self._pair_msg then UIManager:close(self._pair_msg); self._pair_msg = nil end
             infoToast(_("Pairing timed out"), true)
@@ -867,17 +835,11 @@ function HIDPassthrough:_doPollPair(tick)
     if self._pair_msg then UIManager:close(self._pair_msg); self._pair_msg = nil end
     if data.ok then
         infoToast(T(_("Paired: %1"), data.address or ""))
-        -- Drop the user into the paired devices list so they can see the
-        -- new entry and immediately connect/test it.
         self:_afterDeviceAction()
     else
         infoToast(T(_("Pairing failed: %1"), data.error or _("unknown")), true)
     end
 end
-
-------------------------------------------------------------------------------
--- Paired device list (connect / disconnect / remove)
-------------------------------------------------------------------------------
 
 function HIDPassthrough:showPairedDevices()
     local data, err = self:_httpGetJson("/status")
@@ -980,9 +942,6 @@ function HIDPassthrough:_showDeviceActions(addr, proto, name, is_connected)
     UIManager:show(menu)
 end
 
--- After a connect/disconnect/remove action we re-open the paired devices
--- menu so the user lands back where they started, with the list refreshed
--- to reflect the new state (instead of being dumped at the KOReader home).
 function HIDPassthrough:_afterDeviceAction()
     UIManager:scheduleIn(0.4, function() self:showPairedDevices() end)
 end
@@ -1039,10 +998,6 @@ function HIDPassthrough:_removeDevice(addr)
         self:_afterDeviceAction()
     end)
 end
-
-------------------------------------------------------------------------------
--- Logs and cache
-------------------------------------------------------------------------------
 
 HIDPassthrough.LOG_LINES = 100
 
