@@ -20,7 +20,7 @@ from kindle_detect import detect_kindle
 if TYPE_CHECKING:
     pass
 
-__version__ = "3.3.4"
+__version__ = "3.4.0"
 
 
 def _get_git_sha() -> Optional[str]:
