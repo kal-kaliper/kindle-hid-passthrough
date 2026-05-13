@@ -11,6 +11,7 @@ Port 8321 on localhost.
 import json
 import os
 import socket
+import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
@@ -23,17 +24,35 @@ __all__ = ['APIServer', 'RequestHandler', 'PORT']
 PORT = 8321
 
 
+_devices_cache = None
+_devices_mtime = 0
+_devices_lock = threading.Lock()
+
+
 def _build_devices_json():
-    """Parse devices.conf into a list of dicts."""
-    devices = config.get_all_devices()
-    return [
-        {
-            "address": addr,
-            "protocol": proto.value,
-            **({"name": name} if name else {}),
-        }
-        for addr, proto, name in devices
-    ]
+    """Parse devices.conf into a list of dicts, cached by file mtime."""
+    global _devices_cache, _devices_mtime
+
+    try:
+        mtime = os.path.getmtime(config.devices_config_file)
+    except OSError:
+        mtime = 0
+
+    with _devices_lock:
+        if _devices_cache is not None and mtime == _devices_mtime:
+            return _devices_cache
+
+        devices = config.get_all_devices()
+        _devices_cache = [
+            {
+                "address": addr,
+                "protocol": proto.value,
+                **({"name": name} if name else {}),
+            }
+            for addr, proto, name in devices
+        ]
+        _devices_mtime = mtime
+        return _devices_cache
 
 
 class APIServer(ThreadingMixIn, HTTPServer):
@@ -129,6 +148,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         }
         if status.get("connected_device"):
             resp["connected_device"] = status["connected_device"]
+            if status.get("uhid_name"):
+                resp["uhid_name"] = status["uhid_name"]
+            if status.get("input_paths"):
+                resp["input_paths"] = status["input_paths"]
+            if status.get("descriptor_size"):
+                resp["descriptor_size"] = status["descriptor_size"]
         self._send_json(resp)
 
     def _handle_start(self):
@@ -292,3 +317,4 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "lines": short})
         except OSError as e:
             self._send_json({"ok": False, "error": str(e)})
+
