@@ -14,14 +14,19 @@ starting is done by spawning the binary directly with `--daemon`.
 @module koplugin.hidpassthrough
 --]]
 
+local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
 local Event = require("ui/event")
 local InfoMessage = require("ui/widget/infomessage")
 local InputText = require("ui/widget/inputtext")
+local Menu = require("ui/widget/menu")
+local Screen = require("device").screen
+local TextViewer = require("ui/widget/textviewer")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
+local rapidjson = require("rapidjson")
 local util = require("util")
 local ffiutil = require("ffi/util")
 local _ = require("gettext")
@@ -84,6 +89,16 @@ function HIDPassthrough:_httpGet(path)
         return nil, "HTTP " .. tostring(code)
     end
     return table.concat(body_chunks)
+end
+
+-- Same as _httpGet, but parses the body as JSON via rapidjson. Returns
+-- (table, nil) on success or (nil, err) on transport / parse failure.
+function HIDPassthrough:_httpGetJson(path)
+    local body, err = self:_httpGet(path)
+    if not body then return nil, err end
+    local data, perr = rapidjson.decode(body)
+    if not data then return nil, "json decode: " .. tostring(perr) end
+    return data, nil
 end
 
 ------------------------------------------------------------------------------
@@ -629,6 +644,471 @@ function HIDPassthrough:showInfo()
 end
 
 ------------------------------------------------------------------------------
+-- Device operations (scan / pair / connect / disconnect / remove / logs)
+------------------------------------------------------------------------------
+-- Mirrors the BTManager WAF app (illusion/BTManager/script.js): same HTTP
+-- endpoints, same polling cadences (2s), same flow.
+
+HIDPassthrough.SCAN_POLL_INTERVAL = 2
+HIDPassthrough.PAIR_POLL_INTERVAL = 2
+HIDPassthrough.SCAN_TIMEOUT_TICKS = 30 -- 60s
+
+-- Tiny URL-encoder. We can't rely on a particular signature of urlEncode
+-- across KOReader versions, and our inputs (BT addresses, short device names,
+-- "ble"/"classic") are simple enough that this two-liner is plenty.
+local function urlEncode(s)
+    if s == nil then return "" end
+    return (tostring(s):gsub("[^%w%-_.~]", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end))
+end
+
+-- Cancel any in-flight scan or pair polling. Called when the user backs out
+-- of a flow, when the plugin shuts down, or when starting a new flow.
+function HIDPassthrough:_cancelPolls()
+    if self._scan_poll_cb then
+        UIManager:unschedule(self._scan_poll_cb)
+        self._scan_poll_cb = nil
+    end
+    if self._pair_poll_cb then
+        UIManager:unschedule(self._pair_poll_cb)
+        self._pair_poll_cb = nil
+    end
+end
+
+local function infoToast(text, is_error)
+    UIManager:show(InfoMessage:new{
+        text = text,
+        timeout = is_error and 4 or 2,
+    })
+end
+
+-- Build a human label for a device row.
+local function deviceLabel(dev)
+    local name = dev.name
+    if name == nil or name == "" then name = dev.address or "?" end
+    local proto = dev.protocol
+    if proto and proto ~= "" then
+        return name .. "  (" .. proto:upper() .. ")"
+    end
+    return name
+end
+
+-- Replace a Menu's items in-place. Used to live-update scan results as more
+-- devices come in while polling.
+local function setMenuItems(menu, items, title)
+    menu:switchItemTable(title, items, 1)
+end
+
+------------------------------------------------------------------------------
+-- Scan flow
+------------------------------------------------------------------------------
+
+-- Open the scan results menu (empty initially), kick off /scan, and start
+-- polling /scan-status every 2s. Tapping a result starts the pair flow.
+function HIDPassthrough:scanForDevices()
+    if not self:isRunning() then
+        infoToast(_("Daemon is not running. Start it first."), true)
+        return
+    end
+    self:_cancelPolls()
+
+    local menu
+    menu = Menu:new{
+        title = _("Scanning…"),
+        item_table = {{ text = _("Scanning… (no devices yet)"), dim = true }},
+        width = Screen:getWidth(),
+        height = Screen:getHeight(),
+        is_popout = false,
+        onClose = function()
+            self:_cancelPolls()
+            UIManager:close(menu)
+            -- Best-effort stop on backing out, matching what the WAF does.
+            self:_httpGet("/scan-stop")
+        end,
+    }
+    self._scan_menu = menu
+    UIManager:show(menu)
+
+    -- Kick off the scan, then start polling.
+    local body, err = self:_httpGet("/scan")
+    if not body then
+        UIManager:close(menu)
+        infoToast(T(_("Scan failed: %1"), tostring(err)), true)
+        return
+    end
+    self:_pollScan(0)
+end
+
+function HIDPassthrough:_pollScan(tick)
+    self._scan_poll_cb = function() self:_doPollScan(tick) end
+    UIManager:scheduleIn(self.SCAN_POLL_INTERVAL, self._scan_poll_cb)
+end
+
+function HIDPassthrough:_doPollScan(tick)
+    self._scan_poll_cb = nil
+    if not self._scan_menu then return end
+
+    local data, err = self:_httpGetJson("/scan-status")
+    if not data then
+        UIManager:close(self._scan_menu)
+        self._scan_menu = nil
+        infoToast(T(_("Scan error: %1"), tostring(err)), true)
+        return
+    end
+
+    local devices = data.devices or {}
+    if data.scanning then
+        -- Live-update the menu so users see results stream in.
+        if #devices > 0 then
+            setMenuItems(self._scan_menu, self:_buildScanItems(devices),
+                T(_("Scanning… (%1)"), tostring(#devices)))
+        end
+        if tick >= self.SCAN_TIMEOUT_TICKS then
+            self:_httpGet("/scan-stop")
+            -- Fall through next tick will end the scan.
+        end
+        self:_pollScan(tick + 1)
+        return
+    end
+
+    -- Scan complete.
+    if data.ok and #devices > 0 then
+        setMenuItems(self._scan_menu, self:_buildScanItems(devices),
+            T(_("Scan Results (%1)"), tostring(#devices)))
+    else
+        UIManager:close(self._scan_menu)
+        self._scan_menu = nil
+        if data.error then
+            infoToast(T(_("Scan failed: %1"), data.error), true)
+        else
+            infoToast(_("No HID devices found"))
+        end
+    end
+end
+
+function HIDPassthrough:_buildScanItems(devices)
+    local items = {}
+    for _, dev in ipairs(devices) do
+        local addr = dev.address
+        local proto = dev.protocol or "ble"
+        local name = dev.name or ""
+        table.insert(items, {
+            text = deviceLabel(dev),
+            callback = function()
+                if self._scan_menu then
+                    UIManager:close(self._scan_menu)
+                    self._scan_menu = nil
+                end
+                self:_cancelPolls()
+                self:_httpGet("/scan-stop")
+                self:pairDevice(addr, proto, name)
+            end,
+        })
+    end
+    return items
+end
+
+------------------------------------------------------------------------------
+-- Pair flow
+------------------------------------------------------------------------------
+
+function HIDPassthrough:pairDevice(addr, protocol, name)
+    self:_cancelPolls()
+
+    local msg = InfoMessage:new{
+        text = T(_("Pairing %1…"), addr),
+        dismissable = true, -- allow back-out
+    }
+    self._pair_msg = msg
+    UIManager:show(msg)
+
+    local url = "/pair?addr=" .. urlEncode(addr)
+        .. "&protocol=" .. urlEncode(protocol or "ble")
+    if name and name ~= "" then
+        url = url .. "&name=" .. urlEncode(name)
+    end
+
+    local body, err = self:_httpGet(url)
+    if not body then
+        UIManager:close(msg)
+        self._pair_msg = nil
+        infoToast(T(_("Pair error: %1"), tostring(err)), true)
+        return
+    end
+    self:_pollPair(0)
+end
+
+function HIDPassthrough:_pollPair(tick)
+    self._pair_poll_cb = function() self:_doPollPair(tick) end
+    UIManager:scheduleIn(self.PAIR_POLL_INTERVAL, self._pair_poll_cb)
+end
+
+function HIDPassthrough:_doPollPair(tick)
+    self._pair_poll_cb = nil
+    local data, err = self:_httpGetJson("/pair-status")
+    if not data then
+        if self._pair_msg then UIManager:close(self._pair_msg); self._pair_msg = nil end
+        infoToast(T(_("Pair error: %1"), tostring(err)), true)
+        return
+    end
+
+    if data.pairing then
+        -- Keep polling. Safety net: 60s cap.
+        if tick > 30 then
+            if self._pair_msg then UIManager:close(self._pair_msg); self._pair_msg = nil end
+            infoToast(_("Pairing timed out"), true)
+            return
+        end
+        self:_pollPair(tick + 1)
+        return
+    end
+
+    if self._pair_msg then UIManager:close(self._pair_msg); self._pair_msg = nil end
+    if data.ok then
+        infoToast(T(_("Paired: %1"), data.address or ""))
+        -- Drop the user into the paired devices list so they can see the
+        -- new entry and immediately connect/test it.
+        self:_afterDeviceAction()
+    else
+        infoToast(T(_("Pairing failed: %1"), data.error or _("unknown")), true)
+    end
+end
+
+------------------------------------------------------------------------------
+-- Paired device list (connect / disconnect / remove)
+------------------------------------------------------------------------------
+
+function HIDPassthrough:showPairedDevices()
+    local data, err = self:_httpGetJson("/status")
+    if not data then
+        infoToast(T(_("Cannot reach daemon: %1"), tostring(err)), true)
+        return
+    end
+    local devices = data.devices or {}
+    if #devices == 0 then
+        infoToast(_("No paired devices. Use Scan to add one."))
+        return
+    end
+
+    local connected_addr = data.connected_device
+    local items = {}
+    for _, dev in ipairs(devices) do
+        local is_conn = connected_addr
+            and dev.address
+            and dev.address:upper() == tostring(connected_addr):upper()
+        local prefix = is_conn and "● " or "○ "
+        local addr  = dev.address
+        local proto = dev.protocol or "ble"
+        local name  = dev.name or ""
+        table.insert(items, {
+            text = prefix .. deviceLabel(dev),
+            callback = function()
+                if self._paired_menu then
+                    UIManager:close(self._paired_menu)
+                    self._paired_menu = nil
+                end
+                self:_showDeviceActions(addr, proto, name, is_conn)
+            end,
+        })
+    end
+
+    local menu
+    menu = Menu:new{
+        title = _("Paired Devices"),
+        item_table = items,
+        width = Screen:getWidth(),
+        height = Screen:getHeight(),
+        is_popout = false,
+        onClose = function()
+            UIManager:close(menu)
+            self._paired_menu = nil
+        end,
+    }
+    self._paired_menu = menu
+    UIManager:show(menu)
+end
+
+function HIDPassthrough:_showDeviceActions(addr, proto, name, is_connected)
+    local label = (name and name ~= "" and name) or addr
+    local items = {}
+    if is_connected then
+        table.insert(items, {
+            text = _("Disconnect"),
+            callback = function()
+                UIManager:close(self._action_menu)
+                self._action_menu = nil
+                self:_disconnectDevice(addr)
+            end,
+        })
+    else
+        table.insert(items, {
+            text = _("Connect"),
+            callback = function()
+                UIManager:close(self._action_menu)
+                self._action_menu = nil
+                self:_connectDevice(addr, proto)
+            end,
+        })
+    end
+    table.insert(items, {
+        text = _("Remove (forget)"),
+        callback = function()
+            UIManager:close(self._action_menu)
+            self._action_menu = nil
+            UIManager:show(ConfirmBox:new{
+                text = T(_("Remove device %1?"), addr),
+                ok_text = _("Remove"),
+                ok_callback = function() self:_removeDevice(addr) end,
+            })
+        end,
+    })
+
+    local menu
+    menu = Menu:new{
+        title = label,
+        item_table = items,
+        width = Screen:getWidth(),
+        height = Screen:getHeight(),
+        is_popout = false,
+        onClose = function()
+            UIManager:close(menu)
+            self._action_menu = nil
+        end,
+    }
+    self._action_menu = menu
+    UIManager:show(menu)
+end
+
+-- After a connect/disconnect/remove action we re-open the paired devices
+-- menu so the user lands back where they started, with the list refreshed
+-- to reflect the new state (instead of being dumped at the KOReader home).
+function HIDPassthrough:_afterDeviceAction()
+    UIManager:scheduleIn(0.4, function() self:showPairedDevices() end)
+end
+
+function HIDPassthrough:_connectDevice(addr, proto)
+    infoToast(T(_("Connecting %1…"), addr))
+    UIManager:nextTick(function()
+        local url = "/connect?addr=" .. urlEncode(addr)
+            .. "&protocol=" .. urlEncode(proto or "ble")
+        local data, err = self:_httpGetJson(url)
+        if not data then
+            infoToast(T(_("Connect error: %1"), tostring(err)), true)
+            return
+        end
+        if data.ok then
+            infoToast(_("Connect requested"))
+        else
+            infoToast(T(_("Connect failed: %1"), data.error or _("unknown")), true)
+        end
+        self:_afterDeviceAction()
+    end)
+end
+
+function HIDPassthrough:_disconnectDevice(addr)
+    infoToast(T(_("Disconnecting %1…"), addr))
+    UIManager:nextTick(function()
+        local data, err = self:_httpGetJson("/disconnect?addr=" .. urlEncode(addr))
+        if not data then
+            infoToast(T(_("Disconnect error: %1"), tostring(err)), true)
+            return
+        end
+        if data.ok then
+            infoToast(_("Disconnected"))
+        else
+            infoToast(T(_("Disconnect failed: %1"), data.error or _("unknown")), true)
+        end
+        self:_afterDeviceAction()
+    end)
+end
+
+function HIDPassthrough:_removeDevice(addr)
+    infoToast(T(_("Removing %1…"), addr))
+    UIManager:nextTick(function()
+        local data, err = self:_httpGetJson("/remove?addr=" .. urlEncode(addr))
+        if not data then
+            infoToast(T(_("Remove error: %1"), tostring(err)), true)
+            return
+        end
+        if data.ok then
+            infoToast(_("Device removed"))
+        else
+            infoToast(T(_("Remove failed: %1"), data.error or _("unknown")), true)
+        end
+        self:_afterDeviceAction()
+    end)
+end
+
+------------------------------------------------------------------------------
+-- Logs and cache
+------------------------------------------------------------------------------
+
+HIDPassthrough.LOG_LINES = 100
+
+function HIDPassthrough:showLogs()
+    local data, err = self:_httpGetJson("/logs?lines=" .. tostring(self.LOG_LINES))
+    local text
+    if not data then
+        text = T(_("Could not fetch logs: %1"), tostring(err))
+    elseif data.lines and #data.lines > 0 then
+        text = table.concat(data.lines, "\n")
+    else
+        text = _("(no log lines)")
+    end
+
+    local viewer
+    viewer = TextViewer:new{
+        title = _("HID Passthrough Logs"),
+        text = text,
+        justified = false,
+        buttons_table = {
+            {
+                {
+                    text = _("Refresh"),
+                    callback = function()
+                        UIManager:close(viewer)
+                        self:showLogs()
+                    end,
+                },
+                {
+                    text = _("Close"),
+                    callback = function() UIManager:close(viewer) end,
+                },
+            },
+        },
+    }
+    UIManager:show(viewer)
+end
+
+function HIDPassthrough:clearCache()
+    UIManager:show(ConfirmBox:new{
+        text = _("Clear all cached HID descriptors?"),
+        ok_text = _("Clear"),
+        ok_callback = function()
+            UIManager:nextTick(function()
+                local data, err = self:_httpGetJson("/clear-cache")
+                if not data then
+                    infoToast(T(_("Clear cache error: %1"), tostring(err)), true)
+                    return
+                end
+                if data.ok then
+                    local n = data.files_removed
+                    if n then
+                        infoToast(T(_("Cache cleared (%1 files)"), tostring(n)))
+                    else
+                        infoToast(_("Cache cleared"))
+                    end
+                else
+                    infoToast(T(_("Clear cache failed: %1"),
+                        data.error or _("unknown")), true)
+                end
+            end)
+        end,
+    })
+end
+
+------------------------------------------------------------------------------
 -- Menu integration
 ------------------------------------------------------------------------------
 
@@ -716,6 +1196,7 @@ function HIDPassthrough:onCloseWidget()
         logger.info("HIDPassthrough: KOReader closing, stopping keyboard watcher")
         self:_stopKeyboardWatcher()
     end
+    self:_cancelPolls()
 end
 
 function HIDPassthrough:_doToggle(touchmenu_instance)
@@ -751,9 +1232,34 @@ function HIDPassthrough:addToMainMenu(menu_items)
                 end,
             },
             {
+                text = _("Scan for devices"),
+                enabled_func = function() return self:isRunning() end,
+                keep_menu_open = true,
+                callback = function() self:scanForDevices() end,
+                separator = true,
+            },
+            {
+                text = _("Paired devices"),
+                enabled_func = function() return self:isRunning() end,
+                keep_menu_open = true,
+                callback = function() self:showPairedDevices() end,
+            },
+            {
                 text = _("Show daemon status"),
                 keep_menu_open = true,
                 callback = function() self:showInfo() end,
+            },
+            {
+                text = _("Recent logs"),
+                keep_menu_open = true,
+                callback = function() self:showLogs() end,
+            },
+            {
+                text = _("Clear descriptor cache"),
+                enabled_func = function() return self:isRunning() end,
+                keep_menu_open = true,
+                callback = function() self:clearCache() end,
+                separator = true,
             },
             {
                 text = _("About HID Passthrough"),
