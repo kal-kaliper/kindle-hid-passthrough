@@ -162,6 +162,26 @@ class HIDHost:
         self._last_report = None
         self._auth_failure_address = None  # Track address for auth failure retry
 
+    @property
+    def connection_state(self) -> dict:
+        """Current connection state as a dict for API consumers."""
+        if not self._is_connection_alive():
+            return {"connected": False}
+
+        state = {
+            "connected": True,
+            "address": normalize_addr(self.current_device_address) if self.current_device_address else None,
+            "protocol": self.connected_protocol.value if self.connected_protocol else None,
+            "name": self.device_name,
+        }
+        if self.uhid_device:
+            state["uhid_name"] = self.uhid_device.name
+            if self.uhid_device.input_paths:
+                state["input_paths"] = self.uhid_device.input_paths
+        if self.report_map:
+            state["descriptor_size"] = len(self.report_map)
+        return state
+
     def _parse_devices(self):
         """Parse devices from config and group by protocol."""
         devices = config.get_all_devices()
@@ -239,20 +259,6 @@ class HIDHost:
                 HCI_Write_Local_Name_Command(local_name=local_name_bytes),
                 check_result=True
             )
-
-            # Add link key debug logging for Classic
-            original_get_link_key = self.device.get_link_key
-
-            async def debug_get_link_key(address):
-                log.info(f"[Classic] Link key requested for: {address}")
-                result = await original_get_link_key(address)
-                if result:
-                    log.info(f"[Classic] Link key found: {len(result)} bytes")
-                else:
-                    log.info("[Classic] Link key NOT FOUND")
-                return result
-
-            self.device.host.link_key_provider = debug_get_link_key
 
         if self.ble_devices:
             log.info("BLE enabled")
@@ -658,11 +664,7 @@ class HIDHost:
             log.error("[Classic] Failed to connect HID interrupt channel")
             return
 
-        if not self.report_map:
-            self.report_map = get_fallback_hid_descriptor()
-            log.warning("[Classic] Using fallback descriptor")
-
-        self._create_uhid_device()
+        self._finalize_classic_hid()
 
     async def _continue_ble_after_pairing(self):
         """Continue BLE connection after pairing."""
@@ -685,18 +687,7 @@ class HIDHost:
                 self.peer = Peer(self.connection)
             log.info("[BLE] Connection already encrypted")
 
-        # Discover report characteristics for notification subscription.
-        # Even if report_map is cached from pairing, we need to discover
-        # the individual Report characteristics to subscribe to them.
-        if not self.hid_reports:
-            await self._discover_ble_hid_service(process_reports=True)
-
-        if not self.report_map:
-            raise InvalidStateError("[BLE] No report descriptor available")
-
-        self._create_uhid_device()
-        await self._subscribe_to_ble_reports()
-        await self._ble_activate_hid_service()
+        await self._setup_ble_hid()
 
     # ==================== CLASSIC HANDLER ====================
 
@@ -927,25 +918,22 @@ class HIDHost:
             if not self._connection_future.done():
                 await asyncio.sleep(self.ACTIVE_RETRY_INTERVAL)
 
+    def _finalize_classic_hid(self):
+        """Apply fallback descriptor if needed and create UHID. Common to connect and post-pair."""
+        if not self.report_map:
+            self.report_map = get_fallback_hid_descriptor()
+            log.warning("[Classic] Using fallback descriptor")
+        self._create_uhid_device()
+
     async def _handle_classic_connection(self):
         """Finalize Classic connection setup."""
         if not self.hid_host.l2cap_intr_channel:
             raise InvalidStateError("HID interrupt channel not connected")
 
-        # Load or query descriptor
-        cache = self.device_cache.load(self.current_device_address)
-        if cache and 'report_map' in cache:
-            self.report_map = bytes.fromhex(cache['report_map'])
-            self.device_name = cache.get('device_name')
-            log.success(f"[Classic] Loaded cached descriptor ({len(self.report_map)} bytes)")
-        else:
+        if not self._load_cached_descriptor():
             await self._query_classic_sdp()
 
-        if not self.report_map:
-            self.report_map = get_fallback_hid_descriptor()
-            log.warning("[Classic] Using fallback descriptor")
-
-        self._create_uhid_device()
+        self._finalize_classic_hid()
 
     def _parse_hid_descriptor_list(self, data_element):
         """Parse HID Descriptor List from SDP."""
@@ -979,22 +967,22 @@ class HIDHost:
         except Exception as e:
             log.warning(f"[Classic] Failed to parse descriptor: {e}")
 
+    def _forward_report(self, data: bytes):
+        """Deduplicate, log, and forward an HID report to UHID."""
+        if data != self._last_report:
+            log.debug(f"Report: {data.hex()}")
+            self._last_report = data
+        if self.uhid_device:
+            try:
+                self.uhid_device.send_input(data)
+            except Exception as e:
+                log.warning(f"UHID send failed: {e}")
+
     def _on_classic_interrupt_data(self, pdu: bytes):
         """Handle Classic HID report."""
         if len(pdu) < 1:
             return
-
-        report_data = pdu[1:]
-
-        if report_data != self._last_report:
-            log.debug(f"[Classic] Report: {report_data.hex()}")
-            self._last_report = report_data
-
-        if self.uhid_device:
-            try:
-                self.uhid_device.send_input(report_data)
-            except Exception as e:
-                log.warning(f"UHID send failed: {e}")
+        self._forward_report(pdu[1:])
 
     def _on_virtual_cable_unplug(self):
         """Handle virtual cable unplug."""
@@ -1205,26 +1193,20 @@ class HIDHost:
         await self.connection.pair()
         log.success("[BLE] Pairing complete")
 
-    async def _handle_ble_connection(self):
-        """Finalize BLE connection setup."""
-        # Load cached descriptor
-        cache = self.device_cache.load(self.current_device_address)
-        if cache and 'report_map' in cache:
-            self.report_map = bytes.fromhex(cache['report_map'])
-            self.device_name = cache.get('device_name')
-            log.success(f"[BLE] Loaded cached descriptor ({len(self.report_map)} bytes)")
-
-        # Discover GATT services
-        await self._discover_ble_hid_service(process_reports=True)
-
+    async def _setup_ble_hid(self):
+        """Discover reports, create UHID, subscribe. Common to connect and post-pair."""
+        if not self.hid_reports:
+            await self._discover_ble_hid_service(process_reports=True)
         if not self.report_map:
             raise InvalidStateError("[BLE] No report descriptor available")
-
         self._create_uhid_device()
-
-        # Subscribe to reports
         await self._subscribe_to_ble_reports()
         await self._ble_activate_hid_service()
+
+    async def _handle_ble_connection(self):
+        """Finalize BLE connection setup."""
+        self._load_cached_descriptor()
+        await self._setup_ble_hid()
 
     async def _read_ble_device_name(self):
         """Read BLE device name from Generic Access Service."""
@@ -1320,20 +1302,8 @@ class HIDHost:
 
     def _on_ble_hid_report(self, value, report_id):
         """Handle BLE HID report."""
-        # For BLE, GATT notifications do NOT include the Report ID.
-        # But if the device has multiple reports (which it does if we are here),
-        # UHID/Kernel expects the Report ID as the first byte of the data.
-        data = bytes([report_id]) + bytes(value)
-
-        if data != self._last_report:
-            log.info(f"[BLE] Report (ID={report_id}): {data.hex()}")
-            self._last_report = data
-
-        if self.uhid_device:
-            try:
-                self.uhid_device.send_input(data)
-            except Exception as e:
-                log.warning(f"UHID send failed: {e}")
+        # BLE GATT notifications omit Report ID; UHID/kernel expects it first.
+        self._forward_report(bytes([report_id]) + bytes(value))
 
     # ==================== COMMON ====================
 
@@ -1349,6 +1319,17 @@ class HIDHost:
             self._auth_failure_address = self.current_device_address
 
         self._disconnection_event.set()
+
+    def _load_cached_descriptor(self, address: str = None) -> bool:
+        """Load report descriptor and device name from cache. Returns True if found."""
+        address = address or self.current_device_address
+        cache = self.device_cache.load(address)
+        if cache and 'report_map' in cache:
+            self.report_map = bytes.fromhex(cache['report_map'])
+            self.device_name = cache.get('device_name')
+            log.success(f"Loaded cached descriptor ({len(self.report_map)} bytes)")
+            return True
+        return False
 
     def _create_uhid_device(self):
         """Create UHID virtual device."""
@@ -1439,56 +1420,6 @@ class HIDHost:
 
         if self.transport:
             await self.transport.close()
-
-    async def clear_stale_key(self, address: str) -> bool:
-        """Clear a stale link key from the keystore.
-
-        Args:
-            address: Device address to clear key for
-
-        Returns:
-            True if key was cleared
-        """
-        if not self.keystore:
-            log.warning("[Classic] No keystore available for key clearing")
-            return False
-
-        # Try multiple address formats
-        norm_addr = normalize_addr(address)
-        addresses_to_try = [
-            norm_addr,                    # Just the MAC: 98:B9:EA:01:67:68
-            f"{norm_addr}/P",             # With public suffix: 98:B9:EA:01:67:68/P
-            address,                      # Original format
-            address.upper(),              # Original uppercase
-        ]
-
-        # Log what keys are in keystore for debugging
-        try:
-            all_keys = await self.keystore.get_all()
-            if all_keys:
-                log.info(f"[Classic] Keystore has {len(all_keys)} entries:")
-                for entry in all_keys:
-                    key_addr = str(entry[0]) if isinstance(entry, (list, tuple)) else str(entry)
-                    log.info(f"[Classic]   - {key_addr}")
-            else:
-                log.info("[Classic] Keystore is empty")
-        except Exception as e:
-            log.warning(f"[Classic] Could not list keystore: {e}")
-
-        # Try each address format
-        for addr in addresses_to_try:
-            try:
-                keys = await self.keystore.get(addr)
-                if keys and keys.link_key:
-                    log.info(f"[Classic] Found key with format: {addr}")
-                    await self.keystore.delete(addr)
-                    log.success(f"[Classic] Link key cleared for {addr}")
-                    return True
-            except Exception as e:
-                log.debug(f"[Classic] No key at {addr}: {e}")
-
-        log.warning(f"[Classic] No link key found for {address} (tried: {addresses_to_try})")
-        return False
 
     def get_auth_failure_address(self) -> str:
         """Get address that had auth failure, if any.
