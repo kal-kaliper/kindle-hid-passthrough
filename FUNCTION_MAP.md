@@ -105,7 +105,7 @@ Every function in the project, one-line description each.
 - `HIDHost.__init__` — Init transport, device state, protocol lists, UHID, events
 - `HIDHost.connection_state` — Property: build dict of address, protocol, UHID info
 - `HIDHost._parse_devices` — Read devices.conf and split into classic/ble lists
-- `HIDHost.start` — Open transport, create Bumble Device, HCI reset, power on
+- `HIDHost.start` — Create Bumble device via shared init, configure protocols and keystore
 - `HIDHost._load_keystore_addresses` — Read known addresses from keystore for filtering
 - `HIDHost._format_device` — Format address with device name if known
 - `HIDHost.run` — Parse devices, start, race Classic/BLE handlers, wait for disconnect
@@ -175,7 +175,7 @@ Every function in the project, one-line description each.
 
 - `DiscoveredDevice.__str__` — Format as "[BLE/Classic] name (addr) RSSI: N"
 - `Scanner.__init__` — Init transport spec and callback
-- `Scanner.start` — Open transport, HCI reset, power on Bumble device
+- `Scanner.start` — Create Bumble device via shared transport init
 - `Scanner.cleanup` — Close transport
 - `Scanner.scan` — Run concurrent scan, fall back to sequential on failure
 - `Scanner._scan_concurrent` — Run BLE and Classic scans as parallel tasks
@@ -184,6 +184,10 @@ Every function in the project, one-line description each.
 - `Scanner._scan_ble` — Listen for BLE advertisements, filter for HID service UUID
 - `Scanner._scan_classic` — Run Classic inquiry, filter for Peripheral device class
 - `Scanner._merge_results` — Combine BLE + Classic results, sort by RSSI
+
+## transport.py — Bumble transport and device initialization
+
+- `create_bumble_device` — Open HCI transport, create Device, HCI reset, power on
 
 ## uhid_handler.py — Linux UHID virtual device
 

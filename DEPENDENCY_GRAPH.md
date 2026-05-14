@@ -5,7 +5,7 @@
 ```
 Entry       →  daemon.py, main.py
 API         →  api_server.py, controller.py
-BT Core     →  host.py, scanner.py
+BT Core     →  host.py, scanner.py, transport.py
 Hardware    →  bt_setup.py, uhid_handler.py
 Data        →  config.py, device_cache.py, kindle_detect.py
 Utility     →  logging_utils.py
@@ -28,6 +28,7 @@ graph TD
     subgraph BT_Core
         host
         scanner
+        transport
     end
 
     subgraph Hardware
@@ -68,9 +69,13 @@ graph TD
     host --> config
     host --> device_cache
     host --> logging_utils
+    host --> transport
     host --> uhid_handler
     scanner --> config
     scanner --> logging_utils
+    scanner --> transport
+    transport --> config
+    transport --> logging_utils
 
     %% Hardware layer
     bt_setup --> kindle_detect
@@ -99,8 +104,8 @@ graph TD
 | host.py had dead clear_stale_key method (no callers) | Deleted |
 | host.py had debug monkey-patch in start() | Deleted |
 
+| Transport init duplicated in scanner.py and host.py | Extracted `create_bumble_device()` in transport.py |
+
 ### Remaining
 
-| Issue | Location | Notes |
-|-------|----------|-------|
-| Transport init duplication | scanner.py:start(), host.py:start() | Both do: open_transport → Device.with_hci → HCI_Reset → power_on. Could extract a shared `create_bumble_device()` utility. Low priority — the code is stable and only ~15 lines each. |
+No known cross-module redundancy.

@@ -23,7 +23,6 @@ from bumble.hci import (
     HCI_LE_Clear_Filter_Accept_List_Command,
     HCI_LE_Create_Connection_Cancel_Command,
     HCI_LE_Create_Connection_Command,
-    HCI_Reset_Command,
     HCI_Write_Class_Of_Device_Command,
     HCI_Write_Local_Name_Command,
     HCI_Write_Scan_Enable_Command,
@@ -34,9 +33,9 @@ from bumble.hid import Host as BumbleHIDHost
 from bumble.keys import JsonKeyStore
 from bumble.pairing import PairingConfig, PairingDelegate
 from bumble.sdp import Client as SDPClient
-from bumble.transport import open_transport
 
 from config import Protocol, config, get_fallback_hid_descriptor, get_version, normalize_addr
+from transport import create_bumble_device
 from device_cache import DeviceCache
 from logging_utils import log
 from uhid_handler import Bus, UHIDDevice, strip_digitizer_collections
@@ -201,49 +200,16 @@ class HIDHost:
         """Initialize the Bumble device with both protocols."""
         log.info(f"HID Host v{get_version()}")
 
-        log.info("Opening transport...")
+        self.transport, self.device = await create_bumble_device(self.transport_spec)
 
-        try:
-            self.transport = await asyncio.wait_for(
-                open_transport(self.transport_spec),
-                timeout=config.transport_timeout
-            )
-        except asyncio.TimeoutError:
-            log.error(f"Transport open timed out after {config.transport_timeout}s")
-            raise
-
-        self.device = Device.with_hci(
-            config.device_name,
-            config.device_address,
-            self.transport.source,
-            self.transport.sink
-        )
-
-        # Enable both protocols
         self.device.classic_enabled = bool(self.classic_devices)
         self.device.le_enabled = bool(self.ble_devices)
-
         self.device.keystore = self.keystore
         self.device.pairing_config_factory = lambda conn: create_pairing_config()
 
         if self.classic_devices:
             self.device.classic_ssp_enabled = True
             self.device.classic_sc_enabled = True
-
-        log.info("Sending HCI Reset...")
-        try:
-            await asyncio.wait_for(
-                self.device.host.send_command(HCI_Reset_Command()),
-                timeout=config.hci_reset_timeout
-            )
-            log.success("HCI Reset successful")
-            await asyncio.sleep(0.2)
-        except asyncio.TimeoutError:
-            log.error("HCI Reset timed out")
-            raise
-
-        await self.device.power_on()
-        log.success(f"Device powered on: {self.device.public_address}")
 
         # Classic-specific setup
         if self.classic_devices:
