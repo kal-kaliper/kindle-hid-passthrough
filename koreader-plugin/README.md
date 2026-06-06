@@ -23,13 +23,19 @@ Full feature parity with the BTManager WAF app — you can manage everything fro
 
 Copy the `hidpassthrough.koplugin` directory to your KOReader plugins folder:
 
+**Kindle:**
 ```
 cp -r hidpassthrough.koplugin /mnt/us/koreader/plugins/
 ```
 
+**Kobo:**
+```
+cp -r hidpassthrough.koplugin /mnt/onboard/.adds/koreader/plugins/
+```
+
 Then restart KOReader.
 
-The kindle-hid-passthrough daemon must already be installed on the device at `/mnt/us/kindle_hid_passthrough/kindle-hid-passthrough`. See the main project README for installation instructions.
+The kindle-hid-passthrough daemon must already be installed on the device. By default the plugin expects the binary at `/mnt/us/kindle_hid_passthrough/kindle-hid-passthrough`. If your install lives elsewhere (e.g. on Kobo), override `DAEMON_BINARY` in KOReader's `settings/hidpassthrough.lua`. See the main project README for installation instructions.
 
 ## Opening the menu
 

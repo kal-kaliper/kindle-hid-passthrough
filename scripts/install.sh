@@ -14,6 +14,17 @@ installMainFiles()
   echo " -> Ready."
 }
 
+findKOReaderPlugins()
+{
+  for dir in /mnt/us/koreader/plugins /mnt/onboard/.adds/koreader/plugins; do
+    if [ -d "$dir" ]; then
+      echo "$dir"
+      return 0
+    fi
+  done
+  return 1
+}
+
 installAll()
 {
   echo ""
@@ -22,7 +33,7 @@ installAll()
   installUpstart
   installMainFiles
   installWAFApp
-  if [ -d /mnt/us/koreader/plugins/ ]; then
+  if findKOReaderPlugins >/dev/null; then
     installKOReaderPlugin
   fi
   echo ""
@@ -80,12 +91,13 @@ installWAFApp()
 
 installKOReaderPlugin()
 {
-  if [ ! -d /mnt/us/koreader/plugins/ ]; then
+  KOREADER_PLUGINS="$(findKOReaderPlugins)"
+  if [ -z "$KOREADER_PLUGINS" ]; then
     echo " -> KOReader not found, skipping plugin install"
     return
   fi
-  echo " -> Installing KOReader plugin"
-  cp -r koreader-plugin/hidpassthrough.koplugin /mnt/us/koreader/plugins/hidpassthrough.koplugin
+  echo " -> Installing KOReader plugin to $KOREADER_PLUGINS"
+  cp -r koreader-plugin/hidpassthrough.koplugin "$KOREADER_PLUGINS/hidpassthrough.koplugin"
   echo " -> Ready."
 }
 
