@@ -702,11 +702,14 @@ var BTManager = (function() {
 
     function quit() {
         pressBtn("btnBack");
-        if (typeof kindle !== "undefined" && kindle.appmgr && kindle.appmgr.back) {
-            kindle.appmgr.back();
-        } else if (typeof kindle !== "undefined" && kindle.appmgr && kindle.appmgr.startApplication) {
-            kindle.appmgr.startApplication("com.lab126.booklet.home");
-        }
+        request("/quit-app", function(data, err) {
+            if (!err && data && data.ok) return;
+            if (typeof kindle !== "undefined" && kindle.appmgr && kindle.appmgr.back) {
+                kindle.appmgr.back();
+            } else if (typeof kindle !== "undefined" && kindle.appmgr && kindle.appmgr.startApplication) {
+                kindle.appmgr.startApplication("com.lab126.booklet.home");
+            }
+        });
     }
 
     // ---- Event Binding ----
