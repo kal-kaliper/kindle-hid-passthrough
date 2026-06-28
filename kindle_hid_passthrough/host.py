@@ -375,12 +375,21 @@ class HIDHost(ClassicMixin, BLEMixin):
         log.warning(f"[{proto}] Device disconnected: {addr} (reason={reason})")
 
         if reason == 5 and address and proto == "CLASSIC":
-            log.info("[Classic] Authentication failure - will clear stale key and retry")
-            self._auth_failure_address = address
+            log.info("[Classic] Authentication failure; keeping bond and retrying")
+
+        session = self.sessions.pop(protocol, None) if protocol else None
+        if session and session.uhid_device:
+            try:
+                session.uhid_device.destroy()
+            except Exception:
+                pass
 
         if protocol in self._protocol_disconnection_events:
             self._protocol_disconnection_events[protocol].set()
-        if self._disconnection_event:
+        live_sessions = any(
+            self._is_session_alive(s) for s in self.sessions.values()
+        )
+        if self._disconnection_event and not live_sessions:
             self._disconnection_event.set()
         if protocol == self.connected_protocol and protocol not in self.sessions:
             self.connection = None
@@ -470,6 +479,11 @@ class HIDHost(ClassicMixin, BLEMixin):
         event = self._protocol_disconnection_events.get(protocol)
         return bool(event and event.is_set())
 
+    def _clear_protocol_event(self, protocol: Protocol):
+        event = self._protocol_disconnection_events.get(protocol)
+        if event:
+            event.clear()
+
     def _is_connection_alive(self) -> bool:
         """Check if the connection is still alive and usable."""
         if self._disconnection_event and self._disconnection_event.is_set():
@@ -486,6 +500,14 @@ class HIDHost(ClassicMixin, BLEMixin):
         """Check if a protocol already has a live session."""
         session = self.sessions.get(protocol)
         return bool(session and self._is_session_alive(session))
+
+    def _is_protocol_connecting(self, protocol: Protocol) -> bool:
+        """Check if a protocol has an unfinalized live connection."""
+        return (
+            self.connected_protocol == protocol
+            and protocol not in self.sessions
+            and self._is_raw_connection_alive(self.connection)
+        )
 
     def _is_raw_connection_alive(self, connection) -> bool:
         """Check if a Bumble connection object is still alive."""

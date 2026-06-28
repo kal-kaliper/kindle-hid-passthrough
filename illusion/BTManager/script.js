@@ -95,7 +95,7 @@ var BTManager = (function() {
 
     function showMessage(text, isError) {
         var bar = getEl("messageBar");
-        bar.innerHTML = escapeHtml(text);
+        setText(bar, text);
         bar.className = "message-bar visible" + (isError ? " error" : "");
         if (messageTimer) clearTimeout(messageTimer);
         messageTimer = setTimeout(function() {
@@ -123,10 +123,19 @@ var BTManager = (function() {
     function renderLogLines(lines) {
         if (!lines) return "";
         var text = sanitizeText(lines.join("\n"));
-        if (text.length > 12000) {
-            text = text.slice(text.length - 12000);
+        if (text.length > 6000) {
+            text = text.slice(text.length - 6000);
         }
-        return escapeHtml(text);
+        return text;
+    }
+
+    function setText(el, text) {
+        if (!el) return;
+        text = sanitizeText(text);
+        while (el.firstChild) {
+            el.removeChild(el.firstChild);
+        }
+        el.appendChild(document.createTextNode(text));
     }
 
     // ---- Toggle ----
@@ -586,7 +595,7 @@ var BTManager = (function() {
             if (!isPairing) return;
             if (data && data.lines) {
                 var viewer = getEl("pairLogContent");
-                viewer.innerHTML = renderLogLines(data.lines);
+                setText(viewer, renderLogLines(data.lines));
                 var container = viewer.parentNode;
                 container.scrollTop = container.scrollHeight;
             }
@@ -627,11 +636,11 @@ var BTManager = (function() {
     function fetchLogs() {
         request("/logs?lines=100", function(data, err) {
             if (err) {
-                getEl("logContent").innerHTML = "Error loading logs: " + escapeHtml(err);
+                setText(getEl("logContent"), "Error loading logs: " + err);
                 return;
             }
             if (data && data.lines) {
-                getEl("logContent").innerHTML = renderLogLines(data.lines);
+                setText(getEl("logContent"), renderLogLines(data.lines));
                 var viewer = getEl("logViewer");
                 viewer.scrollTop = viewer.scrollHeight;
             }

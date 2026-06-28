@@ -90,6 +90,7 @@ class ClassicMixin:
                         pass
                     return
 
+                self._clear_protocol_event(Protocol.CLASSIC)
                 self.connection = connection
                 self.peer = None
                 self.hid_host = classic_hid_host
@@ -241,10 +242,16 @@ class ClassicMixin:
 
         attempt = 0
         while not self._is_protocol_connected(Protocol.CLASSIC):
+            if self._is_protocol_connecting(Protocol.CLASSIC):
+                await asyncio.sleep(0.5)
+                continue
+
             attempt += 1
             for addr in addresses:
                 if self._is_protocol_connected(Protocol.CLASSIC):
                     return
+                if self._is_protocol_connecting(Protocol.CLASSIC):
+                    break
 
                 log.info(f"[Classic] Attempt {attempt}: {self._format_device(addr)}")
 
