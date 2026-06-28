@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bluetooth scanner — discovers HID devices on BLE + Classic concurrently."""
+"""Bluetooth scanner — discovers HID candidates on BLE + Classic concurrently."""
 
 import asyncio
 from dataclasses import dataclass
@@ -15,10 +15,16 @@ from transport import create_bumble_device
 
 __all__ = ['Scanner', 'DiscoveredDevice']
 
+BLE_APPEARANCE_CATEGORY_PHONE = 0x01
+BLE_APPEARANCE_CATEGORY_HID = 0x0F
+CLASSIC_MAJOR_DEVICE_CLASS_PHONE = 0x02
+CLASSIC_MAJOR_DEVICE_CLASS_PERIPHERAL = 0x05
+CLASSIC_HID_CANDIDATE_CLASSES = {"Peripheral", "Phone"}
+
 
 @dataclass
 class DiscoveredDevice:
-    """A discovered HID device."""
+    """A discovered HID candidate."""
     address: str
     name: str
     protocol: Protocol
@@ -30,7 +36,7 @@ class DiscoveredDevice:
 
 
 class Scanner:
-    """Scans for HID devices across both BLE and Classic protocols.
+    """Scans for HID candidates across both BLE and Classic protocols.
 
     Uses a single Bumble Device instance to perform concurrent scanning.
     Falls back to sequential scanning if concurrent mode fails.
@@ -67,7 +73,7 @@ class Scanner:
         concurrent: bool = True,
         stop_event: asyncio.Event = None
     ) -> List[DiscoveredDevice]:
-        """Scan for HID devices across both BLE and Classic.
+        """Scan for HID candidates across both BLE and Classic.
 
         Args:
             duration: Scan duration in seconds (split between protocols if concurrent)
@@ -75,7 +81,7 @@ class Scanner:
             stop_event: If set, scan stops early when this event is triggered
 
         Returns:
-            List of discovered HID devices with protocol tags
+            List of discovered HID candidates with protocol tags
         """
         if concurrent:
             try:
@@ -132,7 +138,7 @@ class Scanner:
                 pass
 
     async def _scan_ble(self, duration: float, stop_event: asyncio.Event = None) -> List[DiscoveredDevice]:
-        """Scan for BLE HID devices."""
+        """Scan for BLE HID candidates."""
         devices_found: List[DiscoveredDevice] = []
         seen_addresses = set()
 
@@ -157,7 +163,11 @@ class Scanner:
 
                 if not is_hid:
                     appearance = advertisement.data.get(AdvertisingData.APPEARANCE)
-                    if appearance is not None and (int(appearance) >> 6) == 0x0F:
+                    appearance_category = int(appearance) >> 6 if appearance is not None else None
+                    if appearance_category in (
+                        BLE_APPEARANCE_CATEGORY_HID,
+                        BLE_APPEARANCE_CATEGORY_PHONE,
+                    ):
                         is_hid = True
 
             if not is_hid:
@@ -193,7 +203,7 @@ class Scanner:
         return devices_found
 
     async def _scan_classic(self, duration: float, stop_event: asyncio.Event = None) -> List[DiscoveredDevice]:
-        """Scan for Classic Bluetooth HID devices."""
+        """Scan for Classic Bluetooth HID candidates."""
         log.info(f"Starting Classic inquiry ({duration}s)...")
         devices_found: List[DiscoveredDevice] = []
         seen_addresses = set()
@@ -204,20 +214,27 @@ class Scanner:
                 return
             seen_addresses.add(addr_str)
 
-            # Check if HID device (Peripheral device class)
+            # HID keyboard/mouse apps can expose HID while the device still
+            # advertises as a phone.
             is_hid = False
             major_class_name = "Unknown"
             try:
                 _, major_class, _minor_class = DeviceClass.split_class_of_device(class_of_device)
                 major_class_name = DeviceClass.major_device_class_name(major_class)
-                is_hid = major_class_name == "Peripheral"
+                is_hid = major_class_name in CLASSIC_HID_CANDIDATE_CLASSES
             except Exception:
                 major_class = (class_of_device >> 8) & 0x1F
-                is_hid = (major_class == 0x05)  # Peripheral
+                is_hid = major_class in (
+                    CLASSIC_MAJOR_DEVICE_CLASS_PERIPHERAL,
+                    CLASSIC_MAJOR_DEVICE_CLASS_PHONE,
+                )
                 major_class_name = f"0x{major_class:02X}"
 
-            # Log ALL devices found, not just HID
-            log.info(f"  Classic: {addr_str} CoD=0x{class_of_device:06X} ({major_class_name}) HID={is_hid}")
+            # Log ALL devices found, not just HID candidates.
+            log.info(
+                f"  Classic: {addr_str} CoD=0x{class_of_device:06X} "
+                f"({major_class_name}) HID-candidate={is_hid}"
+            )
 
             if is_hid:
                 name = 'Unknown'
@@ -249,7 +266,7 @@ class Scanner:
             log.debug("Classic inquiry started")
             await self._interruptible_sleep(duration, stop_event)
             await self.device.stop_discovery()
-            log.info(f"Classic inquiry complete: {len(seen_addresses)} total, {len(devices_found)} HID")
+            log.info(f"Classic inquiry complete: {len(seen_addresses)} total, {len(devices_found)} candidates")
         finally:
             self.device.remove_listener('inquiry_result', on_inquiry_result)
 
@@ -285,5 +302,5 @@ class Scanner:
         # Sort by RSSI (strongest first)
         all_devices.sort(key=lambda d: d.rssi, reverse=True)
 
-        log.success(f"Found {len(ble_devices)} BLE + {len(classic_devices)} Classic = {len(all_devices)} HID devices")
+        log.success(f"Found {len(ble_devices)} BLE + {len(classic_devices)} Classic = {len(all_devices)} candidates")
         return all_devices

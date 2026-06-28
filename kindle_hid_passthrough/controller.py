@@ -60,6 +60,8 @@ class DaemonController:
 
         conn = self.daemon.connection_state
         if conn.get("connected"):
+            if conn.get("connections"):
+                status["connections"] = conn["connections"]
             status["connected_device"] = conn.get("address")
             status["connected_protocol"] = conn.get("protocol")
             status["connected_name"] = conn.get("name")

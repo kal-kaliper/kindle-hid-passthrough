@@ -770,7 +770,7 @@ function HIDPassthrough:_doPollScan(tick)
         if data.error then
             infoToast(T(_("Scan failed: %1"), data.error), true)
         else
-            infoToast(_("No HID devices found"))
+            infoToast(_("No devices found"))
         end
     end
 end
@@ -868,12 +868,21 @@ function HIDPassthrough:showPairedDevices()
         return
     end
 
-    local connected_addr = data.connected_device
+    local connected = {}
+    if data.connections then
+        for _, conn in ipairs(data.connections) do
+            if conn.address then
+                connected[tostring(conn.address):upper()] = true
+            end
+        end
+    end
+    if data.connected_device then
+        connected[tostring(data.connected_device):upper()] = true
+    end
+
     local items = {}
     for _, dev in ipairs(devices) do
-        local is_conn = connected_addr
-            and dev.address
-            and dev.address:upper() == tostring(connected_addr):upper()
+        local is_conn = dev.address and connected[dev.address:upper()]
         local prefix = is_conn and "● " or "○ "
         local addr  = dev.address
         local proto = dev.protocol or "ble"

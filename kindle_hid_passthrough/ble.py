@@ -72,7 +72,7 @@ class BLEMixin:
         try:
             connection = None
 
-            while connection is None and not self._connection_future.done():
+            while connection is None and not self._is_protocol_connected(Protocol.BLE):
                 matched_dev = None
                 match_kind = None
 
@@ -89,26 +89,42 @@ class BLEMixin:
             if connection is None:
                 return
 
-            if self._connection_future.done():
+            if self._is_protocol_connected(Protocol.BLE):
                 await connection.disconnect()
                 return
 
             addr_str = str(connection.peer_address)
             log.info(f"[BLE] Device connected: {self._format_device(addr_str)}")
 
-            self.connection = connection
-            self.peer = Peer(connection)
-            self.current_device_address = addr_str
-            self.connected_protocol = Protocol.BLE
-            connection.on('disconnection', self._on_disconnection)
+            async with self._session_setup_lock:
+                if self._is_protocol_connected(Protocol.BLE):
+                    await connection.disconnect()
+                    return
 
-            await self._ble_restore_or_pair()
+                self.connection = connection
+                self.peer = Peer(connection)
+                self.hid_host = None
+                self.current_device_address = addr_str
+                self.device_name = self._configured_name(addr_str)
+                self.report_map = None
+                self.hid_reports = []
+                self.uhid_device = None
+                self._last_report = None
+                self.connected_protocol = Protocol.BLE
+                connection.on(
+                    'disconnection',
+                    lambda reason, p=Protocol.BLE, a=addr_str:
+                    self._on_protocol_disconnection(p, a, reason)
+                )
 
-            if match_kind == 'name' and matched_dev is not None:
-                self._save_rotated_address(matched_dev, normalize_addr(addr_str))
+                await self._ble_restore_or_pair()
+                await self._handle_ble_connection()
 
-            if not self._connection_future.done():
-                self._connection_future.set_result(connection)
+                if match_kind == 'name' and matched_dev is not None:
+                    self._save_rotated_address(matched_dev, normalize_addr(addr_str))
+
+                self._record_current_session(Protocol.BLE)
+                log.success(f"[BLE] Session ready: {self._format_device(addr_str)}")
 
         except asyncio.CancelledError:
             raise
@@ -259,12 +275,12 @@ class BLEMixin:
         """Fallback BLE handler using active scanning for discovery."""
         log.info("[BLE] Scanning for devices...")
 
-        while not self._connection_future.done():
+        while not self._is_protocol_connected(Protocol.BLE):
             found_device = None
 
             def on_advertisement(advertisement):
                 nonlocal found_device
-                if self._connection_future.done():
+                if self._is_protocol_connected(Protocol.BLE):
                     return
 
                 addr = normalize_addr(str(advertisement.address))
@@ -278,7 +294,7 @@ class BLEMixin:
                 async with self._radio_lock:
                     await self.device.start_scanning()
                     for _ in range(20):
-                        if found_device or self._connection_future.done():
+                        if found_device or self._is_protocol_connected(Protocol.BLE):
                             break
                         await asyncio.sleep(0.5)
                     await self.device.stop_scanning()
@@ -287,7 +303,7 @@ class BLEMixin:
             finally:
                 self.device.remove_listener('advertisement', on_advertisement)
 
-            if self._connection_future.done():
+            if self._is_protocol_connected(Protocol.BLE):
                 return
 
             if found_device:
@@ -296,25 +312,42 @@ class BLEMixin:
                     try:
                         log.info(f"[BLE] Connecting to {found_device.address} (Attempt {attempt}/{max_attempts})...")
                         async with self._radio_lock:
-                            self.connection = await self.device.connect(
+                            connection = await self.device.connect(
                                 found_device.address,
                                 own_address_type=OwnAddressType.PUBLIC,
                                 timeout=config.connect_timeout,
                             )
 
-                        if self._connection_future.done():
-                            await self.connection.disconnect()
+                        if self._is_protocol_connected(Protocol.BLE):
+                            await connection.disconnect()
                             return
 
-                        self.peer = Peer(self.connection)
-                        self.current_device_address = str(found_device.address)
-                        self.connected_protocol = Protocol.BLE
-                        self.connection.on('disconnection', self._on_disconnection)
+                        async with self._session_setup_lock:
+                            if self._is_protocol_connected(Protocol.BLE):
+                                await connection.disconnect()
+                                return
 
-                        await self._ble_restore_or_pair()
+                            self.connection = connection
+                            self.peer = Peer(connection)
+                            self.hid_host = None
+                            self.current_device_address = str(found_device.address)
+                            self.device_name = self._configured_name(self.current_device_address)
+                            self.report_map = None
+                            self.hid_reports = []
+                            self.uhid_device = None
+                            self._last_report = None
+                            self.connected_protocol = Protocol.BLE
+                            connection.on(
+                                'disconnection',
+                                lambda reason, p=Protocol.BLE, a=self.current_device_address:
+                                self._on_protocol_disconnection(p, a, reason)
+                            )
 
-                        if not self._connection_future.done():
-                            self._connection_future.set_result(self.connection)
+                            await self._ble_restore_or_pair()
+                            await self._handle_ble_connection()
+                            self._record_current_session(Protocol.BLE)
+                            log.success(f"[BLE] Session ready: {self._format_device(self.current_device_address)}")
+
                         return
 
                     except Exception as e:
@@ -322,7 +355,7 @@ class BLEMixin:
                         if attempt < max_attempts:
                             await asyncio.sleep(2.0)
 
-            if not self._connection_future.done():
+            if not self._is_protocol_connected(Protocol.BLE):
                 await asyncio.sleep(3.0)
 
     async def _ble_restore_or_pair(self):
@@ -336,15 +369,45 @@ class BLEMixin:
                 keys = await self.device.keystore.get(str(self.connection.peer_address))
                 if keys:
                     log.info("[BLE] Restoring bonding...")
-                    await self.connection.encrypt()
+                    await self._wait_for_ble_operation(
+                        self.connection.encrypt(), "bonding restore")
                     log.success("[BLE] Bonding restored")
                     return
             except Exception as e:
                 log.warning(f"[BLE] Bonding restore failed: {e}")
 
         log.info("[BLE] Initiating pairing...")
-        await self.connection.pair()
+        await self._wait_for_ble_operation(self.connection.pair(), "pairing")
         log.success("[BLE] Pairing complete")
+
+    async def _wait_for_ble_operation(self, awaitable, operation: str):
+        """Wait for a BLE operation, aborting if the link disconnects."""
+        op_task = asyncio.ensure_future(awaitable)
+        disconnect_task = None
+        try:
+            wait_tasks = {op_task}
+            disconnect_event = self._protocol_disconnection_events.get(
+                Protocol.BLE) or self._disconnection_event
+            if disconnect_event:
+                if disconnect_event.is_set():
+                    op_task.cancel()
+                    await asyncio.gather(op_task, return_exceptions=True)
+                    raise InvalidStateError(f"[BLE] Disconnected during {operation}")
+                disconnect_task = asyncio.create_task(disconnect_event.wait())
+                wait_tasks.add(disconnect_task)
+
+            done, _ = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
+
+            if disconnect_task and disconnect_task in done:
+                if not op_task.done():
+                    op_task.cancel()
+                    await asyncio.gather(op_task, return_exceptions=True)
+                raise InvalidStateError(f"[BLE] Disconnected during {operation}")
+
+            return await op_task
+        finally:
+            if disconnect_task and not disconnect_task.done():
+                disconnect_task.cancel()
 
     async def _setup_ble_hid(self):
         """Discover reports, create UHID, subscribe. Common to connect and post-pair."""
@@ -451,7 +514,7 @@ class BLEMixin:
 
     def _on_ble_hid_report(self, value, report_id):
         """Handle BLE HID report."""
-        self._forward_report(bytes([report_id]) + bytes(value))
+        self._forward_report_for_protocol(Protocol.BLE, bytes([report_id]) + bytes(value))
 
     async def _pair_ble(self, address: str) -> bool:
         """Pair with a BLE device."""

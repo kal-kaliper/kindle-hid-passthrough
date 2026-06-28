@@ -113,7 +113,7 @@ Paired devices are stored in `devices.conf`:
 5C:2B:3E:50:4F:04/P ble BLE-M3
 ```
 
-**Mixed Protocol Support**: You can configure both BLE and Classic devices. The daemon automatically detects mixed protocols and uses a unified host that handles both simultaneously - the first device to connect wins.
+**Mixed Protocol Support**: You can configure both BLE and Classic devices. The daemon automatically detects mixed protocols and can keep one BLE device and one Classic device connected at the same time.
 
 ### Changing keyboard layout
 
