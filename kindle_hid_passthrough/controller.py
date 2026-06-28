@@ -36,6 +36,7 @@ class DaemonController:
         self.scan_result = None
         self.is_scanning = False
         self._scan_live_devices = []
+        self._scan_stop_event = None
 
         # Pair state
         self.pair_result = None
@@ -104,7 +105,14 @@ class DaemonController:
         if self.is_scanning:
             return
         self.scan_result = None
+        self.is_scanning = True
+        self._scan_stop_event = asyncio.Event()
         asyncio.run_coroutine_threadsafe(self._do_scan(), self.loop)
+
+    def request_scan_stop(self):
+        """Ask an in-flight scan to stop early."""
+        if self._scan_stop_event:
+            self._scan_stop_event.set()
 
     def _on_device_found(self, device):
         """Callback from scanner when a device is discovered."""
@@ -117,7 +125,6 @@ class DaemonController:
 
     async def _do_scan(self):
         async with self._op_lock:
-            self.is_scanning = True
             self._scan_live_devices = []
             try:
                 await self.daemon.suspend()
@@ -126,6 +133,7 @@ class DaemonController:
                 await self.daemon.scan(
                     duration=10.0,
                     on_device_found=self._on_device_found,
+                    stop_event=self._scan_stop_event,
                 )
                 self.scan_result = {
                     "ok": True,
@@ -136,6 +144,7 @@ class DaemonController:
                 self.scan_result = {"ok": False, "error": str(e)}
             finally:
                 self.is_scanning = False
+                self._scan_stop_event = None
                 await self.daemon.resume()
 
     # ---- Pair ----
@@ -159,15 +168,17 @@ class DaemonController:
                 success = await self.daemon.pair(address, protocol, name)
                 if success:
                     config.add_device(address, protocol, name)
+                error = self.daemon.last_pair_error or "Pairing failed"
                 self.pair_result = {
                     "ok": success,
                     "address": address,
                     **({"message": "Paired successfully"} if success
-                       else {"error": "Pairing failed"}),
+                       else {"error": error}),
                 }
             except Exception as e:
-                logger.error(f"Pair failed: {e}")
-                self.pair_result = {"ok": False, "address": address, "error": str(e)}
+                error = str(e) or repr(e)
+                logger.error(f"Pair failed: {error}")
+                self.pair_result = {"ok": False, "address": address, "error": error}
             finally:
                 self.is_pairing = False
                 await self.daemon.resume()

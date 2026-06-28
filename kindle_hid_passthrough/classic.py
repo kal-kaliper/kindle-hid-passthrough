@@ -388,9 +388,13 @@ class ClassicMixin:
             )
             log.success(f"[Classic] Connected to {address}")
         except (asyncio.TimeoutError, BumbleTimeoutError):
+            self.last_pair_error = (
+                f"Classic connection timeout after {config.connect_timeout}s"
+            )
             log.error(f"[Classic] Connection timeout after {config.connect_timeout}s")
             return False
         except Exception as e:
+            self.last_pair_error = f"Classic connection failed: {e}"
             log.error(f"[Classic] Connection failed: {e}")
             return False
 
@@ -413,6 +417,7 @@ class ClassicMixin:
                 await asyncio.wait_for(self.connection.authenticate(), timeout=30.0)
                 log.success("[Classic] Authentication complete")
             except Exception as e:
+                self.last_pair_error = f"Classic authentication failed: {e}"
                 log.warning(f"[Classic] Authentication: {e}")
 
             log.info("[Classic] Waiting for link key...")
@@ -435,6 +440,10 @@ class ClassicMixin:
             await self._query_classic_sdp(address)
 
             if not self.report_map:
+                self.last_pair_error = (
+                    "Classic pairing failed: no HID descriptor found. "
+                    "Make sure the phone HID app is active and pairable."
+                )
                 log.error("[Classic] Pairing failed: no HID descriptor found")
                 self.device.host.remove_listener('link_key', on_device_link_key)
                 config.remove_pairing_key(address)
@@ -459,6 +468,7 @@ class ClassicMixin:
             return True
 
         except Exception as e:
+            self.last_pair_error = f"Classic pairing failed: {e or repr(e)}"
             log.error(f"[Classic] Pairing failed: {e}")
             self.device.host.remove_listener('link_key', on_device_link_key)
             if self.connection:

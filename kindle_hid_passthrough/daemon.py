@@ -29,7 +29,7 @@ class HIDDaemon:
         self._host_task = None
         self._suspended = False
         self._resume_event = asyncio.Event()
-        self._paired_host = None
+        self.last_pair_error = None
 
     @property
     def connection_state(self) -> dict:
@@ -63,24 +63,26 @@ class HIDDaemon:
 
         logger.info("Daemon suspended")
 
-    async def scan(self, duration=10.0, on_device_found=None):
+    async def scan(self, duration=10.0, on_device_found=None, stop_event=None):
         """Scan for BT devices. Must be called while suspended."""
         scanner = Scanner()
         if on_device_found:
             scanner.on_device_found = on_device_found
         try:
             await scanner.start()
-            await scanner.scan(duration=duration)
+            await scanner.scan(duration=duration, stop_event=stop_event)
         finally:
             await scanner.cleanup()
 
     async def pair(self, address, protocol, name=None) -> bool:
         """Pair with a device. Must be called while suspended."""
         host = HIDHost()
+        self.last_pair_error = None
         try:
             success = await host.pair_device(address, protocol, name)
+            self.last_pair_error = host.last_pair_error
             if success:
-                self._paired_host = host
+                await host.cleanup()
                 return True
             await host.cleanup()
             return False
@@ -150,20 +152,11 @@ class HIDDaemon:
             skip_delay = False
 
             try:
-                # Use handed-off host from controller pairing if available
-                if self._paired_host:
-                    logger.info("=== Continuing with paired device ===")
-                    self.host = self._paired_host
-                    self._paired_host = None
-                    self._host_task = asyncio.create_task(
-                        self.host.continue_after_pairing()
-                    )
-                else:
-                    logger.info("=== Starting connection ===")
-                    self.host = HIDHost()
-                    self._host_task = asyncio.create_task(
-                        self.host.run()
-                    )
+                logger.info("=== Starting connection ===")
+                self.host = HIDHost()
+                self._host_task = asyncio.create_task(
+                    self.host.run()
+                )
                 await self._host_task
 
             except asyncio.CancelledError:

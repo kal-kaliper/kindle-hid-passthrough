@@ -95,7 +95,7 @@ var BTManager = (function() {
 
     function showMessage(text, isError) {
         var bar = getEl("messageBar");
-        bar.innerHTML = text;
+        bar.innerHTML = escapeHtml(text);
         bar.className = "message-bar visible" + (isError ? " error" : "");
         if (messageTimer) clearTimeout(messageTimer);
         messageTimer = setTimeout(function() {
@@ -103,12 +103,30 @@ var BTManager = (function() {
         }, MESSAGE_TIMEOUT);
     }
 
+    function sanitizeText(str) {
+        if (str === null || str === undefined) return "";
+        str = String(str);
+        // Kindle's old WebKit can hang on ANSI/control bytes in daemon logs.
+        str = str.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+        return str.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+    }
+
     function escapeHtml(str) {
+        str = sanitizeText(str);
         if (!str) return "";
         return str.replace(/&/g, "&amp;")
                   .replace(/</g, "&lt;")
                   .replace(/>/g, "&gt;")
                   .replace(/"/g, "&quot;");
+    }
+
+    function renderLogLines(lines) {
+        if (!lines) return "";
+        var text = sanitizeText(lines.join("\n"));
+        if (text.length > 12000) {
+            text = text.slice(text.length - 12000);
+        }
+        return escapeHtml(text);
     }
 
     // ---- Toggle ----
@@ -568,7 +586,7 @@ var BTManager = (function() {
             if (!isPairing) return;
             if (data && data.lines) {
                 var viewer = getEl("pairLogContent");
-                viewer.innerHTML = escapeHtml(data.lines.join("\n"));
+                viewer.innerHTML = renderLogLines(data.lines);
                 var container = viewer.parentNode;
                 container.scrollTop = container.scrollHeight;
             }
@@ -613,7 +631,7 @@ var BTManager = (function() {
                 return;
             }
             if (data && data.lines) {
-                getEl("logContent").innerHTML = escapeHtml(data.lines.join("\n"));
+                getEl("logContent").innerHTML = renderLogLines(data.lines);
                 var viewer = getEl("logViewer");
                 viewer.scrollTop = viewer.scrollHeight;
             }

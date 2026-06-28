@@ -92,6 +92,7 @@ class HIDHost(ClassicMixin, BLEMixin):
         self._last_report = None
         self._auth_failure_address = None
         self._virtual_cable_unplug_address = None
+        self.last_pair_error = None
         self._radio_lock = None
 
     @property

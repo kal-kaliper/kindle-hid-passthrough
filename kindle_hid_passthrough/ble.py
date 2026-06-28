@@ -528,6 +528,7 @@ class BLEMixin:
                 timeout=config.connect_timeout,
             )
         except Exception as e:
+            self.last_pair_error = f"BLE connection failed: {e}"
             log.error(f"[BLE] Connection failed: {e}")
             return False
 
@@ -548,6 +549,7 @@ class BLEMixin:
 
             return True
         except Exception as e:
+            self.last_pair_error = f"BLE pairing failed: {e}"
             log.error(f"[BLE] Pairing failed: {e}")
             if self.connection:
                 try:
