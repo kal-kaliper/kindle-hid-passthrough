@@ -2,6 +2,7 @@
 """HID Host — runs BLE + Classic handlers on a single Bumble device."""
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -55,6 +56,8 @@ class HIDHost(ClassicMixin, BLEMixin):
     ACTIVE_DELAY = 2.0
     ACTIVE_RETRY_INTERVAL = 5.0
     ACTIVE_CONNECT_TIMEOUT = 10
+    CLASSIC_AUTH_RETRY_DELAY = 8.0
+    CLASSIC_AUTH_RETRY_DELAY_WITH_PENDING_BLE = 20.0
 
     def __init__(self, transport_spec: str = None):
         self.transport_spec = transport_spec or config.transport
@@ -92,6 +95,7 @@ class HIDHost(ClassicMixin, BLEMixin):
         self._last_report = None
         self._auth_failure_address = None
         self._virtual_cable_unplug_address = None
+        self._classic_retry_not_before = 0.0
         self.last_pair_error = None
         self._radio_lock = None
 
@@ -376,6 +380,11 @@ class HIDHost(ClassicMixin, BLEMixin):
 
         if reason == 5 and address and proto == "CLASSIC":
             log.info("[Classic] Authentication failure; keeping bond and retrying")
+            retry_delay = self.CLASSIC_AUTH_RETRY_DELAY
+            if self.ble_devices and not self._is_protocol_connected(Protocol.BLE):
+                retry_delay = self.CLASSIC_AUTH_RETRY_DELAY_WITH_PENDING_BLE
+            self._classic_retry_not_before = time.monotonic() + retry_delay
+            log.info(f"[Classic] Deferring retry for {retry_delay:.0f}s")
 
         session = self.sessions.pop(protocol, None) if protocol else None
         if session and session.uhid_device:
@@ -508,6 +517,12 @@ class HIDHost(ClassicMixin, BLEMixin):
             and protocol not in self.sessions
             and self._is_raw_connection_alive(self.connection)
         )
+
+    def _protocol_retry_delay(self, protocol: Protocol) -> float:
+        """Return seconds before the protocol should retry a connection."""
+        if protocol == Protocol.CLASSIC:
+            return max(0.0, self._classic_retry_not_before - time.monotonic())
+        return 0.0
 
     def _is_raw_connection_alive(self, connection) -> bool:
         """Check if a Bumble connection object is still alive."""
