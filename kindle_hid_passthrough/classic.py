@@ -235,6 +235,32 @@ class ClassicMixin:
 
         return False
 
+    def _has_live_classic_connection(self, addr: str) -> bool:
+        """True if bumble already holds a live Classic link to addr.
+
+        The inbound accept path and the active-connect loop can otherwise both
+        target the same peer at once. The outbound page collides with the
+        existing link (LMP transaction collision) and tears down the
+        in-progress HID session with reason=5, so the HID channels never open.
+        Checking bumble's own connection table is more reliable than the
+        app-level protocol flags, which can briefly read "not connecting"
+        mid-setup.
+        """
+        norm = normalize_addr(addr)
+        connections = getattr(self.device, 'connections', None) or {}
+        for conn in list(connections.values()):
+            try:
+                if normalize_addr(str(conn.peer_address)) != norm:
+                    continue
+                transport = getattr(conn, 'transport', None)
+                if transport is not None and transport != BT_BR_EDR_TRANSPORT:
+                    continue
+                if self._is_raw_connection_alive(conn):
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def _classic_active_connect_loop(self, addresses: List[str]):
         """Actively try to connect to Classic devices."""
         log.info(f"[Classic] Active: {len(addresses)} device(s)")
@@ -257,6 +283,14 @@ class ClassicMixin:
                     return
                 if self._is_protocol_connecting(Protocol.CLASSIC):
                     break
+
+                if self._has_live_classic_connection(addr):
+                    log.info(
+                        f"[Classic] {self._format_device(addr)} already linked; "
+                        "skipping active connect"
+                    )
+                    await asyncio.sleep(1.0)
+                    continue
 
                 log.info(f"[Classic] Attempt {attempt}: {self._format_device(addr)}")
 
