@@ -133,30 +133,21 @@ class ClassicMixin:
 
         hid_host.on_device_connection(connection)
 
-        auth_event = asyncio.Event()
+        if not getattr(connection, 'is_encrypted', False):
+            log.info("[Classic] Authenticating...")
+            try:
+                await asyncio.wait_for(connection.authenticate(), timeout=8.0)
+                log.success("[Classic] Authentication complete")
+            except Exception as e:
+                log.warning(f"[Classic] Authentication: {e}")
 
-        def on_auth():
-            log.success("[Classic] Device authenticated us")
-            auth_event.set()
-
-        def on_auth_fail(error):
-            log.warning(f"[Classic] Auth failed: {error}")
-            auth_event.set()
-
-        connection.on('connection_authentication', on_auth)
-        connection.on('connection_authentication_failure', on_auth_fail)
-
-        log.info("[Classic] Waiting for device authentication...")
-        try:
-            await asyncio.wait_for(auth_event.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            log.warning("[Classic] No auth request from device, continuing...")
-
-        try:
-            connection.remove_listener('connection_authentication', on_auth)
-            connection.remove_listener('connection_authentication_failure', on_auth_fail)
-        except Exception:
-            pass
+        if not getattr(connection, 'is_encrypted', False):
+            log.info("[Classic] Requesting encryption...")
+            try:
+                await asyncio.wait_for(connection.encrypt(enable=True), timeout=10.0)
+                log.success("[Classic] Link encrypted")
+            except Exception as e:
+                log.warning(f"[Classic] Encryption: {e}")
 
         if self._protocol_event_is_set(Protocol.CLASSIC):
             log.warning("[Classic] Connection lost during authentication")
@@ -235,6 +226,23 @@ class ClassicMixin:
 
         return False
 
+    def _has_live_classic_connection(self, addr: str) -> bool:
+        """True if bumble already holds a live Classic link to addr."""
+        norm = normalize_addr(addr)
+        connections = getattr(self.device, 'connections', None) or {}
+        for conn in list(connections.values()):
+            try:
+                if normalize_addr(str(conn.peer_address)) != norm:
+                    continue
+                transport = getattr(conn, 'transport', None)
+                if transport is not None and transport != BT_BR_EDR_TRANSPORT:
+                    continue
+                if self._is_raw_connection_alive(conn):
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def _classic_active_connect_loop(self, addresses: List[str]):
         """Actively try to connect to Classic devices."""
         log.info(f"[Classic] Active: {len(addresses)} device(s)")
@@ -258,6 +266,14 @@ class ClassicMixin:
                 if self._is_protocol_connecting(Protocol.CLASSIC):
                     break
 
+                if self._has_live_classic_connection(addr):
+                    log.info(
+                        f"[Classic] {self._format_device(addr)} already linked; "
+                        "skipping active connect"
+                    )
+                    await asyncio.sleep(1.0)
+                    continue
+
                 log.info(f"[Classic] Attempt {attempt}: {self._format_device(addr)}")
 
                 target = Address(addr, Address.PUBLIC_DEVICE_ADDRESS)
@@ -265,6 +281,7 @@ class ClassicMixin:
                 connect_task = asyncio.create_task(
                     self.device.connect(target, transport=BT_BR_EDR_TRANSPORT)
                 )
+                backoff = 0.0
                 # The finally below guarantees connect_task is cancelled and
                 # awaited on every exit path, including suspend cancellation —
                 # otherwise it leaks and asyncio logs an unretrieved exception
@@ -281,18 +298,17 @@ class ClassicMixin:
 
                     if timed_out:
                         log.info(f"[Classic] {addr} timed out")
-                        await asyncio.sleep(3.0)
-                        continue
-
-                    await connect_task
+                        backoff = 3.0
+                    else:
+                        await connect_task
 
                 except Exception as e:
                     if "DISALLOWED" in str(e) or "PENDING" in str(e):
                         log.warning("[Classic] HCI busy, waiting...")
-                        await asyncio.sleep(5.0)
+                        backoff = 5.0
                     else:
                         log.info(f"[Classic] Connect failed: {e}")
-                        await asyncio.sleep(2.0)
+                        backoff = 2.0
 
                 finally:
                     if not connect_task.done():
@@ -302,6 +318,9 @@ class ClassicMixin:
                     except (asyncio.CancelledError, Exception):
                         pass
                     self._radio_lock.release()
+
+                if backoff:
+                    await asyncio.sleep(backoff)
 
             if not self._is_protocol_connected(Protocol.CLASSIC):
                 await asyncio.sleep(self.ACTIVE_RETRY_INTERVAL)
@@ -452,22 +471,10 @@ class ClassicMixin:
             await self._query_classic_sdp(address)
 
             if not self.report_map:
-                self.last_pair_error = (
-                    "Classic pairing failed: no HID descriptor found. "
-                    "Make sure the phone HID app is active and pairable."
+                log.warning(
+                    "[Classic] No HID descriptor in SDP; "
+                    "using fallback keyboard descriptor"
                 )
-                log.error("[Classic] Pairing failed: no HID descriptor found")
-                self.device.host.remove_listener('link_key', on_device_link_key)
-                config.remove_pairing_key(address)
-                try:
-                    await self.connection.disconnect()
-                except Exception:
-                    pass
-                self.connection = None
-                self.current_device_address = None
-                self.connected_protocol = None
-                self.device_name = None
-                return False
 
             if self.keystore:
                 keys = await self.keystore.get(address)
