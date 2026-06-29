@@ -146,11 +146,26 @@ class ClassicMixin:
         connection.on('connection_authentication', on_auth)
         connection.on('connection_authentication_failure', on_auth_fail)
 
-        log.info("[Classic] Waiting for device authentication...")
-        try:
-            await asyncio.wait_for(auth_event.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            log.warning("[Classic] No auth request from device, continuing...")
+        # Actively authenticate and encrypt the link using the stored bond.
+        # A bonded Bluetooth HID device will not open its HID L2CAP channels
+        # until the link is encrypted; a passive wait leaves the link
+        # unencrypted and the peer drops it with reason=5 (authentication
+        # failure). This mirrors the pairing path in _pair_classic.
+        if not getattr(connection, 'is_encrypted', False):
+            log.info("[Classic] Authenticating...")
+            try:
+                await asyncio.wait_for(connection.authenticate(), timeout=15.0)
+                log.success("[Classic] Authentication complete")
+            except Exception as e:
+                log.warning(f"[Classic] Authentication: {e}")
+
+        if not getattr(connection, 'is_encrypted', False):
+            log.info("[Classic] Requesting encryption...")
+            try:
+                await asyncio.wait_for(connection.encrypt(enable=True), timeout=10.0)
+                log.success("[Classic] Link encrypted")
+            except Exception as e:
+                log.warning(f"[Classic] Encryption: {e}")
 
         try:
             connection.remove_listener('connection_authentication', on_auth)
