@@ -452,22 +452,19 @@ class ClassicMixin:
             await self._query_classic_sdp(address)
 
             if not self.report_map:
-                self.last_pair_error = (
-                    "Classic pairing failed: no HID descriptor found. "
-                    "Make sure the phone HID app is active and pairable."
+                # The device bonded as a HID keyboard (it passed the HID
+                # class-of-device candidate filter) but exposed no HID report
+                # descriptor over SDP. Some keyboard emulators, notably phone
+                # HID apps, advertise the HID service without a complete SDP
+                # record. Keep the bond and fall back to a standard keyboard
+                # descriptor in _finalize_classic_hid, matching the reconnect
+                # path in _handle_classic_connection. Aborting here would
+                # reject otherwise-functional keyboards that drive the HID
+                # interrupt channel directly.
+                log.warning(
+                    "[Classic] No HID descriptor in SDP; "
+                    "using fallback keyboard descriptor"
                 )
-                log.error("[Classic] Pairing failed: no HID descriptor found")
-                self.device.host.remove_listener('link_key', on_device_link_key)
-                config.remove_pairing_key(address)
-                try:
-                    await self.connection.disconnect()
-                except Exception:
-                    pass
-                self.connection = None
-                self.current_device_address = None
-                self.connected_protocol = None
-                self.device_name = None
-                return False
 
             if self.keystore:
                 keys = await self.keystore.get(address)
