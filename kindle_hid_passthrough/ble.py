@@ -35,6 +35,7 @@ class BLEMixin:
 
     BLE_INIT_WINDOW = 18.0
     BLE_SCAN_WINDOW = 8.0
+    BLE_COEXIST_WINDOW = 2.5
 
     async def _run_ble_handler(self):
         """Handle BLE connections."""
@@ -130,10 +131,25 @@ class BLEMixin:
             raise
         except Exception as e:
             log.warning(f"[BLE] Connection failed: {e}")
+            try:
+                if connection is not None:
+                    await connection.disconnect()
+            except Exception:
+                pass
+            if (self.connection is connection
+                    and self.connected_protocol == Protocol.BLE
+                    and Protocol.BLE not in self.sessions):
+                self.connection = None
+                self.peer = None
+                self.current_device_address = None
+                self.connected_protocol = None
 
     async def _ble_initiate(self, window: float, peer: Address = None):
         """Legacy create-connection to `peer`, or to the accept list when
         None. Returns the connection, or None on window timeout."""
+        if any(p != Protocol.BLE for p in self.sessions):
+            window = min(window, self.BLE_COEXIST_WINDOW)
+
         pending = asyncio.get_running_loop().create_future()
 
         def on_connection(connection):
@@ -196,6 +212,9 @@ class BLEMixin:
     async def _ble_scan_for_rotated(self, known: set, window: float):
         """Scan for bonded devices advertising, including from a rotated
         address. Returns (address, DeviceConfig or None, kind) or None."""
+        if any(p != Protocol.BLE for p in self.sessions):
+            window = min(window, self.BLE_COEXIST_WINDOW)
+
         rotated = asyncio.get_running_loop().create_future()
 
         def on_advertisement(advertisement):
@@ -380,10 +399,12 @@ class BLEMixin:
         await self._wait_for_ble_operation(self.connection.pair(), "pairing")
         log.success("[BLE] Pairing complete")
 
-    async def _wait_for_ble_operation(self, awaitable, operation: str):
-        """Wait for a BLE operation, aborting if the link disconnects."""
+    async def _wait_for_ble_operation(self, awaitable, operation: str,
+                                      timeout: float = 20.0):
+        """Wait for a BLE operation, aborting on disconnect or timeout."""
         op_task = asyncio.ensure_future(awaitable)
         disconnect_task = None
+        timeout_task = None
         try:
             wait_tasks = {op_task}
             disconnect_event = self._protocol_disconnection_events.get(
@@ -396,6 +417,9 @@ class BLEMixin:
                 disconnect_task = asyncio.create_task(disconnect_event.wait())
                 wait_tasks.add(disconnect_task)
 
+            timeout_task = asyncio.create_task(asyncio.sleep(timeout))
+            wait_tasks.add(timeout_task)
+
             done, _ = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
 
             if disconnect_task and disconnect_task in done:
@@ -404,10 +428,17 @@ class BLEMixin:
                     await asyncio.gather(op_task, return_exceptions=True)
                 raise InvalidStateError(f"[BLE] Disconnected during {operation}")
 
+            if timeout_task in done and not op_task.done():
+                op_task.cancel()
+                await asyncio.gather(op_task, return_exceptions=True)
+                raise InvalidStateError(f"[BLE] {operation} timed out after {timeout:.0f}s")
+
             return await op_task
         finally:
             if disconnect_task and not disconnect_task.done():
                 disconnect_task.cancel()
+            if timeout_task and not timeout_task.done():
+                timeout_task.cancel()
 
     async def _setup_ble_hid(self):
         """Discover reports, create UHID, subscribe. Common to connect and post-pair."""
