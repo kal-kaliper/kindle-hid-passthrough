@@ -186,6 +186,8 @@ end
 -- directory listing every few seconds, only while the daemon is "on".
 
 HIDPassthrough.WATCHER_INTERVAL = 3 -- seconds
+HIDPassthrough.RESUME_WATCHER_INTERVAL = 5 -- seconds
+HIDPassthrough.RESUME_WATCHER_TIMEOUT = 75 -- seconds
 
 -- Try to load the FBInkInput library. It's part of koreader-base on Kobo
 -- and Kindle, but we still wrap it in pcall so the plugin degrades cleanly
@@ -367,7 +369,7 @@ end
 -- Detach a keyboard by path. Closes the fd via Input:close, decrements the
 -- count, and if it was the last one, restores device caps and broadcasts
 -- the disconnect event.
-function HIDPassthrough:_detachKeyboard(path)
+function HIDPassthrough:_detachKeyboard(path, quiet)
     local entry = self._kb_attached[path]
     if not entry then return end
 
@@ -383,10 +385,12 @@ function HIDPassthrough:_detachKeyboard(path)
 
     if self._kb_count == 0 then
         self:_restoreDeviceCaps()
-        UIManager:show(InfoMessage:new{
-            text = _("Keyboard disconnected"),
-            timeout = 1,
-        })
+        if not quiet then
+            UIManager:show(InfoMessage:new{
+                text = _("Keyboard disconnected"),
+                timeout = 1,
+            })
+        end
         InputText.initInputEvents()
         UIManager:broadcastEvent(Event:new("PhysicalKeyboardDisconnected"))
     end
@@ -447,7 +451,14 @@ function HIDPassthrough:_startKeyboardWatcher()
     UIManager:scheduleIn(1, self._reconcileKeyboardsCb)
 end
 
-function HIDPassthrough:_stopKeyboardWatcher()
+function HIDPassthrough:_stopKeyboardWatcher(quiet, keep_resume_pending)
+    if self._resume_watcher_cb then
+        UIManager:unschedule(self._resume_watcher_cb)
+        self._resume_watcher_cb = nil
+    end
+    if not keep_resume_pending then
+        self._kb_resume_pending = false
+    end
     if not self._kb_watcher_active then return end
     self._kb_watcher_active = false
     -- Detach everything we have. Snapshot keys first because _detachKeyboard
@@ -455,9 +466,32 @@ function HIDPassthrough:_stopKeyboardWatcher()
     local paths = {}
     for path in pairs(self._kb_attached) do table.insert(paths, path) end
     for _, path in ipairs(paths) do
-        self:_detachKeyboard(path)
+        self:_detachKeyboard(path, quiet)
     end
     logger.info("HIDPassthrough: keyboard watcher stopped")
+end
+
+function HIDPassthrough:_scheduleWatcherResume(elapsed)
+    if not self._kb_resume_pending then return end
+    if elapsed >= self.RESUME_WATCHER_TIMEOUT then
+        logger.warn("HIDPassthrough: daemon not ready after resume; "
+            .. "keyboard watcher remains stopped")
+        self._kb_resume_pending = false
+        self._resume_watcher_cb = nil
+        return
+    end
+    self._resume_watcher_cb = function()
+        self._resume_watcher_cb = nil
+        if not self._kb_resume_pending then return end
+        if self:isRunning() then
+            self._kb_resume_pending = false
+            logger.info("HIDPassthrough: daemon resumed, restarting keyboard watcher")
+            self:_startKeyboardWatcher()
+            return
+        end
+        self:_scheduleWatcherResume(elapsed + self.RESUME_WATCHER_INTERVAL)
+    end
+    UIManager:scheduleIn(self.RESUME_WATCHER_INTERVAL, self._resume_watcher_cb)
 end
 
 ------------------------------------------------------------------------------
@@ -1184,7 +1218,30 @@ function HIDPassthrough:onCloseWidget()
         logger.info("HIDPassthrough: KOReader closing, stopping keyboard watcher")
         self:_stopKeyboardWatcher()
     end
+    self._kb_resume_pending = false
+    if self._resume_watcher_cb then
+        UIManager:unschedule(self._resume_watcher_cb)
+        self._resume_watcher_cb = nil
+    end
     self:_cancelPolls()
+end
+
+function HIDPassthrough:onSuspend()
+    self._kb_resume_pending = self._kb_watcher_active
+    if self._kb_watcher_active then
+        logger.info("HIDPassthrough: KOReader suspending, pausing keyboard watcher")
+        self:_stopKeyboardWatcher(true, true)
+    end
+end
+
+function HIDPassthrough:onResume()
+    if not self._kb_resume_pending then return end
+    if self._resume_watcher_cb then
+        UIManager:unschedule(self._resume_watcher_cb)
+        self._resume_watcher_cb = nil
+    end
+    logger.info("HIDPassthrough: KOReader resumed, waiting for HID daemon")
+    self:_scheduleWatcherResume(0)
 end
 
 function HIDPassthrough:_doToggle(touchmenu_instance)

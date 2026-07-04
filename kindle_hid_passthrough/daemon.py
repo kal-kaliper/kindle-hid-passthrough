@@ -29,7 +29,13 @@ class HIDDaemon:
         self.host = None
         self._host_task = None
         self._suspended = False
+        self._suspend_reason = None
         self._resume_event = asyncio.Event()
+        self._lifecycle_lock = asyncio.Lock()
+        self._power_resume_task = None
+        self._power_blocked = False
+        self._resume_after_power = False
+        self._resume_after_power_reason = None
         self._paired_host = None
 
     @property
@@ -39,30 +45,43 @@ class HIDDaemon:
             return self.host.connection_state
         return {"connected": False}
 
-    async def suspend(self):
+    async def suspend(self, reason="manual"):
         """Disconnect and release transport for scan/pair."""
-        logger.info("Daemon suspending...")
-        self._suspended = True
-        self._resume_event.clear()
+        async with self._lifecycle_lock:
+            if reason == "power":
+                self._power_blocked = True
+            elif reason == "manual":
+                self._resume_after_power = False
+                self._resume_after_power_reason = None
 
-        # Cancel the host task first — this stops host.run()'s connect loop
-        if self._host_task and not self._host_task.done():
-            self._host_task.cancel()
-            try:
-                await self._host_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._host_task = None
+            if self._suspended:
+                if reason != "power":
+                    self._suspend_reason = reason
+                detail = f" ({self._suspend_reason})" if self._suspend_reason else ""
+                logger.info(f"Daemon already suspended{detail}")
+                return
 
-        # Then clean up any remaining resources
-        if self.host:
-            try:
-                await self.host.cleanup()
-            except Exception:
-                pass
-            self.host = None
+            logger.info(f"Daemon suspending ({reason})...")
+            self._suspended = True
+            self._suspend_reason = reason
+            self._resume_event.clear()
 
-        logger.info("Daemon suspended")
+            if self._host_task and not self._host_task.done():
+                self._host_task.cancel()
+                try:
+                    await self._host_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                self._host_task = None
+
+            if self.host:
+                try:
+                    await self.host.cleanup()
+                except Exception:
+                    pass
+                self.host = None
+
+            logger.info(f"Daemon suspended ({reason})")
 
     async def scan(self, duration=10.0, on_device_found=None, stop_event=None):
         """Scan for BT devices. Must be called while suspended."""
@@ -100,11 +119,79 @@ class HIDDaemon:
         if self._host_task and not self._host_task.done():
             self._host_task.cancel()
 
-    async def resume(self):
+    async def resume(self, reason=None):
         """Resume connections after scan/pair."""
-        logger.info("Daemon resuming...")
-        self._suspended = False
-        self._resume_event.set()
+        async with self._lifecycle_lock:
+            if self._power_blocked and reason not in ("power", "power-watchdog"):
+                if reason == "user" or self._suspend_reason != "manual":
+                    self._resume_after_power = True
+                    self._resume_after_power_reason = reason
+                detail = f" ({reason})" if reason else ""
+                logger.info(f"Resume deferred during WMT/Wi-Fi recovery{detail}")
+                return
+
+            if reason in ("power", "power-watchdog"):
+                self._power_blocked = False
+                if not self._suspended:
+                    self._resume_after_power = False
+                    return
+                if self._suspend_reason != "power":
+                    should_resume = (
+                        self._resume_after_power
+                        and (
+                            self._suspend_reason != "manual"
+                            or self._resume_after_power_reason == "user"
+                        )
+                    )
+                    if not should_resume:
+                        logger.info(
+                            f"Power resume ignored; daemon suspended by "
+                            f"{self._suspend_reason}"
+                        )
+                        self._resume_after_power = False
+                        self._resume_after_power_reason = None
+                        return
+                    logger.info("Power resume delay elapsed; applying deferred resume")
+            elif not self._suspended:
+                return
+
+            detail = f" ({reason})" if reason else ""
+            logger.info(f"Daemon resuming{detail}...")
+            self._suspended = False
+            self._suspend_reason = None
+            self._resume_after_power = False
+            self._resume_after_power_reason = None
+            self._resume_event.set()
+
+    async def handle_power_event(self, event: str):
+        if event in ("goingToScreenSaver", "readyToSuspend", "suspending"):
+            if self._power_resume_task and not self._power_resume_task.done():
+                self._power_resume_task.cancel()
+            await self.suspend(reason="power")
+            self._power_resume_task = asyncio.create_task(
+                self._delayed_power_resume(config.power_resume_max_delay, "power-watchdog"),
+                name="power_resume_watchdog",
+            )
+            return
+
+        if event not in ("wakeupFromSuspend", "resuming", "outOfScreenSaver"):
+            return
+
+        if self._power_resume_task and not self._power_resume_task.done():
+            self._power_resume_task.cancel()
+        self._power_resume_task = asyncio.create_task(
+            self._delayed_power_resume(config.power_resume_delay, "power"),
+            name="power_resume_delay",
+        )
+
+    async def _delayed_power_resume(self, delay, reason):
+        if delay > 0:
+            logger.info(f"Power resume: waiting {delay:.0f}s for WMT/Wi-Fi")
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+        await self.resume(reason=reason)
 
     def _has_devices(self, log_details=False) -> bool:
         """Check if any devices are configured."""
@@ -232,7 +319,8 @@ class HIDDaemon:
         """Stop the daemon."""
         logger.info("Stopping...")
         self.running = False
-        # Wake up if suspended (waiting on _resume_event)
+        if self._power_resume_task and not self._power_resume_task.done():
+            self._power_resume_task.cancel()
         self._resume_event.set()
         if self.host:
             try:
@@ -245,6 +333,9 @@ async def main():
     setup_daemon_logging(config.log_file)
 
     prepare_bt()
+    if config.power_startup_delay > 0:
+        log.info(f"Waiting {config.power_startup_delay:.0f}s for WMT/Wi-Fi startup")
+        await asyncio.sleep(config.power_startup_delay)
 
     daemon = HIDDaemon()
     controller = DaemonController(daemon)
@@ -258,7 +349,7 @@ async def main():
     log.info(f"API server listening on port {PORT}")
 
     monitor = None
-    if not chip().survives_suspend:
+    if config.power_monitor_enabled and not chip().survives_suspend:
         monitor = PowerMonitor(controller)
         monitor.start()
         log.info("Watching powerd for system suspend")

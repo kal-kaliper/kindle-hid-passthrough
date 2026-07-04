@@ -130,7 +130,7 @@ class DaemonController:
         async with self._op_lock:
             self._scan_live_devices = []
             try:
-                await self.daemon.suspend()
+                await self.daemon.suspend(reason="operation")
                 config.validate_keystore()
 
                 # Re-warm the chip if a prior /stop powered it off; opening the
@@ -152,7 +152,7 @@ class DaemonController:
             finally:
                 self.is_scanning = False
                 self._scan_stop_event = None
-                await self.daemon.resume()
+                await self.daemon.resume(reason="operation")
 
     # ---- Pair ----
 
@@ -169,7 +169,7 @@ class DaemonController:
     async def _do_pair(self, address, protocol, name):
         async with self._op_lock:
             try:
-                await self.daemon.suspend()
+                await self.daemon.suspend(reason="operation")
                 config.validate_keystore()
 
                 # Re-warm the chip if a prior /stop powered it off; opening the
@@ -190,7 +190,7 @@ class DaemonController:
                 self.pair_result = {"ok": False, "address": address, "error": str(e)}
             finally:
                 self.is_pairing = False
-                await self.daemon.resume()
+                await self.daemon.resume(reason="operation")
 
     # ---- Connect / Resume ----
 
@@ -213,17 +213,17 @@ class DaemonController:
         async with self._op_lock:
             self._suspended_by_system = False
             if self.daemon._suspended:
-                await self.daemon.resume()
+                await self.daemon.resume(reason="user")
 
     async def _do_connect(self, address, protocol):
         async with self._op_lock:
             try:
-                await self.daemon.suspend()
+                await self.daemon.suspend(reason="operation")
                 config.add_device(address, protocol)
-                await self.daemon.resume()
+                await self.daemon.resume(reason="operation")
             except Exception as e:
                 logger.error(f"Connect failed: {errstr(e)}")
-                await self.daemon.resume()
+                await self.daemon.resume(reason="operation")
 
     # ---- System suspend (powerd) ----
 
@@ -237,8 +237,16 @@ class DaemonController:
                 return
             logger.info(f"System suspend ({event}): powering BT off")
             self._suspended_by_system = True
-            await self.daemon.suspend()
+            if self.daemon._power_resume_task and not self.daemon._power_resume_task.done():
+                self.daemon._power_resume_task.cancel()
+            await self.daemon.suspend(reason="power")
             chip().power_off()
+            self.daemon._power_resume_task = asyncio.create_task(
+                self.daemon._delayed_power_resume(
+                    config.power_resume_max_delay,
+                    "power-watchdog",
+                )
+            )
 
     def on_system_resume(self, event):
         """From power monitor thread: re-warm BT after wake."""
@@ -252,7 +260,11 @@ class DaemonController:
             if not self.daemon._suspended:
                 return
             logger.info(f"System resume ({event}): restarting BT")
-            await self.daemon.resume()
+            if self.daemon._power_resume_task and not self.daemon._power_resume_task.done():
+                self.daemon._power_resume_task.cancel()
+            self.daemon._power_resume_task = asyncio.create_task(
+                self.daemon._delayed_power_resume(config.power_resume_delay, "power")
+            )
 
     # ---- Remove ----
 
@@ -286,7 +298,7 @@ class DaemonController:
         async with self._op_lock:
             try:
                 if suspend:
-                    await self.daemon.suspend()
+                    await self.daemon.suspend(reason="manual")
                     chip().power_off()
                 else:
                     await self.daemon.disconnect()

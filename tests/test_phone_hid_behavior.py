@@ -172,6 +172,7 @@ install_bumble_stubs()
 
 from config import Protocol, config  # noqa: E402
 from controller import DaemonController  # noqa: E402
+from daemon import HIDDaemon  # noqa: E402
 from host import DeviceConfig, DeviceSession, HIDHost  # noqa: E402
 from scanner import BLE_APPEARANCE_CATEGORY_PHONE  # noqa: E402
 
@@ -348,6 +349,90 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self.assertEqual([], host.classic_devices)
         self.assertIn(Protocol.BLE, host.sessions)
         self.assertFalse(ble.uhid_device.destroyed)
+
+    def test_all_backed_off_classic_devices_returns_next_delay(self):
+        host = self.make_host()
+        host._classic_flap_until[self.ADDR] = time.monotonic() + 120.0
+
+        delay = host._classic_backoff_delay_for_all([self.ADDR])
+
+        self.assertGreater(delay, 0.0)
+        self.assertLessEqual(delay, 120.0)
+
+    def test_one_ready_classic_device_keeps_page_scan_enabled(self):
+        host = self.make_host()
+        host._classic_flap_until[self.ADDR] = time.monotonic() + 120.0
+
+        self.assertEqual(
+            0.0,
+            host._classic_backoff_delay_for_all([
+                self.ADDR,
+                "AA:BB:CC:DD:EE:FF",
+            ]),
+        )
+
+
+class PowerLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_going_to_screensaver_suspends_for_power(self):
+        daemon = HIDDaemon()
+
+        await daemon.handle_power_event("goingToScreenSaver")
+
+        self.assertTrue(daemon._suspended)
+        self.assertEqual("power", daemon._suspend_reason)
+        daemon._power_resume_task.cancel()
+        await asyncio.gather(daemon._power_resume_task, return_exceptions=True)
+
+    async def test_operation_resume_is_deferred_during_power_recovery(self):
+        daemon = HIDDaemon()
+        daemon._suspended = True
+        daemon._suspend_reason = "operation"
+        daemon._power_blocked = True
+
+        await daemon.resume(reason="operation")
+
+        self.assertTrue(daemon._suspended)
+        self.assertTrue(daemon._resume_after_power)
+        self.assertEqual("operation", daemon._resume_after_power_reason)
+
+        await daemon.resume(reason="power")
+
+        self.assertFalse(daemon._suspended)
+        self.assertFalse(daemon._resume_after_power)
+
+    async def test_power_resume_does_not_override_manual_suspend(self):
+        daemon = HIDDaemon()
+        daemon._suspended = True
+        daemon._suspend_reason = "manual"
+        daemon._power_blocked = True
+
+        await daemon.resume(reason="power")
+
+        self.assertTrue(daemon._suspended)
+        self.assertFalse(daemon._resume_after_power)
+
+    async def test_power_watchdog_resumes_after_missed_wake_event(self):
+        daemon = HIDDaemon()
+        daemon._suspended = True
+        daemon._suspend_reason = "power"
+        daemon._power_blocked = True
+
+        await daemon.resume(reason="power-watchdog")
+
+        self.assertFalse(daemon._suspended)
+        self.assertFalse(daemon._power_blocked)
+
+    async def test_power_watchdog_does_not_override_manual_suspend(self):
+        daemon = HIDDaemon()
+        daemon._suspended = True
+        daemon._suspend_reason = "manual"
+        daemon._power_blocked = True
+
+        await daemon.resume(reason="power-watchdog")
+
+        self.assertTrue(daemon._suspended)
+        self.assertFalse(daemon._power_blocked)
+
 
 if __name__ == "__main__":
     unittest.main()

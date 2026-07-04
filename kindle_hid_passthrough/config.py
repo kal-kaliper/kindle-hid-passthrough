@@ -121,6 +121,10 @@ class Config:
             'classic', 'require_live_descriptor', True)
         self.classic_serialize_keyboard_reports = self._getbool(
             'classic', 'serialize_keyboard_reports', True)
+        self.power_monitor_enabled = self._getbool('power', 'monitor_enabled', True)
+        self.power_startup_delay = float(self._get('power', 'startup_delay', '8.0'))
+        self.power_resume_delay = float(self._get('power', 'resume_delay', '20.0'))
+        self.power_resume_max_delay = float(self._get('power', 'resume_max_delay', '90.0'))
 
         # Device identity
         self.device_name = self._get('device', 'name', 'Kindle-HID')

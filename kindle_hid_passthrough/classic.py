@@ -48,11 +48,7 @@ class ClassicMixin:
         classic_hid_host.on(BumbleHIDHost.EVENT_VIRTUAL_CABLE_UNPLUG, self._on_virtual_cable_unplug)
         log.info(f"[Classic] HID Host ready (PSM 0x{HID_CONTROL_PSM:04X}, 0x{HID_INTERRUPT_PSM:04X})")
 
-        log.info("[Classic] Enabling Page Scan...")
-        await self.device.host.send_command(
-            HCI_Write_Scan_Enable_Command(scan_enable=0x02),
-            check_result=True
-        )
+        await self._set_classic_page_scan(True)
 
         async def on_classic_connection(connection):
             if self._is_protocol_connected(Protocol.CLASSIC):
@@ -257,7 +253,21 @@ class ClassicMixin:
                 await asyncio.sleep(0.5)
                 continue
 
-            attempt += 1
+            all_backoff_delay = self._classic_backoff_delay_for_all(addresses)
+            if all_backoff_delay > 0:
+                await self._set_classic_page_scan(False)
+                wait_time = min(
+                    all_backoff_delay,
+                    self.CLASSIC_BACKOFF_POLL_INTERVAL,
+                )
+                log.debug(
+                    "[Classic] All active devices are in flap backoff; "
+                    f"next dial in {all_backoff_delay:.0f}s"
+                )
+                await asyncio.sleep(wait_time)
+                continue
+
+            await self._set_classic_page_scan(True)
             for addr in addresses:
                 if self._is_protocol_connected(Protocol.CLASSIC):
                     return
@@ -280,6 +290,7 @@ class ClassicMixin:
                     await asyncio.sleep(1.0)
                     continue
 
+                attempt += 1
                 log.info(f"[Classic] Attempt {attempt}: {self._format_device(addr)}")
 
                 target = Address(addr, Address.PUBLIC_DEVICE_ADDRESS)
@@ -326,6 +337,27 @@ class ClassicMixin:
 
             if not self._is_protocol_connected(Protocol.CLASSIC):
                 await asyncio.sleep(self.ACTIVE_RETRY_INTERVAL)
+
+    def _classic_backoff_delay_for_all(self, addresses: List[str]) -> float:
+        delays = []
+        for addr in addresses:
+            delay = self._classic_dial_delay(addr)
+            if delay <= 0:
+                return 0.0
+            delays.append(delay)
+        return min(delays) if delays else 0.0
+
+    async def _set_classic_page_scan(self, enabled: bool):
+        if self._classic_page_scan_enabled == enabled:
+            return
+        scan_enable = 0x02 if enabled else 0x00
+        action = "Enabling" if enabled else "Disabling"
+        log.info(f"[Classic] {action} Page Scan...")
+        await self.device.host.send_command(
+            HCI_Write_Scan_Enable_Command(scan_enable=scan_enable),
+            check_result=True
+        )
+        self._classic_page_scan_enabled = enabled
 
     def _classic_set_report_protocol(self):
         """Send HIDP SET_PROTOCOL(Report) on the control channel."""

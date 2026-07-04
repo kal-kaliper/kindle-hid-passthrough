@@ -57,6 +57,7 @@ class HIDHost(ClassicMixin, BLEMixin):
 
     ACTIVE_DELAY = 2.0
     ACTIVE_RETRY_INTERVAL = 5.0
+    CLASSIC_BACKOFF_POLL_INTERVAL = 30.0
     ACTIVE_CONNECT_TIMEOUT = 10
     CLASSIC_AUTH_RETRY_DELAY = 8.0
     CLASSIC_AUTH_RETRY_DELAY_WITH_PENDING_BLE = 20.0
@@ -105,6 +106,7 @@ class HIDHost(ClassicMixin, BLEMixin):
         self._classic_retry_not_before = 0.0
         self._classic_flap_counts: dict[str, int] = {}
         self._classic_flap_until: dict[str, float] = {}
+        self._classic_page_scan_enabled = False
         self.last_pair_error = None
         self._radio_lock = None
 
