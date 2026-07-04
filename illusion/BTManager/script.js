@@ -178,7 +178,7 @@ var BTManager = (function() {
             var running = data.daemon_running || data.scanning || data.pairing;
             setToggleUI(running);
 
-            renderDeviceLists(data.devices, data.connected_device || null);
+            renderDeviceLists(data.devices, connectedAddressMap(data));
 
             getEl("hidWarning").style.display =
                 (data.connected_device && data.hid_ready === false) ? "block" : "none";
@@ -193,15 +193,42 @@ var BTManager = (function() {
 
     // ---- Device Lists (3-tier) ----
 
-    function renderDeviceLists(devices, connectedAddr) {
+    function connectedAddressMap(status) {
+        var map = {};
+        if (status && status.connections) {
+            for (var i = 0; i < status.connections.length; i++) {
+                var conn = status.connections[i];
+                if (conn.address) map[conn.address.toUpperCase()] = conn;
+            }
+        }
+        if (status && status.connected_device) {
+            map[status.connected_device.toUpperCase()] = {
+                address: status.connected_device,
+                protocol: status.connected_protocol,
+                name: status.connected_name,
+                uhid_name: status.uhid_name,
+                input_paths: status.input_paths,
+                descriptor_size: status.descriptor_size
+            };
+        }
+        return map;
+    }
+
+    function findConnection(addr) {
+        if (!lastStatus || !addr) return null;
+        var map = connectedAddressMap(lastStatus);
+        return map[addr.toUpperCase()] || null;
+    }
+
+    function renderDeviceLists(devices, connectedAddrs) {
         var connected = [];
         var paired = [];
 
         if (devices) {
             for (var i = 0; i < devices.length; i++) {
                 var dev = devices[i];
-                var isConn = connectedAddr && dev.address &&
-                    dev.address.toUpperCase() === connectedAddr.toUpperCase();
+                var isConn = dev.address && connectedAddrs &&
+                    connectedAddrs[dev.address.toUpperCase()];
                 if (isConn) {
                     connected.push(dev);
                 } else {
@@ -273,9 +300,11 @@ var BTManager = (function() {
         hidWarn.style.display = "none";
 
         if (isConnected && lastStatus) {
-            var uhid = lastStatus.uhid_name;
-            var inputs = lastStatus.input_paths;
-            if (lastStatus.hid_ready === false) {
+            var conn = findConnection(addr);
+            var uhid = conn ? conn.uhid_name : lastStatus.uhid_name;
+            var inputs = conn ? conn.input_paths : lastStatus.input_paths;
+            var hidReady = conn && conn.hid_ready !== undefined ? conn.hid_ready : lastStatus.hid_ready;
+            if (hidReady === false) {
                 hidWarn.style.display = "block";
                 getEl("detailUhid").innerHTML = "--";
                 getEl("detailInputPaths").innerHTML = "--";
