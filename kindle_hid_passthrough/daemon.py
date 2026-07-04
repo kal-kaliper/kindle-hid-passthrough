@@ -91,9 +91,11 @@ class HIDDaemon:
 
     async def disconnect(self):
         """Drop the active connection; daemon keeps running and will reconnect."""
-        if self.host and self.host._is_connection_alive():
-            await self.host.connection.disconnect()
+        if self.host:
+            disconnected = await self.host.disconnect_all()
         else:
+            disconnected = False
+        if not disconnected:
             logger.info("No active connection to disconnect")
         if self._host_task and not self._host_task.done():
             self._host_task.cancel()
