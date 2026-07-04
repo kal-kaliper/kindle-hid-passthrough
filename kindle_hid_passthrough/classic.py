@@ -241,6 +241,11 @@ class ClassicMixin:
 
         attempt = 0
         while not self._is_protocol_connected(Protocol.CLASSIC):
+            retry_delay = self._protocol_retry_delay(Protocol.CLASSIC)
+            if retry_delay > 0:
+                await asyncio.sleep(min(retry_delay, 1.0))
+                continue
+
             if self._is_protocol_connecting(Protocol.CLASSIC):
                 await asyncio.sleep(0.5)
                 continue
