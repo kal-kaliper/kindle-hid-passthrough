@@ -15,6 +15,9 @@ from transport import create_bumble_device
 
 __all__ = ['Scanner', 'DiscoveredDevice']
 
+BLE_APPEARANCE_CATEGORY_PHONE = 0x01
+BLE_APPEARANCE_CATEGORY_HID = 0x0F
+
 
 @dataclass
 class DiscoveredDevice:
@@ -157,7 +160,13 @@ class Scanner:
 
                     if not is_hid:
                         appearance = advertisement.data.get(AdvertisingData.APPEARANCE)
-                        if appearance is not None and (int(appearance) >> 6) == 0x0F:
+                        appearance_category = (
+                            int(appearance) >> 6 if appearance is not None else None
+                        )
+                        if appearance_category in (
+                            BLE_APPEARANCE_CATEGORY_HID,
+                            BLE_APPEARANCE_CATEGORY_PHONE,
+                        ):
                             is_hid = True
                 except UnicodeDecodeError as e:
                     log.debug(f"Skipping malformed BLE advertisement from {addr_str}: {e}")
@@ -217,10 +226,10 @@ class Scanner:
             try:
                 _, major_class, _minor_class = DeviceClass.split_class_of_device(class_of_device)
                 major_class_name = DeviceClass.major_device_class_name(major_class)
-                is_hid = major_class_name == "Peripheral"
+                is_hid = major_class_name in ("Peripheral", "Phone")
             except Exception:
                 major_class = (class_of_device >> 8) & 0x1F
-                is_hid = (major_class == 0x05)  # Peripheral
+                is_hid = major_class in (0x02, 0x05)
                 major_class_name = f"0x{major_class:02X}"
 
             # Log ALL devices found, not just HID

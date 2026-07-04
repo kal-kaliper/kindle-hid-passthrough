@@ -29,7 +29,6 @@ MAX_LOG_LINE_CHARS = 260
 
 
 def sanitize_log_line(line: str) -> str:
-    """Return a WebKit-safe single log line for the WAF debug screen."""
     line = ANSI_RE.sub('', line)
     line = CONTROL_RE.sub('', line)
     if len(line) > MAX_LOG_LINE_CHARS:
@@ -95,6 +94,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._handle_clear_cache()
             case '/scan':
                 self._handle_scan()
+            case '/scan-stop':
+                self._handle_scan_stop()
             case '/scan-status':
                 self._handle_scan_status()
             case '/pair':
@@ -170,6 +171,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         controller.request_scan()
         self._send_json({"ok": True, "message": "Scan started"})
+
+    def _handle_scan_stop(self):
+        self._controller.request_scan_stop()
+        self._send_json({"ok": True, "message": "Scan stop requested"})
 
     def _handle_scan_status(self):
         controller = self._controller
@@ -278,4 +283,3 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "lines": short})
         except OSError as e:
             self._send_json({"ok": False, "error": str(e)})
-

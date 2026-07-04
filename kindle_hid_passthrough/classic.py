@@ -226,7 +226,6 @@ class ClassicMixin:
         return False
 
     def _has_live_classic_connection(self, addr: str) -> bool:
-        """True if bumble already holds a live Classic link to addr."""
         norm = normalize_addr(addr)
         connections = getattr(self.device, 'connections', None) or {}
         for conn in list(connections.values()):
@@ -264,6 +263,14 @@ class ClassicMixin:
                     return
                 if self._is_protocol_connecting(Protocol.CLASSIC):
                     break
+
+                flap_delay = self._classic_dial_delay(addr)
+                if flap_delay > 0:
+                    log.debug(
+                        f"[Classic] {self._format_device(addr)} in flap "
+                        f"backoff for {flap_delay:.0f}s; skipping dial"
+                    )
+                    continue
 
                 if self._has_live_classic_connection(addr):
                     log.info(
@@ -342,7 +349,19 @@ class ClassicMixin:
         if not self.hid_host.l2cap_intr_channel:
             raise InvalidStateError("HID interrupt channel not connected")
 
-        if not self._load_cached_descriptor():
+        if config.classic_require_live_descriptor:
+            self.report_map = None
+            live = await self._query_classic_sdp()
+            if not live and self._load_cached_descriptor():
+                log.warning("[Classic] Live SDP descriptor unavailable; using cached descriptor")
+            elif not live:
+                log.warning("[Classic] No live HID descriptor; dropping link")
+                try:
+                    await self.connection.disconnect()
+                except Exception:
+                    pass
+                return
+        elif not self._load_cached_descriptor():
             await self._query_classic_sdp()
 
         self._finalize_classic_hid()
@@ -496,7 +515,7 @@ class ClassicMixin:
     async def _query_classic_sdp(self, address: str = None):
         """Query SDP for HID descriptor and cache it."""
         if not self.connection:
-            return
+            return None
 
         address = address or self.current_device_address
 
@@ -505,13 +524,19 @@ class ClassicMixin:
             sdp_client = SDPClient(self.connection)
             await asyncio.wait_for(sdp_client.connect(), timeout=5.0)
 
-            result = await asyncio.wait_for(
-                sdp_client.search_attributes(
-                    [BT_HUMAN_INTERFACE_DEVICE_SERVICE],
-                    [0x0100, 0x0206]
-                ),
-                timeout=10.0
-            )
+            try:
+                result = await asyncio.wait_for(
+                    sdp_client.search_attributes(
+                        [BT_HUMAN_INTERFACE_DEVICE_SERVICE],
+                        [0x0100, 0x0206]
+                    ),
+                    timeout=10.0
+                )
+            finally:
+                try:
+                    await sdp_client.disconnect()
+                except Exception:
+                    pass
 
             if result:
                 for record in result:
@@ -527,16 +552,17 @@ class ClassicMixin:
                             except Exception:
                                 pass
 
-            await sdp_client.disconnect()
-
             if self.report_map:
                 self.device_cache.save(address, {
                     'report_map': self.report_map.hex(),
                     'device_name': self.device_name or 'Unknown'
                 })
                 log.success(f"[Classic] Cached descriptor ({len(self.report_map)} bytes)")
+                return True
+            return False
         except Exception as e:
             log.warning(f"[Classic] SDP query failed: {e}")
+            return None
 
     async def _continue_classic_after_pairing(self):
         """Continue Classic connection after pairing."""

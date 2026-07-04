@@ -64,14 +64,14 @@ class HIDDaemon:
 
         logger.info("Daemon suspended")
 
-    async def scan(self, duration=10.0, on_device_found=None):
+    async def scan(self, duration=10.0, on_device_found=None, stop_event=None):
         """Scan for BT devices. Must be called while suspended."""
         scanner = Scanner()
         if on_device_found:
             scanner.on_device_found = on_device_found
         try:
             await scanner.start()
-            await scanner.scan(duration=duration)
+            await scanner.scan(duration=duration, stop_event=stop_event)
         finally:
             await scanner.cleanup()
 

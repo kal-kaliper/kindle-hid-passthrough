@@ -3,7 +3,7 @@
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 from bumble.core import InvalidStateError
@@ -42,6 +42,8 @@ class DeviceSession:
     uhid_device: Optional[UHIDDevice] = None
     disconnection_event: Optional[asyncio.Event] = None
     last_report: Optional[bytes] = None
+    keyboard_last_keys: tuple = field(default_factory=tuple)
+    established_at: float = 0.0
 
 
 class HIDHost(ClassicMixin, BLEMixin):
@@ -58,6 +60,10 @@ class HIDHost(ClassicMixin, BLEMixin):
     ACTIVE_CONNECT_TIMEOUT = 10
     CLASSIC_AUTH_RETRY_DELAY = 8.0
     CLASSIC_AUTH_RETRY_DELAY_WITH_PENDING_BLE = 20.0
+    CLASSIC_FLAP_WINDOW = 30.0
+    CLASSIC_FLAP_BACKOFF_BASE = 20.0
+    CLASSIC_FLAP_BACKOFF_MAX = 300.0
+    CLASSIC_REMOTE_DISCONNECT_REASONS = frozenset({0x13, 0x14, 0x15})
 
     def __init__(self, transport_spec: str = None):
         self.transport_spec = transport_spec or config.transport
@@ -97,6 +103,8 @@ class HIDHost(ClassicMixin, BLEMixin):
         self._auth_failure_address = None
         self._virtual_cable_unplug_address = None
         self._classic_retry_not_before = 0.0
+        self._classic_flap_counts: dict[str, int] = {}
+        self._classic_flap_until: dict[str, float] = {}
         self.last_pair_error = None
         self._radio_lock = None
 
@@ -392,6 +400,8 @@ class HIDHost(ClassicMixin, BLEMixin):
                 session.uhid_device.destroy()
             except Exception:
                 pass
+        if session and protocol == Protocol.CLASSIC:
+            self._update_classic_flap_backoff(session, reason)
 
         if protocol in self._protocol_disconnection_events:
             self._protocol_disconnection_events[protocol].set()
@@ -435,23 +445,69 @@ class HIDHost(ClassicMixin, BLEMixin):
     def _forward_report_for_protocol(self, protocol: Protocol, data: bytes):
         session = self.sessions.get(protocol)
         if session:
-            last_report = session.last_report
-            uhid_device = session.uhid_device
-        else:
-            last_report = self._last_report
-            uhid_device = self.uhid_device
+            self._forward_report_for_session(session, data)
+            return
 
-        if data != last_report:
+        if data != self._last_report:
             log.debug(f"Report: {data.hex()}")
-            if session:
-                session.last_report = data
-            else:
-                self._last_report = data
-        if uhid_device:
+            self._last_report = data
+        if self.uhid_device:
             try:
-                uhid_device.send_input(data)
+                self.uhid_device.send_input(data)
             except Exception as e:
                 log.warning(f"UHID send failed: {e}")
+
+    def _forward_report_for_session(self, session: DeviceSession, data: bytes):
+        for report in self._reports_for_session(session, data):
+            self._send_report_for_session(session, report)
+
+    def _send_report_for_session(self, session: DeviceSession, data: bytes):
+        if data != session.last_report:
+            log.debug(f"Report: {data.hex()}")
+            session.last_report = data
+        if session.uhid_device:
+            try:
+                session.uhid_device.send_input(data)
+            except Exception as e:
+                log.warning(f"UHID send failed: {e}")
+
+    def _reports_for_session(self, session: DeviceSession, data: bytes):
+        if (
+            session.protocol != Protocol.CLASSIC
+            or not config.classic_serialize_keyboard_reports
+        ):
+            return (data,)
+
+        parsed = self._parse_classic_keyboard_report(data)
+        if not parsed:
+            session.keyboard_last_keys = ()
+            return (data,)
+
+        modifier, keys = parsed
+        previous = set(session.keyboard_last_keys)
+        current = tuple(key for key in keys if key)
+        session.keyboard_last_keys = current
+
+        release = self._make_classic_keyboard_report(0, ())
+        if not current:
+            return (release,)
+
+        reports = []
+        for key in current:
+            if key not in previous:
+                reports.append(self._make_classic_keyboard_report(modifier, (key,)))
+                reports.append(release)
+        return tuple(reports)
+
+    def _parse_classic_keyboard_report(self, data: bytes):
+        if len(data) != 8 or data[0] != 1:
+            return None
+        return data[1], tuple(data[3:8])
+
+    def _make_classic_keyboard_report(self, modifier: int, keys):
+        slots = list(keys[:5])
+        slots.extend([0] * (5 - len(slots)))
+        return bytes([1, modifier, 0, *slots])
 
     def _load_cached_descriptor(self, address: str = None) -> bool:
         """Load report descriptor and device name from cache. Returns True if found."""
@@ -504,6 +560,7 @@ class HIDHost(ClassicMixin, BLEMixin):
             uhid_device=self.uhid_device,
             disconnection_event=event,
         )
+        session.established_at = time.monotonic()
         self.sessions[protocol] = session
         if not self._connection_future.done():
             self._connection_future.set_result(session)
@@ -567,7 +624,6 @@ class HIDHost(ClassicMixin, BLEMixin):
         task.add_done_callback(finish)
 
     def _is_protocol_connecting(self, protocol: Protocol) -> bool:
-        """Check if a protocol has an unfinalized live connection."""
         return (
             self.connected_protocol == protocol
             and protocol not in self.sessions
@@ -578,6 +634,41 @@ class HIDHost(ClassicMixin, BLEMixin):
         if protocol == Protocol.CLASSIC:
             return max(0.0, self._classic_retry_not_before - time.monotonic())
         return 0.0
+
+    def _update_classic_flap_backoff(self, session: DeviceSession, reason):
+        addr = normalize_addr(session.address)
+        duration = (
+            time.monotonic() - session.established_at
+            if session.established_at else 0.0
+        )
+        if session.last_report is not None or duration >= self.CLASSIC_FLAP_WINDOW:
+            if self._classic_flap_counts.pop(addr, None) is not None:
+                self._classic_flap_until.pop(addr, None)
+                log.info(
+                    f"[Classic] {self._format_device(addr)} session healthy; "
+                    "clearing flap backoff"
+                )
+            return
+
+        if reason not in self.CLASSIC_REMOTE_DISCONNECT_REASONS:
+            return
+
+        count = self._classic_flap_counts.get(addr, 0) + 1
+        self._classic_flap_counts[addr] = count
+        delay = min(
+            self.CLASSIC_FLAP_BACKOFF_BASE * (2 ** (count - 1)),
+            self.CLASSIC_FLAP_BACKOFF_MAX,
+        )
+        self._classic_flap_until[addr] = time.monotonic() + delay
+        log.warning(
+            f"[Classic] {self._format_device(addr)} dropped by remote after "
+            f"{duration:.0f}s without input ({count} in a row); "
+            f"deferring dial for {delay:.0f}s"
+        )
+
+    def _classic_dial_delay(self, addr: str) -> float:
+        until = self._classic_flap_until.get(normalize_addr(addr), 0.0)
+        return max(0.0, until - time.monotonic())
 
     def _is_raw_connection_alive(self, connection) -> bool:
         if connection is None:

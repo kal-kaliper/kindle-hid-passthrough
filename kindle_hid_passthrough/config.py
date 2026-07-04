@@ -117,6 +117,10 @@ class Config:
         # Bluetooth hardware setup
         self.bt_module_patterns = self._get_list('bluetooth', 'module_patterns', None)
         self.bt_settle_time = float(self._get('bluetooth', 'settle_time', '0.5'))
+        self.classic_require_live_descriptor = self._getbool(
+            'classic', 'require_live_descriptor', True)
+        self.classic_serialize_keyboard_reports = self._getbool(
+            'classic', 'serialize_keyboard_reports', True)
 
         # Device identity
         self.device_name = self._get('device', 'name', 'Kindle-HID')
@@ -192,6 +196,12 @@ class Config:
     def _getint(self, section: str, key: str, default: int) -> int:
         try:
             return self._parser.getint(section, key)
+        except (configparser.NoSectionError, configparser.NoOptionError, ValueError):
+            return default
+
+    def _getbool(self, section: str, key: str, default: bool) -> bool:
+        try:
+            return self._parser.getboolean(section, key)
         except (configparser.NoSectionError, configparser.NoOptionError, ValueError):
             return default
 
