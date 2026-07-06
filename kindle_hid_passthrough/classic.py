@@ -132,30 +132,21 @@ class ClassicMixin:
 
         hid_host.on_device_connection(connection)
 
-        auth_event = asyncio.Event()
+        if not getattr(connection, 'is_encrypted', False):
+            log.info("[Classic] Authenticating...")
+            try:
+                await asyncio.wait_for(connection.authenticate(), timeout=8.0)
+                log.success("[Classic] Authentication complete")
+            except Exception as e:
+                log.warning(f"[Classic] Authentication: {e}")
 
-        def on_auth():
-            log.success("[Classic] Device authenticated us")
-            auth_event.set()
-
-        def on_auth_fail(error):
-            log.warning(f"[Classic] Auth failed: {error}")
-            auth_event.set()
-
-        connection.on('connection_authentication', on_auth)
-        connection.on('connection_authentication_failure', on_auth_fail)
-
-        log.info("[Classic] Waiting for device authentication...")
-        try:
-            await asyncio.wait_for(auth_event.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            log.warning("[Classic] No auth request from device, continuing...")
-
-        try:
-            connection.remove_listener('connection_authentication', on_auth)
-            connection.remove_listener('connection_authentication_failure', on_auth_fail)
-        except Exception:
-            pass
+        if not getattr(connection, 'is_encrypted', False):
+            log.info("[Classic] Requesting encryption...")
+            try:
+                await asyncio.wait_for(connection.encrypt(enable=True), timeout=10.0)
+                log.success("[Classic] Link encrypted")
+            except Exception as e:
+                log.warning(f"[Classic] Encryption: {e}")
 
         if self._protocol_event_is_set(Protocol.CLASSIC):
             log.warning("[Classic] Connection lost during authentication")
