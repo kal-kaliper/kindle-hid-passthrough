@@ -10,6 +10,7 @@ Port 8321 on localhost.
 
 import json
 import os
+import re
 import socket
 import subprocess
 import threading
@@ -22,6 +23,18 @@ from config import Protocol, config, get_version, normalize_addr
 __all__ = ['APIServer', 'RequestHandler', 'PORT']
 
 PORT = 8321
+ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
+CONTROL_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+MAX_LOG_LINE_CHARS = 260
+
+
+def sanitize_log_line(line: str) -> str:
+    """Return a WebKit-safe single log line for the WAF debug screen."""
+    line = ANSI_RE.sub('', line)
+    line = CONTROL_RE.sub('', line)
+    if len(line) > MAX_LOG_LINE_CHARS:
+        line = line[:MAX_LOG_LINE_CHARS - 3] + '...'
+    return line
 
 
 class APIServer(ThreadingMixIn, HTTPServer):
@@ -228,7 +241,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         num_lines = 50
         if lines_str:
             try:
-                num_lines = max(1, min(int(lines_str), 200))
+                num_lines = max(1, min(int(lines_str), 80))
             except ValueError:
                 pass
 
@@ -240,7 +253,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             with open(log_file, 'rb') as f:
                 f.seek(0, 2)
                 size = f.tell()
-                chunk_size = min(size, num_lines * 200)
+                chunk_size = min(size, num_lines * 400)
                 f.seek(max(0, size - chunk_size))
                 data = f.read().decode('utf-8', errors='replace')
 
@@ -261,7 +274,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 line = line.replace(' WARNING ', ' W ')
                 line = line.replace(' ERROR ', ' E ')
                 line = line.replace(' DEBUG ', ' D ')
-                short.append(line)
+                short.append(sanitize_log_line(line))
             self._send_json({"ok": True, "lines": short})
         except OSError as e:
             self._send_json({"ok": False, "error": str(e)})
