@@ -374,8 +374,7 @@ class HIDHost(ClassicMixin, BLEMixin):
         log.warning(f"[{proto}] Device disconnected: {addr} (reason={reason})")
 
         if reason == 5 and address and proto == "CLASSIC":
-            log.info("[Classic] Authentication failure - will clear stale key and retry")
-            self._auth_failure_address = address
+            log.info("[Classic] Authentication failure; keeping bond and retrying")
 
         session = self.sessions.pop(protocol, None) if protocol else None
         if session and session.uhid_device:
@@ -491,6 +490,11 @@ class HIDHost(ClassicMixin, BLEMixin):
         event = self._protocol_disconnection_events.get(protocol)
         return bool(event and event.is_set())
 
+    def _clear_protocol_event(self, protocol: Protocol):
+        event = self._protocol_disconnection_events.get(protocol)
+        if event:
+            event.clear()
+
     def _is_connection_alive(self) -> bool:
         """Check if the connection is still alive and usable."""
         if self._disconnection_event and self._disconnection_event.is_set():
@@ -539,6 +543,14 @@ class HIDHost(ClassicMixin, BLEMixin):
                 log.warning(f"[{protocol.value.upper()}] Restore failed: {e}")
 
         task.add_done_callback(finish)
+
+    def _is_protocol_connecting(self, protocol: Protocol) -> bool:
+        """Check if a protocol has an unfinalized live connection."""
+        return (
+            self.connected_protocol == protocol
+            and protocol not in self.sessions
+            and self._is_raw_connection_alive(self.connection)
+        )
 
     def _is_raw_connection_alive(self, connection) -> bool:
         if connection is None:
