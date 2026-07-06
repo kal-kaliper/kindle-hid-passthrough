@@ -156,7 +156,11 @@ class DaemonController:
             "name": device.name,
             "protocol": device.protocol.value,
             "rssi": device.rssi,
+            "is_phone": device.is_phone,
         })
+        host = getattr(self.daemon, "host", None)
+        if host is not None:
+            host.device_cache.set_class(device.address, device.is_phone)
 
     async def _do_scan(self):
         async with self._op_lock:

@@ -228,8 +228,17 @@ HIDPassthrough._kb_pending = {}
 HIDPassthrough._kb_count = 0
 HIDPassthrough._kb_original_caps = nil
 
-function HIDPassthrough:_isClassicKeyboardConnection(conn)
-    return type(conn) == "table" and conn.protocol == "classic"
+function HIDPassthrough:_isPhoneKeyboardConnection(conn)
+    if type(conn) ~= "table" or conn.protocol ~= "classic" then
+        return false
+    end
+    -- The daemon reports is_phone when it captured the device class at scan
+    -- time. When it's unknown (e.g. a device paired before class capture),
+    -- fall back to the prior behaviour and accept any classic keyboard.
+    if conn.is_phone ~= nil then
+        return conn.is_phone == true
+    end
+    return true
 end
 
 function HIDPassthrough:_statusConnectionsByInputPath()
@@ -252,7 +261,7 @@ function HIDPassthrough:_statusConnectionsByInputPath()
 end
 
 function HIDPassthrough:_attachStableSecondsForPath(path, conn)
-    if conn and self:_isClassicKeyboardConnection(conn) then
+    if conn and self:_isPhoneKeyboardConnection(conn) then
         local reports = tonumber(conn.source_report_count) or 0
         if reports > 0 then
             return 0
@@ -483,8 +492,8 @@ function HIDPassthrough:_reconcileKeyboards()
                 logger.dbg("HIDPassthrough: waiting to attach", path,
                     "stable_for", string.format("%.1f", now - first_seen),
                     "required", stable_seconds)
-            elseif conn and self:_isClassicKeyboardConnection(conn) then
-                logger.info("HIDPassthrough: classic keyboard accepted", path,
+            elseif conn and self:_isPhoneKeyboardConnection(conn) then
+                logger.info("HIDPassthrough: phone keyboard accepted", path,
                     "source_reports", tostring(conn.source_report_count or 0),
                     "stable_for", string.format("%.1f", now - first_seen))
             end

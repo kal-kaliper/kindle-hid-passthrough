@@ -29,6 +29,7 @@ class DiscoveredDevice:
     name: str
     protocol: Protocol
     rssi: int = -100
+    is_phone: bool = False
 
     def __str__(self) -> str:
         proto_tag = "[BLE]" if self.protocol == Protocol.BLE else "[Classic]"
@@ -148,6 +149,7 @@ class Scanner:
                 return
 
             is_hid = False
+            is_phone = False
             if hasattr(advertisement, 'data') and advertisement.data:
                 try:
                     services = advertisement.data.get(
@@ -168,6 +170,9 @@ class Scanner:
                         )
                         if appearance_category == BLE_APPEARANCE_CATEGORY_HID:
                             is_hid = True
+                        elif appearance_category == BLE_APPEARANCE_CATEGORY_PHONE:
+                            is_hid = True
+                            is_phone = True
                 except UnicodeDecodeError as e:
                     log.debug(f"Skipping malformed BLE advertisement from {addr_str}: {e}")
                     return
@@ -191,7 +196,8 @@ class Scanner:
                 address=addr_str,
                 name=name,
                 protocol=Protocol.BLE,
-                rssi=advertisement.rssi or -100
+                rssi=advertisement.rssi or -100,
+                is_phone=is_phone,
             )
             devices_found.append(device)
             log.info(f"  Found: {device}")
@@ -251,11 +257,16 @@ class Scanner:
                     except Exception:
                         pass
 
+                is_phone = (
+                    major_class_name == "Phone"
+                    or major_class == CLASSIC_MAJOR_DEVICE_CLASS_PHONE
+                )
                 device = DiscoveredDevice(
                     address=addr_str,
                     name=name,
                     protocol=Protocol.CLASSIC,
-                    rssi=rssi or -100
+                    rssi=rssi or -100,
+                    is_phone=is_phone,
                 )
                 devices_found.append(device)
                 log.info(f"  Found: {device}")

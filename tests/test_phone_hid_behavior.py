@@ -481,6 +481,37 @@ class PhoneHidBehaviorTests(unittest.TestCase):
             session.uhid_device.inputs,
         )
 
+    def test_device_cache_records_and_reads_is_phone(self):
+        host = self.make_host()
+        self.assertIsNone(host.device_cache.get_is_phone(self.ADDR))
+        host.device_cache.set_class(self.ADDR, True)
+        self.assertTrue(host.device_cache.get_is_phone(self.ADDR))
+        host.device_cache.set_class(self.ADDR, False)
+        self.assertFalse(host.device_cache.get_is_phone(self.ADDR))
+
+    def test_descriptor_save_preserves_is_phone(self):
+        host = self.make_host()
+        host.device_cache.set_class(self.ADDR, True)
+        # A later descriptor save (which carries no is_phone) must not clobber
+        # the recorded device class.
+        host.device_cache.save(self.ADDR, {
+            "report_map": "0501",
+            "device_name": "Phone",
+        })
+        self.assertTrue(host.device_cache.get_is_phone(self.ADDR))
+        cache = host.device_cache.load(self.ADDR)
+        self.assertEqual("0501", cache["report_map"])
+
+    def test_status_exposes_is_phone_only_when_known(self):
+        host = self.make_host()
+        session = self.make_session(Protocol.CLASSIC)
+        session.is_phone = True
+        self.assertTrue(host._session_state(session)["is_phone"])
+        session.is_phone = False
+        self.assertFalse(host._session_state(session)["is_phone"])
+        session.is_phone = None
+        self.assertNotIn("is_phone", host._session_state(session))
+
     def test_classic_keyboard_overlap_is_serialized_into_taps(self):
         host = self.make_host()
         session = self.make_session(Protocol.CLASSIC)

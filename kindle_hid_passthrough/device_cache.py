@@ -73,6 +73,11 @@ class DeviceCache:
             True if saved successfully, False otherwise
         """
         try:
+            if 'is_phone' not in cache_data:
+                existing = self._read_raw(address)
+                if 'is_phone' in existing:
+                    cache_data = {**cache_data, 'is_phone': existing['is_phone']}
+
             cache_path = self._get_cache_path(address)
             with open(cache_path, 'w') as f:
                 json.dump(cache_data, f, indent=2)
@@ -83,6 +88,35 @@ class DeviceCache:
         except Exception as e:
             logger.warning(f"Failed to save cache for {address}: {e}")
             return False
+
+    def _read_raw(self, address: str) -> Dict:
+        """Read the raw cache dict for a device (no report_map validation)."""
+        cache_path = self._get_cache_path(address)
+        if not os.path.exists(cache_path):
+            return {}
+        try:
+            with open(cache_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to read cache for {address}: {e}")
+            return {}
+
+    def set_class(self, address: str, is_phone: bool) -> bool:
+        """Record whether a device is a phone, merging into its cache entry.
+
+        Persisted at discovery time (from the inquiry/advertisement device
+        class), so reconnects — which never re-run inquiry — can still tell a
+        phone keyboard from a dedicated one.
+        """
+        data = self._read_raw(address)
+        if data.get('is_phone') == is_phone:
+            return True
+        data['is_phone'] = is_phone
+        return self.save(address, data)
+
+    def get_is_phone(self, address: str) -> Optional[bool]:
+        """Return cached is_phone for a device, or None if unknown."""
+        return self._read_raw(address).get('is_phone')
 
     def clear(self, address: Optional[str] = None) -> int:
         """Clear cache for specific device or all devices.
@@ -117,4 +151,3 @@ class DeviceCache:
                         logger.warning(f"Failed to clear {filename}: {e}")
             logger.info("Cleared all device caches")
         return count
-

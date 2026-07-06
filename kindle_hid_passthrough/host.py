@@ -39,6 +39,7 @@ class DeviceSession:
     hid_host: object = None
     device_name: Optional[str] = None
     report_map: Optional[bytes] = None
+    is_phone: Optional[bool] = None
     uhid_device: Optional[UHIDDevice] = None
     disconnection_event: Optional[asyncio.Event] = None
     last_report: Optional[bytes] = None
@@ -176,6 +177,8 @@ class HIDHost(ClassicMixin, BLEMixin):
                 state["input_paths"] = session.uhid_device.input_paths
         if session.report_map:
             state["descriptor_size"] = len(session.report_map)
+        if session.is_phone is not None:
+            state["is_phone"] = session.is_phone
         state["source_report_count"] = session.source_report_count
         state["uhid_report_count"] = session.report_count
         if config.diagnostics_include_reports:
@@ -732,6 +735,7 @@ class HIDHost(ClassicMixin, BLEMixin):
             hid_host=self.hid_host if protocol == Protocol.CLASSIC else None,
             device_name=self.device_name,
             report_map=self.report_map,
+            is_phone=self.device_cache.get_is_phone(self.current_device_address),
             uhid_device=self.uhid_device,
             disconnection_event=event,
             uhid_created_at=self._uhid_created_at or 0.0,
@@ -836,6 +840,7 @@ class HIDHost(ClassicMixin, BLEMixin):
             hid_host=self.hid_host,
             device_name=self.device_name,
             report_map=self.report_map,
+            is_phone=self.device_cache.get_is_phone(self.current_device_address),
             uhid_device=None,
             disconnection_event=event,
         )
