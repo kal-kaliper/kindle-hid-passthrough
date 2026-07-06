@@ -131,6 +131,10 @@ class Config:
         self.power_startup_delay = float(self._get('power', 'startup_delay', '8.0'))
         self.power_resume_delay = float(self._get('power', 'resume_delay', '20.0'))
         self.power_resume_max_delay = float(self._get('power', 'resume_max_delay', '90.0'))
+        self.diagnostics_include_reports = self._getbool(
+            'diagnostics', 'include_reports', False)
+        self.diagnostics_recent_report_count = self._getint(
+            'diagnostics', 'recent_report_count', 12)
 
         # Device identity
         self.device_name = self._get('device', 'name', 'Kindle-HID')

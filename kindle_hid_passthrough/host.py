@@ -49,6 +49,8 @@ class DeviceSession:
     report_count: int = 0
     last_source_report_hex: Optional[str] = None
     last_uhid_report_hex: Optional[str] = None
+    recent_source_reports: List[str] = field(default_factory=list)
+    recent_uhid_reports: List[str] = field(default_factory=list)
     classic_setup_ms: Optional[int] = None
     classic_channels_ms: Optional[int] = None
     classic_hid_ready_ms: Optional[int] = None
@@ -176,6 +178,11 @@ class HIDHost(ClassicMixin, BLEMixin):
             state["descriptor_size"] = len(session.report_map)
         state["source_report_count"] = session.source_report_count
         state["uhid_report_count"] = session.report_count
+        if config.diagnostics_include_reports:
+            state["last_source_report"] = session.last_source_report_hex
+            state["last_uhid_report"] = session.last_uhid_report_hex
+            state["recent_source_reports"] = list(session.recent_source_reports)
+            state["recent_uhid_reports"] = list(session.recent_uhid_reports)
         return state
 
     def _legacy_connection_state(self) -> dict:
@@ -437,13 +444,18 @@ class HIDHost(ClassicMixin, BLEMixin):
                 getattr(session.uhid_device, "input_paths", [])
                 if session.uhid_device else []
             )
+            report_detail = ""
+            if config.diagnostics_include_reports:
+                report_detail = (
+                    f"last_source={session.last_source_report_hex}, "
+                    f"last_uhid={session.last_uhid_report_hex}, "
+                )
             log.warning(
                 f"[{proto}] Device disconnected: {addr} (reason={reason}, "
                 f"session_age={session_age:.2f}s, uhid_age={uhid_age:.2f}s, "
                 f"source_reports={session.source_report_count}, "
                 f"uhid_reports={session.report_count}, "
-                f"last_source={session.last_source_report_hex}, "
-                f"last_uhid={session.last_uhid_report_hex}, "
+                f"{report_detail}"
                 f"classic_setup_ms={session.classic_setup_ms}, "
                 f"classic_channels_ms={session.classic_channels_ms}, "
                 f"classic_hid_ready_ms={session.classic_hid_ready_ms}, "
@@ -524,14 +536,18 @@ class HIDHost(ClassicMixin, BLEMixin):
             return
 
         if self.sessions and protocol is not None:
+            report_detail = (
+                f": {data.hex()}" if config.diagnostics_include_reports else ""
+            )
             log.warning(
                 f"[{protocol.value.upper()}] Dropping report without live "
-                f"session: {data.hex()}"
+                f"session{report_detail}"
             )
             return
 
         if data != self._last_report:
-            log.debug(f"Report: {data.hex()}")
+            if config.diagnostics_include_reports:
+                log.debug(f"Report: {data.hex()}")
             self._last_report = data
         if self.uhid_device:
             try:
@@ -543,6 +559,7 @@ class HIDHost(ClassicMixin, BLEMixin):
         session.source_report_count += 1
         source_hex = data.hex()
         session.last_source_report_hex = source_hex
+        self._append_recent_report(session.recent_source_reports, source_hex)
         reports = self._reports_for_session(session, data)
         paced = (
             session.protocol == Protocol.CLASSIC
@@ -560,14 +577,24 @@ class HIDHost(ClassicMixin, BLEMixin):
         session.report_count += 1
         uhid_hex = data.hex()
         session.last_uhid_report_hex = uhid_hex
+        self._append_recent_report(session.recent_uhid_reports, uhid_hex)
         if data != session.last_report:
-            log.debug(f"Report: {data.hex()}")
+            if config.diagnostics_include_reports:
+                log.debug(f"Report: {data.hex()}")
             session.last_report = data
         if session.uhid_device:
             try:
                 session.uhid_device.send_input(data)
             except Exception as e:
                 log.warning(f"UHID send failed: {e}")
+
+    def _append_recent_report(self, reports: List[str], report_hex: str):
+        reports.append(report_hex)
+        max_count = max(0, config.diagnostics_recent_report_count)
+        if max_count == 0:
+            reports.clear()
+        elif len(reports) > max_count:
+            del reports[:-max_count]
 
     def _reports_for_session(self, session: DeviceSession, data: bytes):
         if (

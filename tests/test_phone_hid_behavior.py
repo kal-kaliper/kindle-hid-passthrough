@@ -280,7 +280,14 @@ class ScanControlTests(unittest.TestCase):
 
 
 class ControllerStatusTests(unittest.TestCase):
+    def setUp(self):
+        self._old_include_reports = config.diagnostics_include_reports
+
+    def tearDown(self):
+        config.diagnostics_include_reports = self._old_include_reports
+
     def test_status_exposes_report_counts_without_raw_report_history(self):
+        config.diagnostics_include_reports = False
         daemon = types.SimpleNamespace(
             running=True,
             _suspended=False,
@@ -345,6 +352,56 @@ class ControllerStatusTests(unittest.TestCase):
         self.assertEqual(2, status["connections"][0]["source_report_count"])
         self.assertNotIn("recent_source_reports", status["connections"][0])
 
+    def test_status_exposes_raw_report_history_in_diagnostic_mode(self):
+        config.diagnostics_include_reports = True
+        daemon = types.SimpleNamespace(
+            running=True,
+            _suspended=False,
+            connection_state={
+                "connected": True,
+                "connections": [
+                    {
+                        "address": "AA:BB:CC:11:22:33",
+                        "protocol": "classic",
+                        "name": "Phone HID App",
+                        "source_report_count": 2,
+                        "uhid_report_count": 4,
+                        "last_source_report": "0100000400000000",
+                        "last_uhid_report": "0100000000000000",
+                        "recent_source_reports": ["0100000400000000"],
+                        "recent_uhid_reports": [
+                            "0100000400000000",
+                            "0100000000000000",
+                        ],
+                    }
+                ],
+                "address": "AA:BB:CC:11:22:33",
+                "protocol": "classic",
+                "name": "Phone HID App",
+                "source_report_count": 2,
+                "uhid_report_count": 4,
+                "last_source_report": "0100000400000000",
+                "last_uhid_report": "0100000000000000",
+                "recent_source_reports": ["0100000400000000"],
+                "recent_uhid_reports": [
+                    "0100000400000000",
+                    "0100000000000000",
+                ],
+            },
+        )
+        controller = DaemonController(daemon)
+        controller._devices_cache = []
+
+        status = controller.get_status()
+
+        self.assertEqual("0100000400000000", status["last_source_report"])
+        self.assertEqual("0100000000000000", status["last_uhid_report"])
+        self.assertEqual(["0100000400000000"], status["recent_source_reports"])
+        self.assertEqual(
+            ["0100000400000000", "0100000000000000"],
+            status["connections"][0]["recent_uhid_reports"],
+        )
+
 
 class PhoneHidBehaviorTests(unittest.TestCase):
     ADDR = "AA:BB:CC:11:22:33"
@@ -354,16 +411,19 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self._old_report_delay = config.classic_serialized_report_delay_ms
         self._old_defer_names = config.classic_defer_uhid_until_input_names
         self._old_idle_retry_names = config.classic_short_idle_retry_names
+        self._old_include_reports = config.diagnostics_include_reports
         config.classic_serialize_keyboard_reports = True
         config.classic_serialized_report_delay_ms = 0
         config.classic_defer_uhid_until_input_names = []
         config.classic_short_idle_retry_names = []
+        config.diagnostics_include_reports = False
 
     def tearDown(self):
         config.classic_serialize_keyboard_reports = self._old_serialize
         config.classic_serialized_report_delay_ms = self._old_report_delay
         config.classic_defer_uhid_until_input_names = self._old_defer_names
         config.classic_short_idle_retry_names = self._old_idle_retry_names
+        config.diagnostics_include_reports = self._old_include_reports
 
     def make_host(self):
         cache_dir = tempfile.mkdtemp(prefix="hid-host-test-")
@@ -450,6 +510,36 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self.assertNotIn("classic_channel_origin", state)
         self.assertNotIn("classic_set_protocol_ok", state)
         self.assertNotIn("classic_set_protocol_error", state)
+
+    def test_disconnect_warning_omits_raw_reports_by_default(self):
+        host = self.make_host()
+        host._schedule_protocol_restore = lambda _protocol: None
+        session = self.make_session(Protocol.CLASSIC)
+        session.last_source_report_hex = "0100000400000000"
+        session.last_uhid_report_hex = "0100000000000000"
+        host.sessions[Protocol.CLASSIC] = session
+
+        with self.assertLogs("ble_hid", level="WARNING") as captured:
+            host._on_protocol_disconnection(Protocol.CLASSIC, self.ADDR, 0x13)
+
+        output = "\n".join(captured.output)
+        self.assertIn("Device disconnected", output)
+        self.assertNotIn("0100000400000000", output)
+        self.assertNotIn("0100000000000000", output)
+
+    def test_drop_warning_omits_raw_report_by_default(self):
+        host = self.make_host()
+        host.sessions[Protocol.BLE] = self.make_session(Protocol.BLE)
+
+        with self.assertLogs("ble_hid", level="WARNING") as captured:
+            host._forward_report_for_protocol(
+                Protocol.CLASSIC,
+                b"\x01\x00\x00\x04\x00\x00\x00\x00",
+            )
+
+        output = "\n".join(captured.output)
+        self.assertIn("Dropping report without live session", output)
+        self.assertNotIn("0100000400000000", output)
 
     def test_classic_keyboard_report_serializes_all_key_slots(self):
         host = self.make_host()

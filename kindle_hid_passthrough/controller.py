@@ -32,6 +32,19 @@ STATUS_CONNECTION_KEYS = (
     "uhid_report_count",
 )
 
+STATUS_DIAGNOSTIC_KEYS = (
+    "last_source_report",
+    "last_uhid_report",
+    "recent_source_reports",
+    "recent_uhid_reports",
+)
+
+
+def _status_connection_keys():
+    if config.diagnostics_include_reports:
+        return STATUS_CONNECTION_KEYS + STATUS_DIAGNOSTIC_KEYS
+    return STATUS_CONNECTION_KEYS
+
 
 class DaemonController:
     """Coordinates between the HTTP server thread and the async daemon.
@@ -84,7 +97,7 @@ class DaemonController:
             status["connected_device"] = conn.get("address")
             status["connected_protocol"] = conn.get("protocol")
             status["connected_name"] = conn.get("name")
-            for key in STATUS_CONNECTION_KEYS:
+            for key in _status_connection_keys():
                 if key in conn:
                     status[key] = conn[key]
 
@@ -94,7 +107,7 @@ class DaemonController:
     def _status_connection_state(connection: dict) -> dict:
         return {
             key: connection[key]
-            for key in STATUS_CONNECTION_KEYS
+            for key in _status_connection_keys()
             if key in connection
         }
 
