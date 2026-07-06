@@ -234,6 +234,23 @@ class ClassicMixin:
 
         return False
 
+    def _has_live_classic_connection(self, addr: str) -> bool:
+        """True if bumble already holds a live Classic link to addr."""
+        norm = normalize_addr(addr)
+        connections = getattr(self.device, 'connections', None) or {}
+        for conn in list(connections.values()):
+            try:
+                if normalize_addr(str(conn.peer_address)) != norm:
+                    continue
+                transport = getattr(conn, 'transport', None)
+                if transport is not None and transport != BT_BR_EDR_TRANSPORT:
+                    continue
+                if self._is_raw_connection_alive(conn):
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def _classic_active_connect_loop(self, addresses: List[str]):
         """Actively try to connect to Classic devices."""
         log.info(f"[Classic] Active: {len(addresses)} device(s)")
@@ -257,6 +274,14 @@ class ClassicMixin:
                 if self._is_protocol_connecting(Protocol.CLASSIC):
                     break
 
+                if self._has_live_classic_connection(addr):
+                    log.info(
+                        f"[Classic] {self._format_device(addr)} already linked; "
+                        "skipping active connect"
+                    )
+                    await asyncio.sleep(1.0)
+                    continue
+
                 log.info(f"[Classic] Attempt {attempt}: {self._format_device(addr)}")
 
                 target = Address(addr, Address.PUBLIC_DEVICE_ADDRESS)
@@ -264,10 +289,7 @@ class ClassicMixin:
                 connect_task = asyncio.create_task(
                     self.device.connect(target, transport=BT_BR_EDR_TRANSPORT)
                 )
-                # The finally below guarantees connect_task is cancelled and
-                # awaited on every exit path, including suspend cancellation —
-                # otherwise it leaks and asyncio logs an unretrieved exception
-                # when bumble eventually raises HCI_PAGE_TIMEOUT.
+                backoff = 0.0
                 try:
                     timed_out = True
                     for _ in range(self.ACTIVE_CONNECT_TIMEOUT):
@@ -280,18 +302,17 @@ class ClassicMixin:
 
                     if timed_out:
                         log.info(f"[Classic] {addr} timed out")
-                        await asyncio.sleep(3.0)
-                        continue
-
-                    await connect_task
+                        backoff = 3.0
+                    else:
+                        await connect_task
 
                 except Exception as e:
                     if "DISALLOWED" in str(e) or "PENDING" in str(e):
                         log.warning("[Classic] HCI busy, waiting...")
-                        await asyncio.sleep(5.0)
+                        backoff = 5.0
                     else:
                         log.info(f"[Classic] Connect failed: {e}")
-                        await asyncio.sleep(2.0)
+                        backoff = 2.0
 
                 finally:
                     if not connect_task.done():
@@ -301,6 +322,9 @@ class ClassicMixin:
                     except (asyncio.CancelledError, Exception):
                         pass
                     self._radio_lock.release()
+
+                if backoff:
+                    await asyncio.sleep(backoff)
 
             if not self._is_protocol_connected(Protocol.CLASSIC):
                 await asyncio.sleep(self.ACTIVE_RETRY_INTERVAL)
@@ -452,18 +476,10 @@ class ClassicMixin:
             await self._query_classic_sdp(address)
 
             if not self.report_map:
-                log.error("[Classic] Pairing failed: no HID descriptor found")
-                self.device.host.remove_listener('link_key', on_device_link_key)
-                config.remove_pairing_key(address)
-                try:
-                    await self.connection.disconnect()
-                except Exception:
-                    pass
-                self.connection = None
-                self.current_device_address = None
-                self.connected_protocol = None
-                self.device_name = None
-                return False
+                log.warning(
+                    "[Classic] No HID descriptor in SDP; "
+                    "using fallback keyboard descriptor"
+                )
 
             if self.keystore:
                 keys = await self.keystore.get(address)
