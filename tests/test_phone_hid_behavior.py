@@ -228,6 +228,7 @@ class FakeBleDevice:
         self.le_connecting = False
         self.connect_own_address_type = None
         self.on_create = on_create
+        self.host = FakeClassicController()
 
     def on(self, event, callback):
         self.listeners.setdefault(event, []).append(callback)
@@ -264,6 +265,7 @@ class FakeClassicController:
 class FakeClassicDevice:
     def __init__(self):
         self.host = FakeClassicController()
+        self.le_connecting = False
 
 
 class ScanControlTests(unittest.TestCase):
@@ -966,6 +968,27 @@ class PhoneHidBehaviorTests(unittest.TestCase):
 
         self.assertEqual(0x02, commands[0].kwargs["scan_enable"])
 
+    def test_classic_active_loop_waits_for_ble_initiate(self):
+        async def scenario():
+            host = self.make_host()
+            host.ACTIVE_DELAY = 0
+            host.device = FakeClassicDevice()
+            host.device.le_connecting = True
+            host._classic_page_scan_enabled = False
+
+            task = asyncio.create_task(host._classic_active_connect_loop([self.ADDR]))
+            await asyncio.sleep(0.01)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return host.device.host.commands
+
+        commands = asyncio.run(scenario())
+
+        self.assertEqual([], commands)
+
     def test_ble_initiate_aborts_when_classic_setup_starts(self):
         async def scenario():
             host = self.make_host()
@@ -1004,18 +1027,62 @@ class PhoneHidBehaviorTests(unittest.TestCase):
             host._ble_coexist_pause_delay(),
         )
 
-    def test_ble_uses_conservative_windows_when_classic_is_live(self):
+    def test_ble_uses_normal_windows_when_classic_is_live(self):
         host = self.make_host()
         host.sessions[Protocol.CLASSIC] = self.make_session(Protocol.CLASSIC)
 
         self.assertEqual(
-            host.BLE_COEXIST_WINDOW,
+            host.BLE_INIT_WINDOW,
             host._ble_window_for_radio_state(host.BLE_INIT_WINDOW),
         )
         self.assertEqual(
-            host.BLE_COEXIST_RETRY_DELAY,
+            0.0,
             host._ble_coexist_pause_delay(),
         )
+
+    def test_ble_initiate_runs_when_classic_session_is_live(self):
+        async def scenario():
+            host = self.make_host()
+            host.sessions[Protocol.CLASSIC] = self.make_session(Protocol.CLASSIC)
+            host.device = FakeBleDevice()
+            host._radio_lock = asyncio.Lock()
+
+            result = await host._ble_initiate(0.01)
+            return host, result
+
+        host, result = asyncio.run(scenario())
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            [
+                "HCI_LE_Create_Connection_Command",
+                "HCI_LE_Create_Connection_Cancel_Command",
+            ],
+            host.device.commands,
+        )
+        self.assertFalse(host.device.le_connecting)
+
+    def test_ble_initiate_pauses_classic_page_scan_when_classic_not_live(self):
+        async def scenario():
+            host = self.make_host()
+            host.device = FakeBleDevice()
+            host._radio_lock = asyncio.Lock()
+            host._classic_page_scan_enabled = True
+
+            result = await host._ble_initiate(0.01)
+            return host, result
+
+        host, result = asyncio.run(scenario())
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            [0x00, 0x02],
+            [
+                command.kwargs["scan_enable"]
+                for command in host.device.host.commands
+            ],
+        )
+        self.assertTrue(host._classic_page_scan_enabled)
 
     def test_ble_restore_disconnect_does_not_fall_through_to_pair(self):
         async def scenario():

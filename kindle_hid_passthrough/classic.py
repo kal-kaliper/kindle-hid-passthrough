@@ -295,6 +295,10 @@ class ClassicMixin:
                     await asyncio.sleep(0.5)
                     continue
 
+                if getattr(self.device, 'le_connecting', False):
+                    await asyncio.sleep(0.5)
+                    continue
+
                 all_backoff_delay = self._classic_backoff_delay_for_all(addresses)
                 if all_backoff_delay > 0:
                     await self._set_classic_page_scan(True)

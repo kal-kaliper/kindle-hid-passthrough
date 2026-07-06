@@ -191,29 +191,33 @@ class BLEMixin:
             and not self._is_protocol_connected(Protocol.CLASSIC)
         )
 
-    def _ble_has_classic_activity(self) -> bool:
+    def _ble_has_classic_setup_activity(self) -> bool:
         return bool(
-            any(p != Protocol.BLE for p in self.sessions)
-            or (
-                self._is_protocol_connecting(Protocol.CLASSIC)
-                and not self._is_classic_parked()
-            )
-            or self._is_protocol_connected(Protocol.CLASSIC)
+            self._is_protocol_connecting(Protocol.CLASSIC)
+            and not self._is_classic_parked()
         )
 
     def _ble_window_for_radio_state(self, window: float) -> float:
-        if self._ble_has_classic_activity():
+        if self._ble_has_classic_setup_activity():
             return min(window, self.BLE_COEXIST_WINDOW)
         if self._ble_should_yield_to_classic():
             return min(window, self.BLE_CLASSIC_IDLE_WINDOW)
         return window
 
     def _ble_coexist_pause_delay(self) -> float:
-        if self._ble_has_classic_activity():
+        if self._ble_has_classic_setup_activity():
             return self.BLE_COEXIST_RETRY_DELAY
         if self._ble_should_yield_to_classic():
             return self.BLE_CLASSIC_IDLE_RETRY_DELAY
         return 0.0
+
+    def _ble_should_pause_classic_page_scan(self) -> bool:
+        return bool(
+            self.classic_devices
+            and not self._is_protocol_connected(Protocol.CLASSIC)
+            and not self._is_protocol_connecting(Protocol.CLASSIC)
+            and not self._is_classic_parked()
+        )
 
     async def _ble_coexist_pause(self):
         delay = self._ble_coexist_pause_delay()
@@ -265,11 +269,16 @@ class BLEMixin:
         await self._radio_lock.acquire()
         self.device.on(Device.EVENT_CONNECTION, on_connection)
         self.device.on(Device.EVENT_CONNECTION_FAILURE, on_failure)
+        classic_page_scan_paused = False
 
         try:
-            if self._ble_has_classic_activity():
+            if self._ble_has_classic_setup_activity():
                 log.info("[BLE] Initiate window skipped: Classic setup active")
                 return None
+
+            if self._ble_should_pause_classic_page_scan():
+                await self._set_classic_page_scan(False)
+                classic_page_scan_paused = True
 
             self.device.connect_own_address_type = OwnAddressType.PUBLIC
             self.device.le_connecting = True
@@ -299,7 +308,7 @@ class BLEMixin:
 
             deadline = started + window
             while True:
-                if self._ble_has_classic_activity():
+                if self._ble_has_classic_setup_activity():
                     elapsed = loop.time() - started
                     log.info(
                         "[BLE] Initiate window aborted for Classic setup: "
@@ -350,6 +359,11 @@ class BLEMixin:
             self.device.le_connecting = False
             self.device.remove_listener(Device.EVENT_CONNECTION, on_connection)
             self.device.remove_listener(Device.EVENT_CONNECTION_FAILURE, on_failure)
+            if classic_page_scan_paused:
+                try:
+                    await self._set_classic_page_scan(True)
+                except Exception as e:
+                    log.warning(f"[BLE] Could not restore Classic Page Scan: {e}")
             self._radio_lock.release()
 
     async def _ble_scan_for_rotated(self, known: set, window: float):
@@ -380,7 +394,7 @@ class BLEMixin:
             scanning = True
             deadline = started + window
             while True:
-                if self._ble_has_classic_activity():
+                if self._ble_has_classic_setup_activity():
                     log.info("[BLE] Rotation scan aborted for Classic setup")
                     return None
                 remaining = deadline - loop.time()
