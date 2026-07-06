@@ -95,7 +95,7 @@ var BTManager = (function() {
 
     function showMessage(text, isError) {
         var bar = getEl("messageBar");
-        bar.innerHTML = text;
+        setText(bar, text);
         bar.className = "message-bar visible" + (isError ? " error" : "");
         if (messageTimer) clearTimeout(messageTimer);
         messageTimer = setTimeout(function() {
@@ -103,12 +103,38 @@ var BTManager = (function() {
         }, MESSAGE_TIMEOUT);
     }
 
+    function sanitizeText(str) {
+        if (str === null || str === undefined) return "";
+        str = String(str);
+        str = str.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+        return str.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+    }
+
     function escapeHtml(str) {
+        str = sanitizeText(str);
         if (!str) return "";
         return str.replace(/&/g, "&amp;")
                   .replace(/</g, "&lt;")
                   .replace(/>/g, "&gt;")
                   .replace(/"/g, "&quot;");
+    }
+
+    function renderLogLines(lines) {
+        if (!lines) return "";
+        var text = sanitizeText(lines.join("\n"));
+        if (text.length > 6000) {
+            text = text.slice(text.length - 6000);
+        }
+        return text;
+    }
+
+    function setText(el, text) {
+        if (!el) return;
+        text = sanitizeText(text);
+        while (el.firstChild) {
+            el.removeChild(el.firstChild);
+        }
+        el.appendChild(document.createTextNode(text));
     }
 
     // ---- Toggle ----
@@ -579,7 +605,7 @@ var BTManager = (function() {
             if (!isPairing) return;
             if (data && data.lines) {
                 var viewer = getEl("pairLogContent");
-                viewer.innerHTML = escapeHtml(data.lines.join("\n"));
+                setText(viewer, renderLogLines(data.lines));
                 var container = viewer.parentNode;
                 container.scrollTop = container.scrollHeight;
             }
@@ -620,11 +646,11 @@ var BTManager = (function() {
     function fetchLogs() {
         request("/logs?lines=100", function(data, err) {
             if (err) {
-                getEl("logContent").innerHTML = "Error loading logs: " + escapeHtml(err);
+                setText(getEl("logContent"), "Error loading logs: " + err);
                 return;
             }
             if (data && data.lines) {
-                getEl("logContent").innerHTML = escapeHtml(data.lines.join("\n"));
+                setText(getEl("logContent"), renderLogLines(data.lines));
                 var viewer = getEl("logViewer");
                 viewer.scrollTop = viewer.scrollHeight;
             }
