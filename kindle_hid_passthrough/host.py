@@ -561,13 +561,9 @@ class HIDHost(ClassicMixin, BLEMixin):
         session.last_source_report_hex = source_hex
         self._append_recent_report(session.recent_source_reports, source_hex)
         reports = self._reports_for_session(session, data)
-        paced = (
-            session.protocol == Protocol.CLASSIC
-            and config.classic_serialize_keyboard_reports
-            and config.classic_serialized_report_delay_ms > 0
-            and len(reports) > 1
-        )
-        delay = config.classic_serialized_report_delay_ms / 1000.0
+        delay_ms = self._serialized_report_delay_ms(session)
+        paced = delay_ms > 0 and len(reports) > 1
+        delay = delay_ms / 1000.0
         for index, report in enumerate(reports):
             if paced and index:
                 time.sleep(delay)
@@ -597,26 +593,25 @@ class HIDHost(ClassicMixin, BLEMixin):
             del reports[:-max_count]
 
     def _reports_for_session(self, session: DeviceSession, data: bytes):
-        if (
-            session.protocol != Protocol.CLASSIC
-            or not config.classic_serialize_keyboard_reports
-        ):
+        if not self._serialize_keyboard_reports(session):
             return (data,)
 
-        parsed = self._parse_classic_keyboard_report(data)
+        parsed = self._parse_keyboard_report(
+            data, self._keyboard_report_ids(session))
         if not parsed:
             session.keyboard_last_keys = ()
             return (data,)
 
-        modifier, keys = parsed
+        report_id, modifier, keys, report_len = parsed
+        modifier &= self._keyboard_modifier_mask(session)
         current = tuple(key for key in keys if key)
         previous = session.keyboard_last_keys
         previous_set = set(previous)
         session.keyboard_last_keys = current
 
-        release = self._make_classic_keyboard_report(0, ())
+        release = self._make_keyboard_report(report_id, 0, (), report_len)
         if not current:
-            return (release,)
+            return (release,) if previous else ()
 
         if current == previous:
             keys_to_tap = current
@@ -625,19 +620,60 @@ class HIDHost(ClassicMixin, BLEMixin):
 
         reports = []
         for key in keys_to_tap:
-            reports.append(self._make_classic_keyboard_report(modifier, (key,)))
+            reports.append(self._make_keyboard_report(report_id, modifier, (key,), report_len))
             reports.append(release)
         return tuple(reports) or (release,)
 
-    def _parse_classic_keyboard_report(self, data: bytes):
-        if len(data) != 8 or data[0] != 1:
+    def _serialize_keyboard_reports(self, session: DeviceSession) -> bool:
+        if session.protocol == Protocol.BLE:
+            return config.ble_serialize_keyboard_reports
+        if session.protocol == Protocol.CLASSIC:
+            return config.classic_serialize_keyboard_reports
+        return False
+
+    def _serialized_report_delay_ms(self, session: DeviceSession) -> int:
+        if session.protocol == Protocol.BLE:
+            return config.ble_serialized_report_delay_ms
+        if session.protocol == Protocol.CLASSIC:
+            return config.classic_serialized_report_delay_ms
+        return 0
+
+    def _keyboard_modifier_mask(self, session: DeviceSession) -> int:
+        if session.protocol == Protocol.BLE:
+            return config.ble_keyboard_modifier_mask
+        if session.protocol == Protocol.CLASSIC:
+            return config.classic_keyboard_modifier_mask
+        return 0xff
+
+    def _keyboard_report_ids(self, session: DeviceSession):
+        if session.protocol == Protocol.BLE:
+            return (2,)
+        if session.protocol == Protocol.CLASSIC:
+            return (1,)
+        return ()
+
+    def _parse_keyboard_report(self, data: bytes, report_ids=(1, 2)):
+        if len(data) not in (8, 9):
             return None
-        return data[1], tuple(data[3:8])
+        report_id = data[0]
+        if report_id not in report_ids:
+            return None
+        return report_id, data[1], tuple(data[3:]), len(data)
+
+    def _parse_classic_keyboard_report(self, data: bytes):
+        parsed = self._parse_keyboard_report(data)
+        if not parsed or parsed[0] != 1:
+            return None
+        return parsed[1], parsed[2]
 
     def _make_classic_keyboard_report(self, modifier: int, keys):
-        slots = list(keys[:5])
-        slots.extend([0] * (5 - len(slots)))
-        return bytes([1, modifier, 0, *slots])
+        return self._make_keyboard_report(1, modifier, keys, 8)
+
+    def _make_keyboard_report(self, report_id: int, modifier: int, keys, report_len: int):
+        slot_count = max(0, report_len - 3)
+        slots = list(keys[:slot_count])
+        slots.extend([0] * (slot_count - len(slots)))
+        return bytes([report_id, modifier, 0, *slots])
 
     def _load_cached_descriptor(self, address: str = None) -> bool:
         """Load report descriptor and device name from cache. Returns True if found."""

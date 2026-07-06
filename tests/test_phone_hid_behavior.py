@@ -411,11 +411,21 @@ class PhoneHidBehaviorTests(unittest.TestCase):
     def setUp(self):
         self._old_serialize = config.classic_serialize_keyboard_reports
         self._old_report_delay = config.classic_serialized_report_delay_ms
+        self._old_modifier_mask = config.classic_keyboard_modifier_mask
+        self._old_ble_kindle_text_mode = config.ble_kindle_text_mode
+        self._old_ble_serialize = config.ble_serialize_keyboard_reports
+        self._old_ble_report_delay = config.ble_serialized_report_delay_ms
+        self._old_ble_modifier_mask = config.ble_keyboard_modifier_mask
         self._old_defer_names = config.classic_defer_uhid_until_input_names
         self._old_idle_retry_names = config.classic_short_idle_retry_names
         self._old_include_reports = config.diagnostics_include_reports
         config.classic_serialize_keyboard_reports = True
         config.classic_serialized_report_delay_ms = 0
+        config.classic_keyboard_modifier_mask = 0xff
+        config.ble_kindle_text_mode = True
+        config.ble_serialize_keyboard_reports = True
+        config.ble_serialized_report_delay_ms = 0
+        config.ble_keyboard_modifier_mask = 0x22
         config.classic_defer_uhid_until_input_names = []
         config.classic_short_idle_retry_names = []
         config.diagnostics_include_reports = False
@@ -423,6 +433,11 @@ class PhoneHidBehaviorTests(unittest.TestCase):
     def tearDown(self):
         config.classic_serialize_keyboard_reports = self._old_serialize
         config.classic_serialized_report_delay_ms = self._old_report_delay
+        config.classic_keyboard_modifier_mask = self._old_modifier_mask
+        config.ble_kindle_text_mode = self._old_ble_kindle_text_mode
+        config.ble_serialize_keyboard_reports = self._old_ble_serialize
+        config.ble_serialized_report_delay_ms = self._old_ble_report_delay
+        config.ble_keyboard_modifier_mask = self._old_ble_modifier_mask
         config.classic_defer_uhid_until_input_names = self._old_defer_names
         config.classic_short_idle_retry_names = self._old_idle_retry_names
         config.diagnostics_include_reports = self._old_include_reports
@@ -491,6 +506,94 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         )
         self.assertEqual("0100000405000000", session.last_source_report_hex)
         self.assertEqual("0100000000000000", session.last_uhid_report_hex)
+
+    def test_ble_keyboard_overlap_is_serialized_into_taps(self):
+        host = self.make_host()
+        session = self.make_session(Protocol.BLE)
+        host.sessions[Protocol.BLE] = session
+
+        host._forward_report_for_protocol(
+            Protocol.BLE,
+            b"\x02\x00\x00\x16\x00\x00\x00\x00\x00",
+        )
+        host._forward_report_for_protocol(
+            Protocol.BLE,
+            b"\x02\x00\x00\x16\x12\x00\x00\x00\x00",
+        )
+
+        self.assertEqual(
+            [
+                b"\x02\x00\x00\x16\x00\x00\x00\x00\x00",
+                b"\x02\x00\x00\x00\x00\x00\x00\x00\x00",
+                b"\x02\x00\x00\x12\x00\x00\x00\x00\x00",
+                b"\x02\x00\x00\x00\x00\x00\x00\x00\x00",
+            ],
+            session.uhid_device.inputs,
+        )
+        self.assertEqual("020000161200000000", session.last_source_report_hex)
+        self.assertEqual("020000000000000000", session.last_uhid_report_hex)
+
+    def test_ble_keyboard_passthrough_is_default_outside_kindle_text_mode(self):
+        config.ble_kindle_text_mode = False
+        config.ble_serialize_keyboard_reports = False
+        host = self.make_host()
+        session = self.make_session(Protocol.BLE)
+        host.sessions[Protocol.BLE] = session
+
+        host._forward_report_for_protocol(
+            Protocol.BLE,
+            b"\x02\x00\x00\x16\x12\x00\x00\x00\x00",
+        )
+
+        self.assertEqual(
+            [b"\x02\x00\x00\x16\x12\x00\x00\x00\x00"],
+            session.uhid_device.inputs,
+        )
+
+    def test_ble_non_keyboard_report_is_forwarded_unchanged(self):
+        host = self.make_host()
+        session = self.make_session(Protocol.BLE)
+        host.sessions[Protocol.BLE] = session
+
+        host._forward_report_for_protocol(
+            Protocol.BLE,
+            b"\x01\x00\x00\x04\x00\x00\x00\x00",
+        )
+
+        self.assertEqual(
+            [b"\x01\x00\x00\x04\x00\x00\x00\x00"],
+            session.uhid_device.inputs,
+        )
+
+    def test_ble_keyboard_drops_non_shift_modifiers(self):
+        host = self.make_host()
+        session = self.make_session(Protocol.BLE)
+        host.sessions[Protocol.BLE] = session
+
+        host._forward_report_for_protocol(
+            Protocol.BLE,
+            b"\x02\x01\x00\x2a\x00\x00\x00\x00\x00",
+        )
+
+        self.assertEqual(
+            [
+                b"\x02\x00\x00\x2a\x00\x00\x00\x00\x00",
+                b"\x02\x00\x00\x00\x00\x00\x00\x00\x00",
+            ],
+            session.uhid_device.inputs,
+        )
+
+    def test_keyboard_idle_release_is_not_forwarded_repeatedly(self):
+        host = self.make_host()
+        session = self.make_session(Protocol.BLE)
+        host.sessions[Protocol.BLE] = session
+
+        host._forward_report_for_protocol(
+            Protocol.BLE,
+            b"\x02\x00\x00\x00\x00\x00\x00\x00\x00",
+        )
+
+        self.assertEqual([], session.uhid_device.inputs)
 
     def test_session_state_keeps_status_telemetry_minimal(self):
         host = self.make_host()
