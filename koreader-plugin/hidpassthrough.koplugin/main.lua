@@ -186,8 +186,11 @@ end
 -- directory listing every few seconds, only while the daemon is "on".
 
 HIDPassthrough.WATCHER_INTERVAL = 3 -- seconds
+HIDPassthrough.KEYBOARD_ATTACH_STABLE_SECONDS = 0 -- seconds
+HIDPassthrough.PHONE_KEYBOARD_ATTACH_STABLE_SECONDS = 12 -- seconds
 HIDPassthrough.RESUME_WATCHER_INTERVAL = 5 -- seconds
 HIDPassthrough.RESUME_WATCHER_TIMEOUT = 75 -- seconds
+HIDPassthrough.RESUME_WATCHER_SLOW_INTERVAL = 30 -- seconds
 
 -- Try to load the FBInkInput library. It's part of koreader-base on Kobo
 -- and Kindle, but we still wrap it in pcall so the plugin degrades cleanly
@@ -221,8 +224,56 @@ local function no()  return false end
 -- The fd_object is whatever Device.input:fdopen returns, which we hand back
 -- to :close() on removal.
 HIDPassthrough._kb_attached = {}
+HIDPassthrough._kb_pending = {}
 HIDPassthrough._kb_count = 0
 HIDPassthrough._kb_original_caps = nil
+
+function HIDPassthrough:_isClassicKeyboardConnection(conn)
+    return type(conn) == "table" and conn.protocol == "classic"
+end
+
+function HIDPassthrough:_statusConnectionsByInputPath()
+    local status, err = self:_httpGetJson("/status")
+    if not status then
+        logger.dbg("HIDPassthrough: status unavailable for keyboard gate:", err)
+        return nil
+    end
+    local by_path = {}
+    if type(status.connections) == "table" then
+        for _, conn in ipairs(status.connections) do
+            if type(conn.input_paths) == "table" then
+                for _, path in ipairs(conn.input_paths) do
+                    by_path[path] = conn
+                end
+            end
+        end
+    end
+    return by_path
+end
+
+function HIDPassthrough:_attachStableSecondsForPath(path, conn)
+    if conn and self:_isClassicKeyboardConnection(conn) then
+        local reports = tonumber(conn.source_report_count) or 0
+        if reports > 0 then
+            return 0
+        end
+        return self.PHONE_KEYBOARD_ATTACH_STABLE_SECONDS
+    end
+    return self.KEYBOARD_ATTACH_STABLE_SECONDS
+end
+
+function HIDPassthrough:_closeExistingInputPath(path)
+    if not (Device.input and Device.input.opened_devices) then return end
+    if not Device.input.opened_devices[path] then return end
+    logger.info("HIDPassthrough: closing existing input fd before reattach",
+        path)
+    local ok, err = pcall(Device.input.close, Device.input, path)
+    if not ok then
+        logger.warn("HIDPassthrough: existing input close failed for", path,
+            ":", err)
+        Device.input.opened_devices[path] = nil
+    end
+end
 
 -- Pull in the upstream keyboard event_map. Prefer the upstream copy (so we
 -- get any improvements automatically); fall back to our bundled copy if it
@@ -324,9 +375,11 @@ end
 function HIDPassthrough:_attachKeyboard(info)
     if self._kb_attached[info.path] then return end
 
+    self:_closeExistingInputPath(info.path)
+
     local ok, fd = pcall(Device.input.fdopen, Device.input,
         info.fd, info.path, info.name)
-    if not ok then
+    if not ok or fd == nil then
         logger.warn("HIDPassthrough: fdopen failed for", info.path, ":", fd)
         return
     end
@@ -348,6 +401,7 @@ function HIDPassthrough:_attachKeyboard(info)
         Device.hasDPad = yes
     end
 
+    self._kb_pending[info.path] = nil
     self._kb_attached[info.path] = { fd = fd, has_dpad = info.has_dpad }
     self._kb_count = self._kb_count + 1
     logger.info("HIDPassthrough: attached keyboard", info.name, "@", info.path,
@@ -379,7 +433,7 @@ function HIDPassthrough:_detachKeyboard(path, quiet)
     end
 
     self._kb_attached[path] = nil
-    self._kb_count = self._kb_count - 1
+    self._kb_count = math.max(0, self._kb_count - 1)
     logger.info("HIDPassthrough: detached keyboard", path,
         "(remaining:", self._kb_count, ")")
 
@@ -413,20 +467,48 @@ function HIDPassthrough:_reconcileKeyboards()
     end
 
     local seen = {}
+    local now = socket.gettime()
+    local connections_by_path = self:_statusConnectionsByInputPath()
     for _, path in ipairs(event_paths) do
         seen[path] = true
         if not self._kb_attached[path] then
-            local info = self:_checkKeyboard(path)
-            if info then
-                self:_attachKeyboard(info)
+            local first_seen = self._kb_pending[path]
+            if not first_seen then
+                first_seen = now
+                self._kb_pending[path] = first_seen
+            end
+            local conn = connections_by_path and connections_by_path[path]
+            local stable_seconds = self:_attachStableSecondsForPath(path, conn)
+            if now - first_seen < stable_seconds then
+                logger.dbg("HIDPassthrough: waiting to attach", path,
+                    "stable_for", string.format("%.1f", now - first_seen),
+                    "required", stable_seconds)
+            elseif conn and self:_isClassicKeyboardConnection(conn) then
+                logger.info("HIDPassthrough: classic keyboard accepted", path,
+                    "source_reports", tostring(conn.source_report_count or 0),
+                    "stable_for", string.format("%.1f", now - first_seen))
+            end
+            if now - first_seen >= stable_seconds then
+                local info = self:_checkKeyboard(path)
+                if info then
+                    self:_attachKeyboard(info)
+                else
+                    self._kb_pending[path] = nil
+                end
             end
         end
+    end
+
+    for path in pairs(self._kb_pending) do
+        if not seen[path] then self._kb_pending[path] = nil end
     end
 
     -- Detach anything we have that's no longer present.
     local gone = {}
     for path in pairs(self._kb_attached) do
-        if not seen[path] then table.insert(gone, path) end
+        local opened = Device.input and Device.input.opened_devices
+            and Device.input.opened_devices[path]
+        if not seen[path] or not opened then table.insert(gone, path) end
     end
     for _, path in ipairs(gone) do
         self:_detachKeyboard(path)
@@ -443,12 +525,24 @@ function HIDPassthrough:_startKeyboardWatcher()
         return
     end
     self._kb_watcher_active = true
+    self._kb_pending = {}
     -- Bind a stable callback so UIManager:unschedule could find it if needed.
     -- We don't actually unschedule by reference (the active flag handles it),
     -- but it keeps the closure allocation out of the hot loop.
     self._reconcileKeyboardsCb = function() self:_reconcileKeyboards() end
     logger.info("HIDPassthrough: starting keyboard watcher")
     UIManager:scheduleIn(1, self._reconcileKeyboardsCb)
+end
+
+function HIDPassthrough:_resumeKeyboardWatcher(reason)
+    if self:isRunning() then
+        self._kb_resume_pending = false
+        logger.info("HIDPassthrough: daemon running, restarting keyboard watcher",
+            reason or "")
+        self:_startKeyboardWatcher()
+        return true
+    end
+    return false
 end
 
 function HIDPassthrough:_stopKeyboardWatcher(quiet, keep_resume_pending)
@@ -459,6 +553,7 @@ function HIDPassthrough:_stopKeyboardWatcher(quiet, keep_resume_pending)
     if not keep_resume_pending then
         self._kb_resume_pending = false
     end
+    self._kb_pending = {}
     if not self._kb_watcher_active then return end
     self._kb_watcher_active = false
     -- Detach everything we have. Snapshot keys first because _detachKeyboard
@@ -473,25 +568,21 @@ end
 
 function HIDPassthrough:_scheduleWatcherResume(elapsed)
     if not self._kb_resume_pending then return end
+    if self:_resumeKeyboardWatcher("resume") then return end
+    local interval = self.RESUME_WATCHER_INTERVAL
+    local next_elapsed = elapsed + interval
     if elapsed >= self.RESUME_WATCHER_TIMEOUT then
         logger.warn("HIDPassthrough: daemon not ready after resume; "
-            .. "keyboard watcher remains stopped")
-        self._kb_resume_pending = false
-        self._resume_watcher_cb = nil
-        return
+            .. "continuing slow keyboard watcher retry")
+        interval = self.RESUME_WATCHER_SLOW_INTERVAL
+        next_elapsed = elapsed
     end
     self._resume_watcher_cb = function()
         self._resume_watcher_cb = nil
         if not self._kb_resume_pending then return end
-        if self:isRunning() then
-            self._kb_resume_pending = false
-            logger.info("HIDPassthrough: daemon resumed, restarting keyboard watcher")
-            self:_startKeyboardWatcher()
-            return
-        end
-        self:_scheduleWatcherResume(elapsed + self.RESUME_WATCHER_INTERVAL)
+        self:_scheduleWatcherResume(next_elapsed)
     end
-    UIManager:scheduleIn(self.RESUME_WATCHER_INTERVAL, self._resume_watcher_cb)
+    UIManager:scheduleIn(interval, self._resume_watcher_cb)
 end
 
 ------------------------------------------------------------------------------
@@ -1235,7 +1326,7 @@ function HIDPassthrough:onSuspend()
 end
 
 function HIDPassthrough:onResume()
-    if not self._kb_resume_pending then return end
+    self._kb_resume_pending = true
     if self._resume_watcher_cb then
         UIManager:unschedule(self._resume_watcher_cb)
         self._resume_watcher_cb = nil

@@ -2,11 +2,14 @@
 """Classic Bluetooth HID handler mixin for HIDHost."""
 
 import asyncio
+import time
 from typing import List
 
 from bumble.core import BT_BR_EDR_TRANSPORT, BT_HUMAN_INTERFACE_DEVICE_SERVICE, InvalidStateError, TimeoutError as BumbleTimeoutError
 from bumble.hci import (
     Address,
+    HCI_Exit_Sniff_Mode_Command,
+    HCI_Write_Link_Policy_Settings_Command,
     HCI_Write_Scan_Enable_Command,
 )
 from bumble.hid import HID_CONTROL_PSM, HID_INTERRUPT_PSM, Message
@@ -95,7 +98,14 @@ class ClassicMixin:
                 self.report_map = None
                 self.hid_reports = []
                 self.uhid_device = None
+                self._uhid_created_at = None
                 self._last_report = None
+                self._classic_setup_started_at = time.monotonic()
+                self._classic_channels_opened_at = None
+                self._classic_hid_ready_at = None
+                self._classic_channel_origin = None
+                self._classic_set_protocol_ok = None
+                self._classic_set_protocol_error = None
                 self.connected_protocol = Protocol.CLASSIC
 
                 connection.on(
@@ -127,6 +137,8 @@ class ClassicMixin:
         addr_str = str(connection.peer_address)
 
         hid_host.on_device_connection(connection)
+        hid_host.l2cap_ctrl_channel = None
+        hid_host.l2cap_intr_channel = None
 
         if not getattr(connection, 'is_encrypted', False):
             log.info("[Classic] Authenticating...")
@@ -151,6 +163,8 @@ class ClassicMixin:
             self.connected_protocol = None
             return
 
+        await self._classic_disable_low_power(connection)
+
         log.info("[Classic] Waiting for HID channels...")
         for _ in range(30):
             if self._protocol_event_is_set(Protocol.CLASSIC):
@@ -159,7 +173,10 @@ class ClassicMixin:
                 self.current_device_address = None
                 self.connected_protocol = None
                 return
-            if hid_host.l2cap_intr_channel and hid_host.l2cap_ctrl_channel:
+            self._classic_clear_closed_l2cap_channels(hid_host)
+            if self._classic_hid_channels_open(hid_host):
+                self._classic_channels_opened_at = time.monotonic()
+                self._classic_channel_origin = "remote"
                 log.success("[Classic] HID channels opened")
                 break
             await asyncio.sleep(0.1)
@@ -171,15 +188,17 @@ class ClassicMixin:
             self.connected_protocol = None
             return
 
-        if not hid_host.l2cap_ctrl_channel:
+        if not self._classic_channel_open(hid_host.l2cap_ctrl_channel):
             try:
                 await asyncio.wait_for(hid_host.connect_control_channel(), timeout=5.0)
+                self._classic_channel_origin = "host"
             except Exception:
                 pass
 
-        if not hid_host.l2cap_intr_channel:
+        if not self._classic_channel_open(hid_host.l2cap_intr_channel):
             try:
                 await asyncio.wait_for(hid_host.connect_interrupt_channel(), timeout=5.0)
+                self._classic_channel_origin = self._classic_channel_origin or "host"
             except Exception:
                 pass
 
@@ -190,7 +209,8 @@ class ClassicMixin:
             self.connected_protocol = None
             return
 
-        if not hid_host.l2cap_intr_channel:
+        self._classic_clear_closed_l2cap_channels(hid_host)
+        if not self._classic_channel_open(hid_host.l2cap_intr_channel):
             log.warning("[Classic] HID interrupt channel failed to connect, dropping link")
             try:
                 await connection.disconnect()
@@ -201,8 +221,22 @@ class ClassicMixin:
             self.connected_protocol = None
             return
 
+        if (
+            self._classic_hid_channels_open(hid_host)
+            and self._classic_channels_opened_at is None
+        ):
+            self._classic_channels_opened_at = time.monotonic()
+            self._classic_channel_origin = self._classic_channel_origin or "host"
+
         self._classic_set_report_protocol()
-        await self._handle_classic_connection()
+        await self._classic_disable_low_power(connection)
+        if not await self._handle_classic_connection(create_uhid=False):
+            return
+        self._classic_hid_ready_at = time.monotonic()
+        if self._classic_defer_uhid_until_input(addr_str):
+            self._park_classic_session_until_input()
+            return
+        self._finalize_classic_hid()
         self._record_current_session(Protocol.CLASSIC)
         log.success(f"[Classic] Session ready: {self._format_device(addr_str)}")
 
@@ -239,104 +273,116 @@ class ClassicMixin:
 
     async def _classic_active_connect_loop(self, addresses: List[str]):
         """Actively try to connect to Classic devices."""
+        current_task = asyncio.current_task()
+        existing = getattr(self, "_classic_active_connect_task", None)
+        if existing and existing is not current_task and not existing.done():
+            log.info("[Classic] Active connect loop already running")
+            return
+        self._classic_active_connect_task = current_task
         log.info(f"[Classic] Active: {len(addresses)} device(s)")
-        await asyncio.sleep(self.ACTIVE_DELAY)
 
-        attempt = 0
-        while not self._is_protocol_connected(Protocol.CLASSIC):
-            retry_delay = self._protocol_retry_delay(Protocol.CLASSIC)
-            if retry_delay > 0:
-                await asyncio.sleep(min(retry_delay, 1.0))
-                continue
+        try:
+            await asyncio.sleep(self.ACTIVE_DELAY)
 
-            if self._is_protocol_connecting(Protocol.CLASSIC):
-                await asyncio.sleep(0.5)
-                continue
+            attempt = 0
+            while not self._is_protocol_connected(Protocol.CLASSIC):
+                retry_delay = self._protocol_retry_delay(Protocol.CLASSIC)
+                if retry_delay > 0:
+                    await asyncio.sleep(min(retry_delay, 1.0))
+                    continue
 
-            all_backoff_delay = self._classic_backoff_delay_for_all(addresses)
-            if all_backoff_delay > 0:
-                await self._set_classic_page_scan(False)
-                wait_time = min(
-                    all_backoff_delay,
-                    self.CLASSIC_BACKOFF_POLL_INTERVAL,
-                )
-                log.debug(
-                    "[Classic] All active devices are in flap backoff; "
-                    f"next dial in {all_backoff_delay:.0f}s"
-                )
-                await asyncio.sleep(wait_time)
-                continue
-
-            await self._set_classic_page_scan(True)
-            for addr in addresses:
-                if self._is_protocol_connected(Protocol.CLASSIC):
-                    return
                 if self._is_protocol_connecting(Protocol.CLASSIC):
-                    break
+                    await asyncio.sleep(0.5)
+                    continue
 
-                flap_delay = self._classic_dial_delay(addr)
-                if flap_delay > 0:
+                all_backoff_delay = self._classic_backoff_delay_for_all(addresses)
+                if all_backoff_delay > 0:
+                    await self._set_classic_page_scan(True)
+                    wait_time = min(
+                        all_backoff_delay,
+                        self.CLASSIC_BACKOFF_POLL_INTERVAL,
+                    )
                     log.debug(
-                        f"[Classic] {self._format_device(addr)} in flap "
-                        f"backoff for {flap_delay:.0f}s; skipping dial"
+                        "[Classic] All active devices are in flap backoff; "
+                        f"passive Page Scan remains enabled; next dial in "
+                        f"{all_backoff_delay:.0f}s"
                     )
+                    await asyncio.sleep(wait_time)
                     continue
 
-                if self._has_live_classic_connection(addr):
-                    log.info(
-                        f"[Classic] {self._format_device(addr)} already linked; "
-                        "skipping active connect"
+                await self._set_classic_page_scan(True)
+                for addr in addresses:
+                    if self._is_protocol_connected(Protocol.CLASSIC):
+                        return
+                    if self._is_protocol_connecting(Protocol.CLASSIC):
+                        break
+
+                    flap_delay = self._classic_dial_delay(addr)
+                    if flap_delay > 0:
+                        log.debug(
+                            f"[Classic] {self._format_device(addr)} in flap "
+                            f"backoff for {flap_delay:.0f}s; skipping dial"
+                        )
+                        continue
+
+                    if self._has_live_classic_connection(addr):
+                        log.info(
+                            f"[Classic] {self._format_device(addr)} already linked; "
+                            "skipping active connect"
+                        )
+                        await asyncio.sleep(1.0)
+                        continue
+
+                    attempt += 1
+                    log.info(f"[Classic] Attempt {attempt}: {self._format_device(addr)}")
+
+                    target = Address(addr, Address.PUBLIC_DEVICE_ADDRESS)
+                    await self._radio_lock.acquire()
+                    connect_task = asyncio.create_task(
+                        self.device.connect(target, transport=BT_BR_EDR_TRANSPORT)
                     )
-                    await asyncio.sleep(1.0)
-                    continue
-
-                attempt += 1
-                log.info(f"[Classic] Attempt {attempt}: {self._format_device(addr)}")
-
-                target = Address(addr, Address.PUBLIC_DEVICE_ADDRESS)
-                await self._radio_lock.acquire()
-                connect_task = asyncio.create_task(
-                    self.device.connect(target, transport=BT_BR_EDR_TRANSPORT)
-                )
-                backoff = 0.0
-                try:
-                    timed_out = True
-                    for _ in range(self.ACTIVE_CONNECT_TIMEOUT):
-                        if self._is_protocol_connected(Protocol.CLASSIC):
-                            return
-                        done, _ = await asyncio.wait([connect_task], timeout=0.5)
-                        if done:
-                            timed_out = False
-                            break
-
-                    if timed_out:
-                        log.info(f"[Classic] {addr} timed out")
-                        backoff = 3.0
-                    else:
-                        await connect_task
-
-                except Exception as e:
-                    if "DISALLOWED" in str(e) or "PENDING" in str(e):
-                        log.warning("[Classic] HCI busy, waiting...")
-                        backoff = 5.0
-                    else:
-                        log.info(f"[Classic] Connect failed: {e}")
-                        backoff = 2.0
-
-                finally:
-                    if not connect_task.done():
-                        connect_task.cancel()
+                    backoff = 0.0
                     try:
-                        await connect_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    self._radio_lock.release()
+                        timed_out = True
+                        for _ in range(self.ACTIVE_CONNECT_TIMEOUT):
+                            if self._is_protocol_connected(Protocol.CLASSIC):
+                                return
+                            done, _ = await asyncio.wait([connect_task], timeout=0.5)
+                            if done:
+                                timed_out = False
+                                break
 
-                if backoff:
-                    await asyncio.sleep(backoff)
+                        if timed_out:
+                            log.info(f"[Classic] {addr} timed out")
+                            backoff = 3.0
+                        else:
+                            await connect_task
 
-            if not self._is_protocol_connected(Protocol.CLASSIC):
-                await asyncio.sleep(self.ACTIVE_RETRY_INTERVAL)
+                    except Exception as e:
+                        if "DISALLOWED" in str(e) or "PENDING" in str(e):
+                            log.warning("[Classic] HCI busy, waiting...")
+                            backoff = 5.0
+                        else:
+                            log.info(f"[Classic] Connect failed: {e}")
+                            backoff = 2.0
+
+                    finally:
+                        if not connect_task.done():
+                            connect_task.cancel()
+                        try:
+                            await connect_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        self._radio_lock.release()
+
+                    if backoff:
+                        await asyncio.sleep(backoff)
+
+                if not self._is_protocol_connected(Protocol.CLASSIC):
+                    await asyncio.sleep(self.ACTIVE_RETRY_INTERVAL)
+        finally:
+            if getattr(self, "_classic_active_connect_task", None) is current_task:
+                self._classic_active_connect_task = None
 
     def _classic_backoff_delay_for_all(self, addresses: List[str]) -> float:
         delays = []
@@ -359,15 +405,80 @@ class ClassicMixin:
         )
         self._classic_page_scan_enabled = enabled
 
+    async def _classic_disable_low_power(self, connection):
+        handle = getattr(connection, "handle", None)
+        if handle is None:
+            return
+        try:
+            await self.device.host.send_command(
+                HCI_Write_Link_Policy_Settings_Command(
+                    connection_handle=handle,
+                    link_policy_settings=0,
+                ),
+                check_result=True,
+            )
+            log.info("[Classic] Disabled low-power link policy")
+        except Exception as e:
+            log.warning(f"[Classic] Link policy update failed: {e}")
+        try:
+            await self.device.host.send_command(
+                HCI_Exit_Sniff_Mode_Command(connection_handle=handle),
+                check_result=True,
+            )
+            log.info("[Classic] Requested exit from sniff mode")
+        except Exception as e:
+            log.debug(f"[Classic] Exit sniff ignored: {e}")
+
+    def _classic_channel_open(self, channel):
+        if not channel:
+            return False
+        state = getattr(channel, "state", None)
+        state_enum = getattr(channel, "State", None)
+        if state is None or state_enum is None:
+            return True
+        return state == state_enum.OPEN
+
+    def _classic_channel_closed(self, channel):
+        if not channel:
+            return False
+        state = getattr(channel, "state", None)
+        state_enum = getattr(channel, "State", None)
+        if state is None or state_enum is None:
+            return False
+        closed_states = {
+            getattr(state_enum, "CLOSED", None),
+            getattr(state_enum, "WAIT_DISCONNECT", None),
+        }
+        return state in closed_states
+
+    def _classic_clear_closed_l2cap_channels(self, hid_host):
+        if self._classic_channel_closed(hid_host.l2cap_ctrl_channel):
+            hid_host.l2cap_ctrl_channel = None
+        if self._classic_channel_closed(hid_host.l2cap_intr_channel):
+            hid_host.l2cap_intr_channel = None
+
+    def _classic_hid_channels_open(self, hid_host):
+        return (
+            self._classic_channel_open(hid_host.l2cap_intr_channel)
+            and self._classic_channel_open(hid_host.l2cap_ctrl_channel)
+        )
+
     def _classic_set_report_protocol(self):
         """Send HIDP SET_PROTOCOL(Report) on the control channel."""
-        if not self.hid_host or not self.hid_host.l2cap_ctrl_channel:
+        if not self.hid_host or not self._classic_channel_open(self.hid_host.l2cap_ctrl_channel):
+            self._classic_set_protocol_ok = False
+            self._classic_set_protocol_error = "control channel unavailable"
             return
         try:
             self.hid_host.set_protocol(Message.ProtocolMode.REPORT_PROTOCOL)
+            self._classic_set_protocol_ok = True
+            self._classic_set_protocol_error = None
             log.info("[Classic] Sent SET_PROTOCOL (Report)")
         except Exception as e:
-            log.warning(f"[Classic] SET_PROTOCOL failed: {e}")
+            error = str(e)
+            self._classic_set_protocol_ok = False
+            self._classic_set_protocol_error = error
+            log.warning(f"[Classic] SET_PROTOCOL failed: {error}")
 
     def _finalize_classic_hid(self):
         """Apply fallback descriptor if needed and create UHID."""
@@ -376,8 +487,8 @@ class ClassicMixin:
             log.warning("[Classic] Using fallback descriptor")
         self._create_uhid_device()
 
-    async def _handle_classic_connection(self):
-        """Finalize Classic connection setup."""
+    async def _handle_classic_connection(self, create_uhid=True):
+        """Prepare Classic HID metadata and optionally create UHID."""
         if not self.hid_host.l2cap_intr_channel:
             raise InvalidStateError("HID interrupt channel not connected")
 
@@ -392,11 +503,13 @@ class ClassicMixin:
                     await self.connection.disconnect()
                 except Exception:
                     pass
-                return
+                return False
         elif not self._load_cached_descriptor():
             await self._query_classic_sdp()
 
-        self._finalize_classic_hid()
+        if create_uhid:
+            self._finalize_classic_hid()
+        return True
 
     def _parse_hid_descriptor_list(self, data_element):
         """Parse HID Descriptor List from SDP."""
@@ -438,6 +551,9 @@ class ClassicMixin:
                 (pdu[0] & 0x0F) != Message.ReportType.INPUT_REPORT:
             log.debug(f"[Classic] Ignoring non-input interrupt PDU: 0x{pdu[0]:02X}")
             return
+        if Protocol.CLASSIC not in self.sessions and self._classic_pending_session:
+            if not self._promote_classic_pending_session():
+                return
         self._forward_report_for_protocol(Protocol.CLASSIC, pdu[1:])
 
     def _on_virtual_cable_unplug(self):

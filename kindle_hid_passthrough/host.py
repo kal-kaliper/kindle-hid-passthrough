@@ -44,6 +44,17 @@ class DeviceSession:
     last_report: Optional[bytes] = None
     keyboard_last_keys: tuple = field(default_factory=tuple)
     established_at: float = 0.0
+    uhid_created_at: float = 0.0
+    source_report_count: int = 0
+    report_count: int = 0
+    last_source_report_hex: Optional[str] = None
+    last_uhid_report_hex: Optional[str] = None
+    classic_setup_ms: Optional[int] = None
+    classic_channels_ms: Optional[int] = None
+    classic_hid_ready_ms: Optional[int] = None
+    classic_channel_origin: Optional[str] = None
+    classic_set_protocol_ok: Optional[bool] = None
+    classic_set_protocol_error: Optional[str] = None
 
 
 class HIDHost(ClassicMixin, BLEMixin):
@@ -64,6 +75,7 @@ class HIDHost(ClassicMixin, BLEMixin):
     CLASSIC_FLAP_WINDOW = 30.0
     CLASSIC_FLAP_BACKOFF_BASE = 20.0
     CLASSIC_FLAP_BACKOFF_MAX = 300.0
+    CLASSIC_PARKED_RETRY_DELAY = 5.0
     CLASSIC_REMOTE_DISCONNECT_REASONS = frozenset({0x13, 0x14, 0x15})
 
     def __init__(self, transport_spec: str = None):
@@ -92,6 +104,7 @@ class HIDHost(ClassicMixin, BLEMixin):
         self.device_cache = DeviceCache(config.cache_dir)
 
         self.uhid_device = None
+        self._uhid_created_at = None
         self.sessions: dict[Protocol, DeviceSession] = {}
 
         self._disconnection_event = None
@@ -106,7 +119,15 @@ class HIDHost(ClassicMixin, BLEMixin):
         self._classic_retry_not_before = 0.0
         self._classic_flap_counts: dict[str, int] = {}
         self._classic_flap_until: dict[str, float] = {}
+        self._classic_pending_session: Optional[DeviceSession] = None
+        self._classic_active_connect_task = None
         self._classic_page_scan_enabled = False
+        self._classic_setup_started_at = None
+        self._classic_channels_opened_at = None
+        self._classic_hid_ready_at = None
+        self._classic_channel_origin = None
+        self._classic_set_protocol_ok = None
+        self._classic_set_protocol_error = None
         self.last_pair_error = None
         self._radio_lock = None
 
@@ -130,7 +151,13 @@ class HIDHost(ClassicMixin, BLEMixin):
             "protocol": primary.get("protocol"),
             "name": primary.get("name"),
         })
-        for key in ("uhid_name", "input_paths", "descriptor_size"):
+        for key in (
+            "uhid_name",
+            "input_paths",
+            "descriptor_size",
+            "source_report_count",
+            "uhid_report_count",
+        ):
             if key in primary:
                 state[key] = primary[key]
         return state
@@ -147,6 +174,8 @@ class HIDHost(ClassicMixin, BLEMixin):
                 state["input_paths"] = session.uhid_device.input_paths
         if session.report_map:
             state["descriptor_size"] = len(session.report_map)
+        state["source_report_count"] = session.source_report_count
+        state["uhid_report_count"] = session.report_count
         return state
 
     def _legacy_connection_state(self) -> dict:
@@ -283,6 +312,7 @@ class HIDHost(ClassicMixin, BLEMixin):
         self._allow_legacy_connection_state = False
         self._radio_lock = asyncio.Lock()
         self._protocol_restore_tasks = {}
+        self._classic_active_connect_task = None
 
         self._parse_devices()
         await self.start()
@@ -386,7 +416,44 @@ class HIDHost(ClassicMixin, BLEMixin):
     def _on_protocol_disconnection(self, protocol, address, reason):
         proto = protocol.value.upper() if protocol else "Unknown"
         addr = address or "unknown"
-        log.warning(f"[{proto}] Device disconnected: {addr} (reason={reason})")
+        now = time.monotonic()
+        session = self.sessions.get(protocol) if protocol else None
+        pending_session = None
+        was_pending = False
+        if (
+            not session
+            and protocol == Protocol.CLASSIC
+            and self._classic_pending_session
+        ):
+            pending_addr = normalize_addr(self._classic_pending_session.address)
+            if not address or normalize_addr(address) == pending_addr:
+                pending_session = self._classic_pending_session
+                session = pending_session
+                was_pending = True
+        if session:
+            session_age = now - session.established_at if session.established_at else 0.0
+            uhid_age = now - session.uhid_created_at if session.uhid_created_at else 0.0
+            input_paths = (
+                getattr(session.uhid_device, "input_paths", [])
+                if session.uhid_device else []
+            )
+            log.warning(
+                f"[{proto}] Device disconnected: {addr} (reason={reason}, "
+                f"session_age={session_age:.2f}s, uhid_age={uhid_age:.2f}s, "
+                f"source_reports={session.source_report_count}, "
+                f"uhid_reports={session.report_count}, "
+                f"last_source={session.last_source_report_hex}, "
+                f"last_uhid={session.last_uhid_report_hex}, "
+                f"classic_setup_ms={session.classic_setup_ms}, "
+                f"classic_channels_ms={session.classic_channels_ms}, "
+                f"classic_hid_ready_ms={session.classic_hid_ready_ms}, "
+                f"classic_channel_origin={session.classic_channel_origin}, "
+                f"classic_set_protocol_ok={session.classic_set_protocol_ok}, "
+                f"input_paths={input_paths}, "
+                f"live={self._live_protocols()})"
+            )
+        else:
+            log.warning(f"[{proto}] Device disconnected: {addr} (reason={reason})")
 
         if reason == 5 and address and proto == "CLASSIC":
             log.info("[Classic] Authentication failure; keeping bond and retrying")
@@ -396,7 +463,11 @@ class HIDHost(ClassicMixin, BLEMixin):
             self._classic_retry_not_before = time.monotonic() + retry_delay
             log.info(f"[Classic] Deferring retry for {retry_delay:.0f}s")
 
-        session = self.sessions.pop(protocol, None) if protocol else None
+        if was_pending:
+            session = pending_session
+            self._classic_pending_session = None
+        else:
+            session = self.sessions.pop(protocol, None) if protocol else None
         if session and session.uhid_device:
             try:
                 session.uhid_device.destroy()
@@ -404,6 +475,12 @@ class HIDHost(ClassicMixin, BLEMixin):
                 pass
         if session and protocol == Protocol.CLASSIC:
             self._update_classic_flap_backoff(session, reason)
+        short_idle_classic_drop = bool(
+            session
+            and protocol == Protocol.CLASSIC
+            and session.source_report_count == 0
+            and self._classic_short_idle_retry(session)
+        )
 
         if protocol in self._protocol_disconnection_events:
             self._protocol_disconnection_events[protocol].set()
@@ -411,27 +488,23 @@ class HIDHost(ClassicMixin, BLEMixin):
             self._is_session_alive(s) for s in self.sessions.values()
         )
         if self._disconnection_event:
-            if (
-                session
-                and protocol == Protocol.CLASSIC
-                and self.ble_devices
-                and not self._is_protocol_connected(Protocol.BLE)
-            ):
-                retry_delay = self.CLASSIC_AUTH_RETRY_DELAY_WITH_PENDING_BLE
-                self._classic_retry_not_before = time.monotonic() + retry_delay
-                log.info(
-                    "[Classic] Waiting for BLE before restarting Classic "
-                    f"after {retry_delay:.0f}s"
-                )
-            elif session and self._has_configured_devices(protocol) and live_sessions:
-                log.info(
-                    f"[{proto}] Restoring dropped session without restarting "
-                    "other live protocol"
-                )
-                self._schedule_protocol_restore(protocol)
+            if was_pending and self._has_configured_devices(protocol):
+                log.info(f"[{proto}] Parked link dropped before input; keeping host alive")
             elif session and self._has_configured_devices(protocol):
-                log.info(f"[{proto}] Restarting host to restore configured device")
-                self._disconnection_event.set()
+                if live_sessions:
+                    log.info(
+                        f"[{proto}] Restoring dropped session without restarting "
+                        "other live protocol"
+                    )
+                    self._schedule_protocol_restore(protocol)
+                elif short_idle_classic_drop:
+                    log.info(
+                        "[Classic] Restoring idle phone link without host restart"
+                    )
+                    self._schedule_protocol_restore(protocol)
+                else:
+                    log.info(f"[{proto}] Restarting host to restore configured device")
+                    self._disconnection_event.set()
             elif not live_sessions:
                 self._disconnection_event.set()
         if protocol == self.connected_protocol and protocol not in self.sessions:
@@ -450,6 +523,13 @@ class HIDHost(ClassicMixin, BLEMixin):
             self._forward_report_for_session(session, data)
             return
 
+        if self.sessions and protocol is not None:
+            log.warning(
+                f"[{protocol.value.upper()}] Dropping report without live "
+                f"session: {data.hex()}"
+            )
+            return
+
         if data != self._last_report:
             log.debug(f"Report: {data.hex()}")
             self._last_report = data
@@ -460,10 +540,26 @@ class HIDHost(ClassicMixin, BLEMixin):
                 log.warning(f"UHID send failed: {e}")
 
     def _forward_report_for_session(self, session: DeviceSession, data: bytes):
-        for report in self._reports_for_session(session, data):
+        session.source_report_count += 1
+        source_hex = data.hex()
+        session.last_source_report_hex = source_hex
+        reports = self._reports_for_session(session, data)
+        paced = (
+            session.protocol == Protocol.CLASSIC
+            and config.classic_serialize_keyboard_reports
+            and config.classic_serialized_report_delay_ms > 0
+            and len(reports) > 1
+        )
+        delay = config.classic_serialized_report_delay_ms / 1000.0
+        for index, report in enumerate(reports):
+            if paced and index:
+                time.sleep(delay)
             self._send_report_for_session(session, report)
 
     def _send_report_for_session(self, session: DeviceSession, data: bytes):
+        session.report_count += 1
+        uhid_hex = data.hex()
+        session.last_uhid_report_hex = uhid_hex
         if data != session.last_report:
             log.debug(f"Report: {data.hex()}")
             session.last_report = data
@@ -486,20 +582,25 @@ class HIDHost(ClassicMixin, BLEMixin):
             return (data,)
 
         modifier, keys = parsed
-        previous = set(session.keyboard_last_keys)
         current = tuple(key for key in keys if key)
+        previous = session.keyboard_last_keys
+        previous_set = set(previous)
         session.keyboard_last_keys = current
 
         release = self._make_classic_keyboard_report(0, ())
         if not current:
             return (release,)
 
+        if current == previous:
+            keys_to_tap = current
+        else:
+            keys_to_tap = tuple(key for key in current if key not in previous_set)
+
         reports = []
-        for key in current:
-            if key not in previous:
-                reports.append(self._make_classic_keyboard_report(modifier, (key,)))
-                reports.append(release)
-        return tuple(reports)
+        for key in keys_to_tap:
+            reports.append(self._make_classic_keyboard_report(modifier, (key,)))
+            reports.append(release)
+        return tuple(reports) or (release,)
 
     def _parse_classic_keyboard_report(self, data: bytes):
         if len(data) != 8 or data[0] != 1:
@@ -543,7 +644,15 @@ class HIDHost(ClassicMixin, BLEMixin):
                 product=0,
                 uniq=self.current_device_address or "",
             )
+            self._uhid_created_at = time.monotonic()
             log.success(f"UHID device created: {name}")
+            log.info(
+                f"UHID telemetry: protocol="
+                f"{self.connected_protocol.value if self.connected_protocol else None}, "
+                f"address={self.current_device_address}, "
+                f"descriptor={len(self.report_map)} bytes, "
+                f"stripped={len(descriptor)} bytes, live={self._live_protocols()}"
+            )
             asyncio.get_event_loop().call_later(
                 0.5, self.uhid_device.discover_input_paths)
         except Exception as e:
@@ -551,6 +660,7 @@ class HIDHost(ClassicMixin, BLEMixin):
 
     def _record_current_session(self, protocol: Protocol):
         event = self._protocol_disconnection_events.get(protocol)
+        recorded_at = time.monotonic()
         session = DeviceSession(
             protocol=protocol,
             address=self.current_device_address,
@@ -561,10 +671,22 @@ class HIDHost(ClassicMixin, BLEMixin):
             report_map=self.report_map,
             uhid_device=self.uhid_device,
             disconnection_event=event,
+            uhid_created_at=self._uhid_created_at or 0.0,
+            classic_setup_ms=self._classic_elapsed_ms(recorded_at),
+            classic_channels_ms=self._classic_elapsed_ms(self._classic_channels_opened_at),
+            classic_hid_ready_ms=self._classic_elapsed_ms(self._classic_hid_ready_at),
+            classic_channel_origin=self._classic_channel_origin,
+            classic_set_protocol_ok=self._classic_set_protocol_ok,
+            classic_set_protocol_error=self._classic_set_protocol_error,
         )
-        session.established_at = time.monotonic()
+        session.established_at = recorded_at
         self.sessions[protocol] = session
-        if not self._connection_future.done():
+        log.info(
+            f"[{protocol.value.upper()}] Session recorded: "
+            f"address={session.address}, name={session.device_name}, "
+            f"has_uhid={bool(session.uhid_device)}, live={self._live_protocols()}"
+        )
+        if self._connection_future and not self._connection_future.done():
             self._connection_future.set_result(session)
 
     def _protocol_event_is_set(self, protocol: Protocol) -> bool:
@@ -598,12 +720,113 @@ class HIDHost(ClassicMixin, BLEMixin):
             return bool(self.ble_devices)
         return False
 
+    def _is_classic_parked(self) -> bool:
+        return bool(
+            self._classic_pending_session
+            and self._is_session_alive(self._classic_pending_session)
+        )
+
+    def _live_protocols(self):
+        return [
+            protocol.value
+            for protocol, session in self.sessions.items()
+            if self._is_session_alive(session)
+        ]
+
+    def _classic_defer_uhid_until_input(self, address: str) -> bool:
+        names = config.classic_defer_uhid_until_input_names
+        if not names:
+            return False
+        return self._classic_name_matches(address, names)
+
+    def _classic_elapsed_ms(self, end_time: Optional[float]) -> Optional[int]:
+        if self._classic_setup_started_at is None or end_time is None:
+            return None
+        return max(0, int((end_time - self._classic_setup_started_at) * 1000))
+
+    def _classic_short_idle_retry(self, session: DeviceSession) -> bool:
+        names = config.classic_short_idle_retry_names
+        if not names:
+            return True
+        return self._classic_name_matches(session.address, names, session.device_name)
+
+    def _classic_name_matches(self, address: str, names, extra_name: str = None) -> bool:
+        configured_name = self._configured_name(address)
+        candidates = [configured_name, extra_name, self.device_name]
+        normalized_names = {
+            name.replace("\x00", "").strip().lower()
+            for name in names
+            if name and name.strip()
+        }
+        return any(
+            candidate
+            and candidate.replace("\x00", "").strip().lower() in normalized_names
+            for candidate in candidates
+        )
+
+    def _park_classic_session_until_input(self):
+        event = self._protocol_disconnection_events.get(Protocol.CLASSIC)
+        session = DeviceSession(
+            protocol=Protocol.CLASSIC,
+            address=self.current_device_address,
+            connection=self.connection,
+            hid_host=self.hid_host,
+            device_name=self.device_name,
+            report_map=self.report_map,
+            uhid_device=None,
+            disconnection_event=event,
+        )
+        session.established_at = time.monotonic()
+        self._classic_pending_session = session
+        if self._connection_future and not self._connection_future.done():
+            self._connection_future.set_result(session)
+        log.info(
+            f"[Classic] Parked {self._format_device(session.address)}; "
+            "waiting for first input report before creating UHID"
+        )
+
+    def _promote_classic_pending_session(self) -> bool:
+        pending = self._classic_pending_session
+        if not pending or not self._is_session_alive(pending):
+            return False
+
+        self.connection = pending.connection
+        self.hid_host = pending.hid_host
+        self.current_device_address = pending.address
+        self.device_name = pending.device_name
+        self.report_map = pending.report_map
+        self.connected_protocol = Protocol.CLASSIC
+        self.uhid_device = None
+        self._uhid_created_at = None
+
+        self._finalize_classic_hid()
+        if not self.uhid_device:
+            log.warning("[Classic] Could not promote parked link; UHID unavailable")
+            return False
+
+        self._classic_pending_session = None
+        self._record_current_session(Protocol.CLASSIC)
+        log.success(
+            f"[Classic] Promoted parked link after input: "
+            f"{self._format_device(self.current_device_address)}"
+        )
+        return True
+
     def _schedule_protocol_restore(self, protocol: Protocol):
         existing = self._protocol_restore_tasks.get(protocol)
         if existing and not existing.done():
             return
         if protocol == Protocol.CLASSIC:
-            coro = self._run_classic_handler()
+            has_classic_listener = bool(
+                getattr(self, "_classic_connection_listener", None)
+            )
+            active_addresses = [
+                dev.address for dev in self.classic_devices if dev.address != '*'
+            ]
+            if has_classic_listener and active_addresses:
+                coro = self._classic_active_connect_loop(active_addresses)
+            else:
+                coro = self._run_classic_handler()
         elif protocol == Protocol.BLE:
             coro = self._run_ble_handler()
         else:
@@ -644,8 +867,9 @@ class HIDHost(ClassicMixin, BLEMixin):
             if session.established_at else 0.0
         )
         if session.last_report is not None or duration >= self.CLASSIC_FLAP_WINDOW:
-            if self._classic_flap_counts.pop(addr, None) is not None:
-                self._classic_flap_until.pop(addr, None)
+            had_flap_count = self._classic_flap_counts.pop(addr, None) is not None
+            had_retry_deadline = self._classic_flap_until.pop(addr, None) is not None
+            if had_flap_count or had_retry_deadline:
                 log.info(
                     f"[Classic] {self._format_device(addr)} session healthy; "
                     "clearing flap backoff"
@@ -653,6 +877,18 @@ class HIDHost(ClassicMixin, BLEMixin):
             return
 
         if reason not in self.CLASSIC_REMOTE_DISCONNECT_REASONS:
+            return
+
+        if session.source_report_count == 0 and self._classic_short_idle_retry(session):
+            delay = self.CLASSIC_PARKED_RETRY_DELAY
+            if self.ble_devices and not self._is_protocol_connected(Protocol.BLE):
+                delay = max(delay, self.CLASSIC_AUTH_RETRY_DELAY_WITH_PENDING_BLE)
+            self._classic_flap_until[addr] = time.monotonic() + delay
+            log.warning(
+                f"[Classic] {self._format_device(addr)} idle link dropped "
+                f"before input after {duration:.0f}s; retrying in "
+                f"{delay:.0f}s"
+            )
             return
 
         count = self._classic_flap_counts.get(addr, 0) + 1
@@ -727,6 +963,22 @@ class HIDHost(ClassicMixin, BLEMixin):
                 except Exception as e:
                     log.debug(f"Disconnect cleanup: {e}")
         self.sessions.clear()
+
+        if self._classic_pending_session:
+            pending = self._classic_pending_session
+            if pending.uhid_device:
+                try:
+                    pending.uhid_device.destroy()
+                except Exception:
+                    pass
+            if self._is_session_alive(pending):
+                try:
+                    await asyncio.wait_for(pending.connection.disconnect(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    log.warning("Connection disconnect timed out")
+                except Exception as e:
+                    log.debug(f"Disconnect cleanup: {e}")
+            self._classic_pending_session = None
 
         peer_already_disconnected = (
             self._disconnection_event is not None

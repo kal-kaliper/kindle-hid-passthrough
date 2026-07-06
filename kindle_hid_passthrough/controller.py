@@ -20,6 +20,18 @@ logger = logging.getLogger(__name__)
 
 __all__ = ['DaemonController']
 
+STATUS_CONNECTION_KEYS = (
+    "address",
+    "protocol",
+    "name",
+    "hid_ready",
+    "uhid_name",
+    "input_paths",
+    "descriptor_size",
+    "source_report_count",
+    "uhid_report_count",
+)
+
 
 class DaemonController:
     """Coordinates between the HTTP server thread and the async daemon.
@@ -65,19 +77,26 @@ class DaemonController:
         conn = self.daemon.connection_state
         if conn.get("connected"):
             if conn.get("connections"):
-                status["connections"] = conn["connections"]
+                status["connections"] = [
+                    self._status_connection_state(connection)
+                    for connection in conn["connections"]
+            ]
             status["connected_device"] = conn.get("address")
             status["connected_protocol"] = conn.get("protocol")
             status["connected_name"] = conn.get("name")
-            status["hid_ready"] = conn.get("hid_ready", False)
-            if conn.get("uhid_name"):
-                status["uhid_name"] = conn["uhid_name"]
-            if conn.get("input_paths"):
-                status["input_paths"] = conn["input_paths"]
-            if conn.get("descriptor_size"):
-                status["descriptor_size"] = conn["descriptor_size"]
+            for key in STATUS_CONNECTION_KEYS:
+                if key in conn:
+                    status[key] = conn[key]
 
         return status
+
+    @staticmethod
+    def _status_connection_state(connection: dict) -> dict:
+        return {
+            key: connection[key]
+            for key in STATUS_CONNECTION_KEYS
+            if key in connection
+        }
 
     def _get_devices_cached(self) -> list:
         """Device list from devices.conf, cached by file mtime."""

@@ -121,6 +121,12 @@ class Config:
             'classic', 'require_live_descriptor', True)
         self.classic_serialize_keyboard_reports = self._getbool(
             'classic', 'serialize_keyboard_reports', True)
+        self.classic_serialized_report_delay_ms = self._getint(
+            'classic', 'serialized_report_delay_ms', 0)
+        self.classic_defer_uhid_until_input_names = self._get_list(
+            'classic', 'defer_uhid_until_input_names', [])
+        self.classic_short_idle_retry_names = self._get_list(
+            'classic', 'short_idle_retry_names', [])
         self.power_monitor_enabled = self._getbool('power', 'monitor_enabled', True)
         self.power_startup_delay = float(self._get('power', 'startup_delay', '8.0'))
         self.power_resume_delay = float(self._get('power', 'resume_delay', '20.0'))

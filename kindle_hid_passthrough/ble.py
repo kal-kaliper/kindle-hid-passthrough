@@ -35,7 +35,10 @@ class BLEMixin:
 
     BLE_INIT_WINDOW = 18.0
     BLE_SCAN_WINDOW = 8.0
-    BLE_COEXIST_WINDOW = 2.5
+    BLE_COEXIST_WINDOW = 1.0
+    BLE_CLASSIC_IDLE_WINDOW = 12.0
+    BLE_CLASSIC_IDLE_RETRY_DELAY = 2.0
+    BLE_COEXIST_RETRY_DELAY = 60.0
 
     async def _run_ble_handler(self):
         """Handle BLE connections."""
@@ -52,7 +55,7 @@ class BLEMixin:
         await self.device.send_command(
             HCI_LE_Clear_Filter_Accept_List_Command(), check_result=True)
 
-        known = {normalize_addr(a) for a in addresses} | self._keystore_addresses
+        known = {normalize_addr(a) for a in addresses}
 
         for addr_str in sorted(known):
             target = Address(addr_str)
@@ -79,6 +82,12 @@ class BLEMixin:
 
                 connection = await self._ble_initiate(self.BLE_INIT_WINDOW)
                 if connection is not None:
+                    if await self._reject_unconfigured_ble_connection(
+                        connection, matched_dev
+                    ):
+                        connection = None
+                        await self._ble_coexist_pause()
+                        continue
                     break
 
                 match = await self._ble_scan_for_rotated(known, self.BLE_SCAN_WINDOW)
@@ -86,6 +95,17 @@ class BLEMixin:
                     target_address, matched_dev, match_kind = match
                     connection = await self._ble_initiate(
                         config.connect_timeout, peer=target_address)
+                    if (
+                        connection is not None
+                        and await self._reject_unconfigured_ble_connection(
+                            connection, matched_dev
+                        )
+                    ):
+                        connection = None
+                        await self._ble_coexist_pause()
+                        continue
+                if connection is None:
+                    await self._ble_coexist_pause()
 
             if connection is None:
                 return
@@ -111,6 +131,7 @@ class BLEMixin:
                 self.report_map = None
                 self.hid_reports = []
                 self.uhid_device = None
+                self._uhid_created_at = None
                 self._last_report = None
                 self.connected_protocol = Protocol.BLE
                 connection.on(
@@ -145,13 +166,86 @@ class BLEMixin:
                 self.current_device_address = None
                 self.connected_protocol = None
 
+    async def _reject_unconfigured_ble_connection(self, connection, matched_dev) -> bool:
+        if matched_dev is not None:
+            return False
+        addr_str = str(connection.peer_address)
+        addr_norm = normalize_addr(addr_str)
+        configured = {
+            normalize_addr(dev.address)
+            for dev in self.ble_devices
+            if dev.address != '*'
+        }
+        if addr_norm in configured or any(dev.address == '*' for dev in self.ble_devices):
+            return False
+        log.warning(f"[BLE] Rejecting {addr_str} (not configured for BLE)")
+        try:
+            await connection.disconnect()
+        except Exception:
+            pass
+        return True
+
+    def _ble_should_yield_to_classic(self) -> bool:
+        return bool(
+            self.classic_devices
+            and not self._is_protocol_connected(Protocol.CLASSIC)
+        )
+
+    def _ble_has_classic_activity(self) -> bool:
+        return bool(
+            any(p != Protocol.BLE for p in self.sessions)
+            or (
+                self._is_protocol_connecting(Protocol.CLASSIC)
+                and not self._is_classic_parked()
+            )
+            or self._is_protocol_connected(Protocol.CLASSIC)
+        )
+
+    def _ble_window_for_radio_state(self, window: float) -> float:
+        if self._ble_has_classic_activity():
+            return min(window, self.BLE_COEXIST_WINDOW)
+        if self._ble_should_yield_to_classic():
+            return min(window, self.BLE_CLASSIC_IDLE_WINDOW)
+        return window
+
+    def _ble_coexist_pause_delay(self) -> float:
+        if self._ble_has_classic_activity():
+            return self.BLE_COEXIST_RETRY_DELAY
+        if self._ble_should_yield_to_classic():
+            return self.BLE_CLASSIC_IDLE_RETRY_DELAY
+        return 0.0
+
+    async def _ble_coexist_pause(self):
+        delay = self._ble_coexist_pause_delay()
+        if delay <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + delay
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, 1.0))
+            updated_delay = self._ble_coexist_pause_delay()
+            if updated_delay <= 0:
+                return
+            if updated_delay < remaining:
+                deadline = loop.time() + updated_delay
+
     async def _ble_initiate(self, window: float, peer: Address = None):
         """Legacy create-connection to `peer`, or to the accept list when
         None. Returns the connection, or None on window timeout."""
-        if any(p != Protocol.BLE for p in self.sessions):
-            window = min(window, self.BLE_COEXIST_WINDOW)
+        window = self._ble_window_for_radio_state(window)
 
-        pending = asyncio.get_running_loop().create_future()
+        mode = f"peer {peer}" if peer is not None else "accept-list"
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        log.info(
+            f"[BLE] Initiate window start: mode={mode}, "
+            f"window={window:.1f}s, live={self._live_protocols()}"
+        )
+        pending = loop.create_future()
+        initiated = False
 
         def on_connection(connection):
             if connection.transport == BT_LE_TRANSPORT and not pending.done():
@@ -173,32 +267,80 @@ class BLEMixin:
         self.device.on(Device.EVENT_CONNECTION_FAILURE, on_failure)
 
         try:
+            if self._ble_has_classic_activity():
+                log.info("[BLE] Initiate window skipped: Classic setup active")
+                return None
+
             self.device.connect_own_address_type = OwnAddressType.PUBLIC
             self.device.le_connecting = True
 
-            await self.device.send_command(
-                HCI_LE_Create_Connection_Command(
-                    le_scan_interval=96,
-                    le_scan_window=96,
-                    initiator_filter_policy=0 if peer is not None else 1,
-                    peer_address_type=peer.address_type if peer is not None else 0,
-                    peer_address=peer if peer is not None else Address.ANY,
-                    own_address_type=OwnAddressType.PUBLIC,
-                    connection_interval_min=12,
-                    connection_interval_max=24,
-                    max_latency=0,
-                    supervision_timeout=72,
-                    min_ce_length=0,
-                    max_ce_length=0,
-                ), check_result=True)
-
             try:
-                return await asyncio.wait_for(asyncio.shield(pending), timeout=window)
-            except asyncio.TimeoutError:
+                await self.device.send_command(
+                    HCI_LE_Create_Connection_Command(
+                        le_scan_interval=96,
+                        le_scan_window=96,
+                        initiator_filter_policy=0 if peer is not None else 1,
+                        peer_address_type=peer.address_type if peer is not None else 0,
+                        peer_address=peer if peer is not None else Address.ANY,
+                        own_address_type=OwnAddressType.PUBLIC,
+                        connection_interval_min=12,
+                        connection_interval_max=24,
+                        max_latency=0,
+                        supervision_timeout=72,
+                        min_ce_length=0,
+                        max_ce_length=0,
+                    ), check_result=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.info(f"[BLE] Initiate command failed: {e}")
                 return None
+            initiated = True
+
+            deadline = started + window
+            while True:
+                if self._ble_has_classic_activity():
+                    elapsed = loop.time() - started
+                    log.info(
+                        "[BLE] Initiate window aborted for Classic setup: "
+                        f"mode={mode}, elapsed={elapsed:.2f}s"
+                    )
+                    return None
+
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    elapsed = loop.time() - started
+                    log.info(
+                        f"[BLE] Initiate window timeout: mode={mode}, "
+                        f"elapsed={elapsed:.2f}s"
+                    )
+                    return None
+
+                try:
+                    connection = await asyncio.wait_for(
+                        asyncio.shield(pending),
+                        timeout=min(0.1, remaining),
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    elapsed = loop.time() - started
+                    log.info(
+                        f"[BLE] Initiate window failed: mode={mode}, "
+                        f"elapsed={elapsed:.2f}s, error={e}"
+                    )
+                    return None
+                elapsed = loop.time() - started
+                log.info(
+                    f"[BLE] Initiate window connected: "
+                    f"peer={connection.peer_address}, elapsed={elapsed:.2f}s"
+                )
+                return connection
 
         finally:
-            if not pending.done():
+            if initiated and not pending.done():
                 try:
                     await self.device.send_command(
                         HCI_LE_Create_Connection_Cancel_Command())
@@ -213,10 +355,11 @@ class BLEMixin:
     async def _ble_scan_for_rotated(self, known: set, window: float):
         """Scan for bonded devices advertising, including from a rotated
         address. Returns (address, DeviceConfig or None, kind) or None."""
-        if any(p != Protocol.BLE for p in self.sessions):
-            window = min(window, self.BLE_COEXIST_WINDOW)
+        window = self._ble_window_for_radio_state(window)
 
-        rotated = asyncio.get_running_loop().create_future()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        rotated = loop.create_future()
 
         def on_advertisement(advertisement):
             if rotated.done():
@@ -235,10 +378,21 @@ class BLEMixin:
                 filter_duplicates=True,
             )
             scanning = True
-            try:
-                return await asyncio.wait_for(rotated, timeout=window)
-            except asyncio.TimeoutError:
-                return None
+            deadline = started + window
+            while True:
+                if self._ble_has_classic_activity():
+                    log.info("[BLE] Rotation scan aborted for Classic setup")
+                    return None
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return None
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(rotated),
+                        timeout=min(0.1, remaining),
+                    )
+                except asyncio.TimeoutError:
+                    pass
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -360,6 +514,7 @@ class BLEMixin:
                             self.report_map = None
                             self.hid_reports = []
                             self.uhid_device = None
+                            self._uhid_created_at = None
                             self._last_report = None
                             self.connected_protocol = Protocol.BLE
                             connection.on(
@@ -400,6 +555,11 @@ class BLEMixin:
                     return
             except Exception as e:
                 log.warning(f"[BLE] Bonding restore failed: {e}")
+                if (
+                    not self._is_raw_connection_alive(self.connection)
+                    or self._protocol_event_is_set(Protocol.BLE)
+                ):
+                    raise InvalidStateError("[BLE] Disconnected during bonding restore")
 
         log.info("[BLE] Initiating pairing...")
         await self._wait_for_ble_operation(self.connection.pair(), "pairing")

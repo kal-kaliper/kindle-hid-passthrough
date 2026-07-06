@@ -37,6 +37,9 @@ class HIDDaemon:
         self._resume_after_power = False
         self._resume_after_power_reason = None
         self._paired_host = None
+        self._classic_flap_counts = {}
+        self._classic_flap_until = {}
+        self._classic_retry_not_before = 0.0
 
     @property
     def connection_state(self) -> dict:
@@ -212,6 +215,17 @@ class HIDDaemon:
 
         return True
 
+    def _seed_host_state(self, host: HIDHost):
+        """Carry reconnect throttles across host restarts."""
+        host._classic_flap_counts = self._classic_flap_counts
+        host._classic_flap_until = self._classic_flap_until
+        host._classic_retry_not_before = self._classic_retry_not_before
+
+    def _capture_host_state(self, host: HIDHost):
+        self._classic_flap_counts = host._classic_flap_counts
+        self._classic_flap_until = host._classic_flap_until
+        self._classic_retry_not_before = host._classic_retry_not_before
+
     async def run(self):
         """Main daemon loop."""
         self.running = True
@@ -245,12 +259,14 @@ class HIDDaemon:
                     logger.info("=== Continuing with paired device ===")
                     self.host = self._paired_host
                     self._paired_host = None
+                    self._seed_host_state(self.host)
                     self._host_task = asyncio.create_task(
                         self.host.continue_after_pairing()
                     )
                 else:
                     logger.info("=== Starting connection ===")
                     self.host = HIDHost()
+                    self._seed_host_state(self.host)
                     self._host_task = asyncio.create_task(
                         self.host.run()
                     )
@@ -276,6 +292,7 @@ class HIDDaemon:
                 auth_fail_addr = None
                 vc_unplug_addr = None
                 if self.host and not self._suspended:
+                    self._capture_host_state(self.host)
                     auth_fail_addr = self.host.get_auth_failure_address()
                     vc_unplug_addr = self.host.get_virtual_cable_unplug_address()
                     try:

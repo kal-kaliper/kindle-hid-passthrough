@@ -17,6 +17,9 @@ __all__ = ['Scanner', 'DiscoveredDevice']
 
 BLE_APPEARANCE_CATEGORY_PHONE = 0x01
 BLE_APPEARANCE_CATEGORY_HID = 0x0F
+CLASSIC_MAJOR_DEVICE_CLASS_PHONE = 0x02
+CLASSIC_MAJOR_DEVICE_CLASS_PERIPHERAL = 0x05
+CLASSIC_HID_CANDIDATE_CLASSES = {"Peripheral", "Phone"}
 
 
 @dataclass
@@ -163,10 +166,7 @@ class Scanner:
                         appearance_category = (
                             int(appearance) >> 6 if appearance is not None else None
                         )
-                        if appearance_category in (
-                            BLE_APPEARANCE_CATEGORY_HID,
-                            BLE_APPEARANCE_CATEGORY_PHONE,
-                        ):
+                        if appearance_category == BLE_APPEARANCE_CATEGORY_HID:
                             is_hid = True
                 except UnicodeDecodeError as e:
                     log.debug(f"Skipping malformed BLE advertisement from {addr_str}: {e}")
@@ -226,10 +226,13 @@ class Scanner:
             try:
                 _, major_class, _minor_class = DeviceClass.split_class_of_device(class_of_device)
                 major_class_name = DeviceClass.major_device_class_name(major_class)
-                is_hid = major_class_name in ("Peripheral", "Phone")
+                is_hid = major_class_name in CLASSIC_HID_CANDIDATE_CLASSES
             except Exception:
                 major_class = (class_of_device >> 8) & 0x1F
-                is_hid = major_class in (0x02, 0x05)
+                is_hid = major_class in (
+                    CLASSIC_MAJOR_DEVICE_CLASS_PERIPHERAL,
+                    CLASSIC_MAJOR_DEVICE_CLASS_PHONE,
+                )
                 major_class_name = f"0x{major_class:02X}"
 
             # Log ALL devices found, not just HID
