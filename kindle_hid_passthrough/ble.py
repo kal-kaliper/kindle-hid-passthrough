@@ -530,6 +530,9 @@ class BLEMixin:
                             self.uhid_device = None
                             self._uhid_created_at = None
                             self._last_report = None
+                            # Cleared per fresh connection so a bond-restore
+                            # failure reads only this session's disconnect reason.
+                            self._last_ble_disconnect_reason = None
                             self.connected_protocol = Protocol.BLE
                             connection.on(
                                 'disconnection',
@@ -559,8 +562,9 @@ class BLEMixin:
             return
 
         if self.device.keystore:
+            peer_address = str(self.connection.peer_address)
             try:
-                keys = await self.device.keystore.get(str(self.connection.peer_address))
+                keys = await self.device.keystore.get(peer_address)
                 if keys:
                     log.info("[BLE] Restoring bonding...")
                     await self._wait_for_ble_operation(
@@ -573,11 +577,34 @@ class BLEMixin:
                     not self._is_raw_connection_alive(self.connection)
                     or self._protocol_event_is_set(Protocol.BLE)
                 ):
+                    # If the peer dropped the link because it rejected our stored
+                    # key (it was re-paired to another host and forgot us), the
+                    # bond will fail identically on every future restore and
+                    # deadlock reconnection. Forget it so the next window pairs
+                    # fresh. Keep the bond on transient drops (e.g. supervision
+                    # timeout) so a good bond survives a momentary glitch.
+                    if self._last_ble_disconnect_reason in self.BLE_BOND_REJECT_REASONS:
+                        await self._forget_ble_bond(peer_address)
                     raise InvalidStateError("[BLE] Disconnected during bonding restore")
 
         log.info("[BLE] Initiating pairing...")
         await self._wait_for_ble_operation(self.connection.pair(), "pairing")
         log.success("[BLE] Pairing complete")
+
+    async def _forget_ble_bond(self, address: str):
+        """Delete a stale BLE bond so the next connect re-pairs from scratch."""
+        if not self.device.keystore:
+            return
+        try:
+            await self.device.keystore.delete(address)
+            log.warning(
+                f"[BLE] Removed stale bond for {address} "
+                "(peer rejected our key); will re-pair on reconnect"
+            )
+        except KeyError:
+            pass
+        except Exception as e:
+            log.warning(f"[BLE] Failed to remove stale bond for {address}: {e}")
 
     async def _wait_for_ble_operation(self, awaitable, operation: str,
                                       timeout: float = 20.0):

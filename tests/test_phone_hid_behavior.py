@@ -250,8 +250,14 @@ class FakeBleDevice:
 
 
 class FakeKeystore:
+    def __init__(self):
+        self.deleted = []
+
     async def get(self, _address):
         return object()
+
+    async def delete(self, address):
+        self.deleted.append(address)
 
 
 class FakeClassicController:
@@ -419,6 +425,7 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self._old_defer_names = config.classic_defer_uhid_until_input_names
         self._old_idle_retry_names = config.classic_short_idle_retry_names
         self._old_include_reports = config.diagnostics_include_reports
+        self._old_ble_remap_home = config.ble_remap_consumer_home_to_escape
         config.classic_serialize_keyboard_reports = True
         config.classic_serialized_report_delay_ms = 0
         config.classic_keyboard_modifier_mask = 0xff
@@ -429,6 +436,7 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         config.classic_defer_uhid_until_input_names = []
         config.classic_short_idle_retry_names = []
         config.diagnostics_include_reports = False
+        config.ble_remap_consumer_home_to_escape = False
 
     def tearDown(self):
         config.classic_serialize_keyboard_reports = self._old_serialize
@@ -441,6 +449,7 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         config.classic_defer_uhid_until_input_names = self._old_defer_names
         config.classic_short_idle_retry_names = self._old_idle_retry_names
         config.diagnostics_include_reports = self._old_include_reports
+        config.ble_remap_consumer_home_to_escape = self._old_ble_remap_home
 
     def make_host(self):
         cache_dir = tempfile.mkdtemp(prefix="hid-host-test-")
@@ -593,6 +602,40 @@ class PhoneHidBehaviorTests(unittest.TestCase):
 
         self.assertEqual(
             [b"\x01\x00\x00\x04\x00\x00\x00\x00"],
+            session.uhid_device.inputs,
+        )
+
+    def test_ble_consumer_home_is_forwarded_unchanged_by_default(self):
+        host = self.make_host()
+        session = self.make_session(Protocol.BLE)
+        host.sessions[Protocol.BLE] = session
+
+        host._forward_report_for_protocol(
+            Protocol.BLE, b"\x03\x00\x01\x00\x00")
+        host._forward_report_for_protocol(
+            Protocol.BLE, b"\x03\x00\x00\x00\x00")
+
+        self.assertEqual(
+            [b"\x03\x00\x01\x00\x00", b"\x03\x00\x00\x00\x00"],
+            session.uhid_device.inputs,
+        )
+
+    def test_ble_consumer_home_remaps_to_escape_when_enabled(self):
+        config.ble_remap_consumer_home_to_escape = True
+        host = self.make_host()
+        session = self.make_session(Protocol.BLE)
+        host.sessions[Protocol.BLE] = session
+
+        host._forward_report_for_protocol(
+            Protocol.BLE, b"\x03\x00\x01\x00\x00")
+        host._forward_report_for_protocol(
+            Protocol.BLE, b"\x03\x00\x00\x00\x00")
+
+        self.assertEqual(
+            [
+                b"\x02\x00\x00\x29\x00\x00\x00\x00\x00",
+                b"\x02\x00\x00\x00\x00\x00\x00\x00\x00",
+            ],
             session.uhid_device.inputs,
         )
 
@@ -1236,6 +1279,51 @@ class PhoneHidBehaviorTests(unittest.TestCase):
 
         self.assertIn("Disconnected during bonding restore", error)
         self.assertFalse(connection.pair_called)
+
+    def test_ble_restore_forgets_bond_when_peer_rejects_key(self):
+        async def scenario():
+            host = self.make_host()
+            connection = FakeConnection()
+            host.connection = connection
+            host.connected_protocol = Protocol.BLE
+            keystore = FakeKeystore()
+            host.device = types.SimpleNamespace(keystore=keystore)
+            host._protocol_disconnection_events[Protocol.BLE].set()
+            # 0x3E = Connection Failed to be Established: peer dropped us during
+            # encryption because it no longer holds our bond.
+            host._last_ble_disconnect_reason = 0x3E
+
+            with self.assertRaises(Exception):
+                await host._ble_restore_or_pair()
+
+            return connection, keystore
+
+        connection, keystore = asyncio.run(scenario())
+
+        self.assertEqual([connection.peer_address], keystore.deleted)
+        self.assertFalse(connection.pair_called)
+
+    def test_ble_restore_keeps_bond_on_transient_drop(self):
+        async def scenario():
+            host = self.make_host()
+            connection = FakeConnection()
+            host.connection = connection
+            host.connected_protocol = Protocol.BLE
+            keystore = FakeKeystore()
+            host.device = types.SimpleNamespace(keystore=keystore)
+            host._protocol_disconnection_events[Protocol.BLE].set()
+            # 0x08 = Connection Timeout (supervision timeout): a transient drop,
+            # not a key rejection, so the good bond must be preserved.
+            host._last_ble_disconnect_reason = 0x08
+
+            with self.assertRaises(Exception):
+                await host._ble_restore_or_pair()
+
+            return keystore
+
+        keystore = asyncio.run(scenario())
+
+        self.assertEqual([], keystore.deleted)
 
 
 class DaemonHostStateTests(unittest.TestCase):

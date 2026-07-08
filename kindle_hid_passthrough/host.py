@@ -21,6 +21,16 @@ from uhid_handler import Bus, UHIDDevice, strip_digitizer_collections
 
 __all__ = ['HIDHost']
 
+# Some BLE keyboards bind their Esc key to the Consumer-page "AC Home"
+# control (usage 0x0223) instead of the standard Keyboard-page Escape
+# (usage 0x29), so it never reaches KOReader/terminal apps as Escape.
+# These are the exact 5-byte Consumer report payloads that keyboard sends
+# for that key (report_id 3, bit for AC Home set/cleared); see
+# docs/troubleshooting.md for how they were captured.
+_CONSUMER_HOME_PRESS = bytes.fromhex('0300010000')
+_CONSUMER_HOME_RELEASE = bytes.fromhex('0300000000')
+_KEYBOARD_ESCAPE_USAGE = 0x29
+
 
 @dataclass
 class DeviceConfig:
@@ -80,6 +90,12 @@ class HIDHost(ClassicMixin, BLEMixin):
     CLASSIC_FLAP_BACKOFF_MAX = 300.0
     CLASSIC_PARKED_RETRY_DELAY = 5.0
     CLASSIC_REMOTE_DISCONNECT_REASONS = frozenset({0x13, 0x14, 0x15})
+    # HCI disconnect reasons that mean the BLE peer rejected our stored bond:
+    # 0x05 Authentication Failure, 0x06 PIN or Key Missing,
+    # 0x3E Connection Failed to be Established (link dropped during encryption).
+    # A bond that fails this way will fail every future restore identically, so
+    # it must be forgotten to let reconnection fall back to fresh pairing.
+    BLE_BOND_REJECT_REASONS = frozenset({0x05, 0x06, 0x3E})
 
     def __init__(self, transport_spec: str = None):
         self.transport_spec = transport_spec or config.transport
@@ -112,6 +128,7 @@ class HIDHost(ClassicMixin, BLEMixin):
 
         self._disconnection_event = None
         self._protocol_disconnection_events: dict[Protocol, asyncio.Event] = {}
+        self._last_ble_disconnect_reason = None
         self._connection_future = None
         self._session_setup_lock = None
         self._allow_legacy_connection_state = False
@@ -427,6 +444,10 @@ class HIDHost(ClassicMixin, BLEMixin):
         proto = protocol.value.upper() if protocol else "Unknown"
         addr = address or "unknown"
         now = time.monotonic()
+        if protocol == Protocol.BLE:
+            # Recorded so an in-flight bond restore can tell a credential
+            # rejection (forget the bond) from a transient drop (keep it).
+            self._last_ble_disconnect_reason = reason
         session = self.sessions.get(protocol) if protocol else None
         pending_session = None
         was_pending = False
@@ -563,6 +584,12 @@ class HIDHost(ClassicMixin, BLEMixin):
         source_hex = data.hex()
         session.last_source_report_hex = source_hex
         self._append_recent_report(session.recent_source_reports, source_hex)
+
+        escape_report = self._remap_consumer_home_to_escape(session, data)
+        if escape_report is not None:
+            self._send_report_for_session(session, escape_report)
+            return
+
         reports = self._reports_for_session(session, data)
         delay_ms = self._serialized_report_delay_ms(session)
         paced = delay_ms > 0 and len(reports) > 1
@@ -594,6 +621,23 @@ class HIDHost(ClassicMixin, BLEMixin):
             reports.clear()
         elif len(reports) > max_count:
             del reports[:-max_count]
+
+    def _remap_consumer_home_to_escape(self, session: DeviceSession, data: bytes) -> Optional[bytes]:
+        """Translate a mis-bound Consumer 'AC Home' press/release into a
+        synthesized Keyboard-page Escape report, for keyboards whose Esc
+        key sends the wrong HID usage. Returns None if remapping is
+        disabled or `data` isn't one of the known Home reports."""
+        if session.protocol != Protocol.BLE or not config.ble_remap_consumer_home_to_escape:
+            return None
+        report_ids = self._keyboard_report_ids(session)
+        if not report_ids:
+            return None
+        report_id = report_ids[0]
+        if data == _CONSUMER_HOME_PRESS:
+            return self._make_keyboard_report(report_id, 0, (_KEYBOARD_ESCAPE_USAGE,), 9)
+        if data == _CONSUMER_HOME_RELEASE:
+            return self._make_keyboard_report(report_id, 0, (), 9)
+        return None
 
     def _reports_for_session(self, session: DeviceSession, data: bytes):
         if not self._serialize_keyboard_reports(session):

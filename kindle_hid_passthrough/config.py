@@ -139,6 +139,8 @@ class Config:
         self.ble_keyboard_modifier_mask = self._getint_auto(
             'ble', 'keyboard_modifier_mask',
             0x22 if self.ble_kindle_text_mode else 0xff)
+        self.ble_remap_consumer_home_to_escape = self._getbool(
+            'ble', 'remap_consumer_home_to_escape', False)
         self.power_monitor_enabled = self._getbool('power', 'monitor_enabled', True)
         self.power_startup_delay = float(self._get('power', 'startup_delay', '8.0'))
         self.power_resume_delay = float(self._get('power', 'resume_delay', '20.0'))
