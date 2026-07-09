@@ -2168,6 +2168,7 @@ class PowerLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._old_power_wifi_gate_enabled = config.power_wifi_gate_enabled
         self._old_power_resume_delay = config.power_resume_delay
+        self._old_power_resume_max_delay = config.power_resume_max_delay
         self._old_power_resume_min_delay = config.power_resume_min_delay
         self._old_power_resume_poll_interval = config.power_resume_poll_interval
         self._old_power_resume_stable_polls = config.power_resume_stable_polls
@@ -2175,6 +2176,7 @@ class PowerLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         config.power_wifi_gate_enabled = self._old_power_wifi_gate_enabled
         config.power_resume_delay = self._old_power_resume_delay
+        config.power_resume_max_delay = self._old_power_resume_max_delay
         config.power_resume_min_delay = self._old_power_resume_min_delay
         config.power_resume_poll_interval = self._old_power_resume_poll_interval
         config.power_resume_stable_polls = self._old_power_resume_stable_polls
@@ -2293,6 +2295,28 @@ class PowerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([3.5], sleep_calls)
         self.assertFalse(daemon._suspended)
         self.assertFalse(daemon._power_blocked)
+
+    async def test_controller_system_resume_uses_wifi_gate_max_delay(self):
+        config.power_resume_delay = 20.0
+        config.power_resume_max_delay = 90.0
+
+        class FakeDaemon:
+            def __init__(self):
+                self._suspended = True
+                self._power_resume_task = None
+                self.calls = []
+
+            async def _delayed_power_resume(self, delay, reason):
+                self.calls.append((delay, reason))
+
+        daemon = FakeDaemon()
+        controller = DaemonController(daemon)
+        controller._suspended_by_system = True
+
+        await controller._do_system_resume("wakeupFromSuspend")
+        await daemon._power_resume_task
+
+        self.assertEqual([(90.0, "power")], daemon.calls)
 
 
 if __name__ == "__main__":

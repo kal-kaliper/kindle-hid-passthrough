@@ -299,7 +299,10 @@ class DaemonController:
             if self.daemon._power_resume_task and not self.daemon._power_resume_task.done():
                 self.daemon._power_resume_task.cancel()
             self.daemon._power_resume_task = asyncio.create_task(
-                self.daemon._delayed_power_resume(config.power_resume_delay, "power")
+                self.daemon._delayed_power_resume(
+                    config.power_resume_max_delay,
+                    "power",
+                )
             )
 
     # ---- Remove ----
