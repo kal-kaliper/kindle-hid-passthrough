@@ -133,6 +133,9 @@ class BLEMixin:
                 self.uhid_device = None
                 self._uhid_created_at = None
                 self._last_report = None
+                # Cleared per fresh connection so a bond-restore failure reads
+                # only this session's disconnect reason.
+                self._last_ble_disconnect_reason = None
                 self.connected_protocol = Protocol.BLE
                 connection.on(
                     'disconnection',
@@ -555,21 +558,45 @@ class BLEMixin:
             if not self._is_protocol_connected(Protocol.BLE):
                 await asyncio.sleep(3.0)
 
+    def _ble_bond_identity_address(self, connection) -> str:
+        """Resolve a connection's peer address to its bonded identity address
+        (e.g. an RPA resolved via IRK), matching the resolution
+        `_match_rotated_ble_device` already does for advertisements. The
+        keystore (and our per-address bond-forget state) is keyed by identity
+        address, so forgetting/counting against the raw peer address can
+        silently miss when the peer connected via a rotating RPA. Falls back
+        to the raw peer address when resolution isn't available."""
+        peer_address = connection.peer_address
+        resolver = getattr(self.device, 'address_resolver', None)
+        if getattr(peer_address, 'is_resolvable', False) and resolver:
+            resolved = resolver.resolve(peer_address)
+            if resolved:
+                return str(resolved)
+        return str(peer_address)
+
     async def _ble_restore_or_pair(self):
         """Restore BLE bonding or initiate new pairing."""
+        identity_address = self._ble_bond_identity_address(self.connection)
+
         if self.connection.is_encrypted:
             log.info("[BLE] Connection already encrypted")
+            self._ble_bond_3e_fail_counts.pop(identity_address, None)
             return
 
         if self.device.keystore:
-            peer_address = str(self.connection.peer_address)
+            # Look up, count, and forget under one key: the resolved identity
+            # address. If the peer connected via an RPA but the bond is stored
+            # under its identity address, keying get() off the raw peer address
+            # would miss the bond and force a needless fresh pair every
+            # reconnect.
             try:
-                keys = await self.device.keystore.get(peer_address)
+                keys = await self.device.keystore.get(identity_address)
                 if keys:
                     log.info("[BLE] Restoring bonding...")
                     await self._wait_for_ble_operation(
                         self.connection.encrypt(), "bonding restore")
                     log.success("[BLE] Bonding restored")
+                    self._ble_bond_3e_fail_counts.pop(identity_address, None)
                     return
             except Exception as e:
                 log.warning(f"[BLE] Bonding restore failed: {e}")
@@ -583,13 +610,27 @@ class BLEMixin:
                     # deadlock reconnection. Forget it so the next window pairs
                     # fresh. Keep the bond on transient drops (e.g. supervision
                     # timeout) so a good bond survives a momentary glitch.
-                    if self._last_ble_disconnect_reason in self.BLE_BOND_REJECT_REASONS:
-                        await self._forget_ble_bond(peer_address)
+                    reason = self._last_ble_disconnect_reason
+                    if reason in self.BLE_BOND_REJECT_REASONS:
+                        await self._forget_ble_bond(identity_address)
+                        self._ble_bond_3e_fail_counts.pop(identity_address, None)
+                    elif reason == 0x3E:
+                        count = self._ble_bond_3e_fail_counts.get(identity_address, 0) + 1
+                        self._ble_bond_3e_fail_counts[identity_address] = count
+                        if count >= self.BLE_BOND_3E_FORGET_THRESHOLD:
+                            log.warning(
+                                f"[BLE] {count} consecutive 0x3E restore failures "
+                                f"for {identity_address}; treating stored key as "
+                                "rejected"
+                            )
+                            await self._forget_ble_bond(identity_address)
+                            self._ble_bond_3e_fail_counts.pop(identity_address, None)
                     raise InvalidStateError("[BLE] Disconnected during bonding restore")
 
         log.info("[BLE] Initiating pairing...")
         await self._wait_for_ble_operation(self.connection.pair(), "pairing")
         log.success("[BLE] Pairing complete")
+        self._ble_bond_3e_fail_counts.pop(identity_address, None)
 
     async def _forget_ble_bond(self, address: str):
         """Delete a stale BLE bond so the next connect re-pairs from scratch."""

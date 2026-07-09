@@ -40,6 +40,7 @@ class HIDDaemon:
         self._classic_flap_counts = {}
         self._classic_flap_until = {}
         self._classic_retry_not_before = 0.0
+        self._ble_bond_3e_fail_counts = {}
 
     @property
     def connection_state(self) -> dict:
@@ -220,11 +221,13 @@ class HIDDaemon:
         host._classic_flap_counts = self._classic_flap_counts
         host._classic_flap_until = self._classic_flap_until
         host._classic_retry_not_before = self._classic_retry_not_before
+        host._ble_bond_3e_fail_counts = self._ble_bond_3e_fail_counts
 
     def _capture_host_state(self, host: HIDHost):
         self._classic_flap_counts = host._classic_flap_counts
         self._classic_flap_until = host._classic_flap_until
         self._classic_retry_not_before = host._classic_retry_not_before
+        self._ble_bond_3e_fail_counts = host._ble_bond_3e_fail_counts
 
     async def run(self):
         """Main daemon loop."""
@@ -251,7 +254,7 @@ class HIDDaemon:
                 continue
 
             skip_delay = False
-            chip().ensure_powered()
+            await asyncio.to_thread(chip().ensure_powered)
 
             try:
                 # Use handed-off host from controller pairing if available
@@ -349,7 +352,7 @@ class HIDDaemon:
 async def main():
     setup_daemon_logging(config.log_file)
 
-    prepare_bt()
+    await asyncio.to_thread(prepare_bt)
     if config.power_startup_delay > 0:
         log.info(f"Waiting {config.power_startup_delay:.0f}s for WMT/Wi-Fi startup")
         await asyncio.sleep(config.power_startup_delay)

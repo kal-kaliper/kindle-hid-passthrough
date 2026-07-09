@@ -33,3 +33,6 @@ evsieve-kindle/
 future-work.md
 pr-24-*.md
 .worktrees/
+
+# Planning docs (local only)
+.plans/

@@ -13,13 +13,32 @@ from config import Protocol, config
 from logging_utils import log
 from transport import create_bumble_device
 
-__all__ = ['Scanner', 'DiscoveredDevice']
+__all__ = ['Scanner', 'DiscoveredDevice', 'classic_cod_is_phone']
 
 BLE_APPEARANCE_CATEGORY_PHONE = 0x01
 BLE_APPEARANCE_CATEGORY_HID = 0x0F
 CLASSIC_MAJOR_DEVICE_CLASS_PHONE = 0x02
 CLASSIC_MAJOR_DEVICE_CLASS_PERIPHERAL = 0x05
 CLASSIC_HID_CANDIDATE_CLASSES = {"Peripheral", "Phone"}
+
+
+def classic_cod_is_phone(class_of_device: int) -> bool:
+    """True if a Classic Bluetooth Class of Device's major class is Phone.
+
+    Shared by the manual-scan inquiry flow (`Scanner._scan_classic`) and the
+    daemon's live connection path (`classic.py`, on inbound
+    `connection_request`), so both agree on what counts as a phone.
+    """
+    try:
+        _, major_class, _minor_class = DeviceClass.split_class_of_device(class_of_device)
+        major_class_name = DeviceClass.major_device_class_name(major_class)
+        return (
+            major_class_name == "Phone"
+            or major_class == CLASSIC_MAJOR_DEVICE_CLASS_PHONE
+        )
+    except Exception:
+        major_class = (class_of_device >> 8) & 0x1F
+        return major_class == CLASSIC_MAJOR_DEVICE_CLASS_PHONE
 
 
 @dataclass

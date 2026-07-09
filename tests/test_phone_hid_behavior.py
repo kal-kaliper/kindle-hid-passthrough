@@ -48,7 +48,14 @@ def install_bumble_stubs():
             self.is_resolvable = False
 
         def __str__(self):
-            return str(self.value)
+            # Real Bumble appends a transport suffix to Classic/public
+            # addresses ("/P" for public, "/R" for random). Reproduce that
+            # so tests exercise the same normalization the daemon needs.
+            text = str(self.value)
+            if "/" in text or text == Address.ANY:
+                return text
+            suffix = "/P" if self.address_type == Address.PUBLIC_DEVICE_ADDRESS else "/R"
+            return f"{text}{suffix}"
 
     class OwnAddressType:
         PUBLIC = 0
@@ -133,6 +140,12 @@ def install_bumble_stubs():
         EVENT_INTERRUPT_DATA = "interrupt"
         EVENT_VIRTUAL_CABLE_UNPLUG = "unplug"
 
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def on(self, *args, **kwargs):
+            pass
+
     hid.HID_CONTROL_PSM = 0x11
     hid.HID_INTERRUPT_PSM = 0x13
     hid.Message = Message
@@ -179,32 +192,68 @@ def install_bumble_stubs():
 
 install_bumble_stubs()
 
+from bumble.hci import Address  # noqa: E402
 from config import Protocol, config  # noqa: E402
 from controller import DaemonController  # noqa: E402
 from daemon import HIDDaemon  # noqa: E402
 from host import DeviceConfig, DeviceSession, HIDHost  # noqa: E402
 from scanner import BLE_APPEARANCE_CATEGORY_PHONE  # noqa: E402
+from bt_mtk import MtkChip  # noqa: E402
+import transport as transport_module  # noqa: E402
 
 
 class FakeConnection:
-    def __init__(self):
+    def __init__(self, peer_address="AA:BB:CC:44:55:66", encrypt_succeeds=False):
         self.handle = 1
         self.is_disconnected = False
         self.is_encrypted = False
-        self.peer_address = "AA:BB:CC:44:55:66"
+        self.peer_address = peer_address
         self.pair_called = False
+        self.encrypt_succeeds = encrypt_succeeds
 
     async def disconnect(self):
         self.is_disconnected = True
         self.handle = None
 
     async def encrypt(self):
+        if self.encrypt_succeeds:
+            self.is_encrypted = True
+            return
         self.is_disconnected = True
         self.handle = None
         raise RuntimeError("disconnect during restore")
 
     async def pair(self):
         self.pair_called = True
+
+
+class FakeResolvableAddress:
+    """A BLE peer address that resolves (via IRK) to a different identity
+    address, mimicking a rotating RPA."""
+
+    def __init__(self, rpa):
+        self.value = rpa
+        self.is_resolvable = True
+
+    def __str__(self):
+        return self.value
+
+
+class RecordingKeystore:
+    """Keystore that records which addresses get()/delete() are called with
+    and only returns keys for addresses it was seeded with."""
+
+    def __init__(self, known_addresses=()):
+        self.known = set(known_addresses)
+        self.requested = []
+        self.deleted = []
+
+    async def get(self, address):
+        self.requested.append(address)
+        return object() if address in self.known else None
+
+    async def delete(self, address):
+        self.deleted.append(address)
 
 
 class FakeUhidDevice:
@@ -263,15 +312,35 @@ class FakeKeystore:
 class FakeClassicController:
     def __init__(self):
         self.commands = []
+        self._listeners = {}
 
     async def send_command(self, command, check_result=False):
         self.commands.append(command)
+
+    def on(self, event, handler):
+        self._listeners.setdefault(event, []).append(handler)
+
+    def remove_listener(self, event, handler):
+        callbacks = self._listeners.get(event, [])
+        if handler in callbacks:
+            callbacks.remove(handler)
+
+    def emit(self, event, *args):
+        for handler in list(self._listeners.get(event, [])):
+            handler(*args)
 
 
 class FakeClassicDevice:
     def __init__(self):
         self.host = FakeClassicController()
         self.le_connecting = False
+        self._listeners = {}
+
+    def on(self, event, handler):
+        self._listeners[event] = handler
+
+    def remove_listener(self, event, handler):
+        self._listeners.pop(event, None)
 
 
 class ScanControlTests(unittest.TestCase):
@@ -411,6 +480,113 @@ class ControllerStatusTests(unittest.TestCase):
         )
 
 
+class MtkPowerTests(unittest.TestCase):
+    def test_mtk_chip_arms_power_monitor(self):
+        self.assertFalse(MtkChip(None).survives_suspend)
+
+    def test_mtk_power_off_releases_stpbt_and_unloads_loaded_module(self):
+        chip = MtkChip(None)
+        chip._powered = True
+
+        completed = types.SimpleNamespace(
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+        with unittest.mock.patch("bt_mtk.os.path.exists", return_value=True), \
+                unittest.mock.patch(
+                    "bt_mtk._is_device_free",
+                    side_effect=[False, False, True],
+                ) as is_free, \
+                unittest.mock.patch(
+                    "bt_mtk._release_own_fds",
+                    return_value=1,
+                ) as release_own_fds, \
+                unittest.mock.patch(
+                    "bt_mtk.free_device",
+                ) as free_device, \
+                unittest.mock.patch(
+                    "bt_mtk._kill_holders_via_proc",
+                    return_value=1,
+                ) as kill_holders, \
+                unittest.mock.patch(
+                    "bt_mtk._find_bt_module",
+                    return_value="/lib/modules/test/extra/wmt_cdev_bt.ko",
+                ), \
+                unittest.mock.patch(
+                    "bt_mtk._is_module_name_loaded",
+                    side_effect=lambda name: name == "wmt_cdev_bt",
+                ), \
+                unittest.mock.patch(
+                    "bt_mtk.subprocess.run",
+                    return_value=completed,
+                ) as run_cmd:
+            chip.power_off()
+
+        self.assertFalse(chip._powered)
+        release_own_fds.assert_called_once_with("/dev/stpbt")
+        free_device.assert_not_called()
+        kill_holders.assert_called_once_with("/dev/stpbt")
+        run_cmd.assert_called_once()
+        self.assertEqual(["/sbin/rmmod", "wmt_cdev_bt"], run_cmd.call_args[0][0])
+        self.assertEqual(3, is_free.call_count)
+
+
+class TransportRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hci_reset_timeout_closes_transport_before_chip_recovery(self):
+        events = []
+        old_timeout = config.hci_reset_timeout
+        config.hci_reset_timeout = 0.01
+
+        class FakeTransport:
+            source = object()
+            sink = object()
+
+            async def close(self):
+                events.append("close")
+
+        class FakeHost:
+            async def reset(self):
+                events.append("reset")
+                await asyncio.sleep(3600)
+
+        class FakeDevice:
+            host = FakeHost()
+
+        class FakeDeviceFactory:
+            @staticmethod
+            def with_hci(*_args, **_kwargs):
+                events.append("with_hci")
+                return FakeDevice()
+
+        class FakeChip:
+            def on_transport_open(self):
+                events.append("transport_open_hook")
+
+            def on_hci_reset_timeout(self):
+                events.append("reset_timeout_hook")
+
+        async def fake_open_transport(_spec):
+            events.append("open_transport")
+            return FakeTransport()
+
+        try:
+            with unittest.mock.patch.object(
+                    transport_module, "open_transport", fake_open_transport), \
+                    unittest.mock.patch.object(
+                        transport_module, "Device", FakeDeviceFactory), \
+                    unittest.mock.patch(
+                        "bt_setup.chip", return_value=FakeChip()):
+                with self.assertRaises(asyncio.TimeoutError):
+                    await transport_module.create_bumble_device("file:/dev/stpbt")
+        finally:
+            config.hci_reset_timeout = old_timeout
+
+        self.assertEqual(1, events.count("close"))
+        self.assertLess(events.index("close"), events.index("reset_timeout_hook"))
+
+
 class PhoneHidBehaviorTests(unittest.TestCase):
     ADDR = "AA:BB:CC:11:22:33"
 
@@ -424,6 +600,7 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self._old_ble_modifier_mask = config.ble_keyboard_modifier_mask
         self._old_defer_names = config.classic_defer_uhid_until_input_names
         self._old_idle_retry_names = config.classic_short_idle_retry_names
+        self._old_passive_names = config.classic_passive_names
         self._old_include_reports = config.diagnostics_include_reports
         self._old_ble_remap_home = config.ble_remap_consumer_home_to_escape
         config.classic_serialize_keyboard_reports = True
@@ -435,6 +612,7 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         config.ble_keyboard_modifier_mask = 0x22
         config.classic_defer_uhid_until_input_names = []
         config.classic_short_idle_retry_names = []
+        config.classic_passive_names = []
         config.diagnostics_include_reports = False
         config.ble_remap_consumer_home_to_escape = False
 
@@ -448,6 +626,7 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         config.ble_keyboard_modifier_mask = self._old_ble_modifier_mask
         config.classic_defer_uhid_until_input_names = self._old_defer_names
         config.classic_short_idle_retry_names = self._old_idle_retry_names
+        config.classic_passive_names = self._old_passive_names
         config.diagnostics_include_reports = self._old_include_reports
         config.ble_remap_consumer_home_to_escape = self._old_ble_remap_home
 
@@ -979,6 +1158,251 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self.assertFalse(host._disconnection_event.is_set())
         self.assertEqual([Protocol.CLASSIC], scheduled)
 
+    def test_classic_is_passive_matches_by_name_and_address(self):
+        config.classic_passive_names = ["Example Phone"]
+        host = self.make_host()
+        host.classic_devices = [
+            DeviceConfig(self.ADDR, Protocol.CLASSIC, "Example Phone")
+        ]
+
+        self.assertTrue(host._classic_is_passive(self.ADDR))
+        self.assertTrue(host._classic_is_passive(self.ADDR, "Example Phone"))
+        self.assertFalse(host._classic_is_passive("AA:BB:CC:DD:EE:FF"))
+        self.assertFalse(
+            host._classic_is_passive("AA:BB:CC:DD:EE:FF", "Some Other Device")
+        )
+
+        config.classic_passive_names = ["AA:BB:CC:DD:EE:FF"]
+        self.assertTrue(host._classic_is_passive("AA:BB:CC:DD:EE:FF"))
+
+    def test_classic_is_passive_true_when_device_cache_says_phone(self):
+        host = self.make_host()
+        host.device_cache.set_class(self.ADDR, True)
+
+        self.assertTrue(host._classic_is_passive(self.ADDR))
+
+    def test_classic_is_passive_false_for_unrelated_device_by_default(self):
+        host = self.make_host()
+
+        self.assertFalse(host._classic_is_passive(self.ADDR))
+        self.assertFalse(host._classic_is_passive("AA:BB:CC:DD:EE:FF"))
+
+    def test_classic_is_passive_ignores_stale_global_device_name(self):
+        # Regression: _classic_is_passive must not consult the global
+        # self.device_name (the last-connected device's name). Otherwise, once
+        # the passive phone has connected, a *different* non-passive device
+        # would be misclassified as passive and never dialed.
+        config.classic_passive_names = ["Example Phone"]
+        host = self.make_host()
+        other_addr = "AA:BB:CC:DD:EE:FF"
+        host.classic_devices = [
+            DeviceConfig(self.ADDR, Protocol.CLASSIC, "Example Phone"),
+            DeviceConfig(other_addr, Protocol.CLASSIC, "Real Keyboard"),
+        ]
+        # Simulate the phone having connected: the global is now stale.
+        host.device_name = "Example Phone"
+
+        self.assertTrue(host._classic_is_passive(self.ADDR, "Example Phone"))
+        self.assertFalse(host._classic_is_passive(other_addr, "Real Keyboard"))
+        self.assertFalse(host._classic_is_passive(other_addr))
+
+    def test_passive_device_excluded_from_active_dialing(self):
+        async def scenario():
+            config.classic_passive_names = ["Example Phone"]
+            host = self.make_host()
+            host.classic_devices = [
+                DeviceConfig(self.ADDR, Protocol.CLASSIC, "Example Phone"),
+                DeviceConfig("AA:BB:CC:DD:EE:FF", Protocol.CLASSIC, "Remote"),
+            ]
+            host.device = FakeClassicDevice()
+            dialed = []
+
+            async def active_loop(addresses):
+                dialed.append(addresses)
+
+            host._classic_active_connect_loop = active_loop
+            await host._run_classic_handler()
+            return dialed
+
+        dialed = asyncio.run(scenario())
+
+        self.assertEqual([["AA:BB:CC:DD:EE:FF"]], dialed)
+
+    def test_all_passive_devices_do_not_start_active_connect_loop(self):
+        async def scenario():
+            config.classic_passive_names = ["Example Phone"]
+            host = self.make_host()
+            host.classic_devices = [
+                DeviceConfig(self.ADDR, Protocol.CLASSIC, "Example Phone"),
+            ]
+            host.device = FakeClassicDevice()
+            called = []
+            host._classic_active_connect_loop = lambda addrs: called.append(addrs)
+            await host._run_classic_handler()
+            return called
+
+        called = asyncio.run(scenario())
+
+        self.assertEqual([], called)
+
+    @staticmethod
+    def _cod(major, minor=0, service=0):
+        """Build a 24-bit Class of Device value from major/minor/service."""
+        return (service << 13) | (major << 8) | (minor << 2)
+
+    def test_connection_request_phone_cod_marks_device_passive(self):
+        # Inbound connection_request with a Phone-major-class CoD from a
+        # configured address should auto-populate device_cache.is_phone,
+        # which then makes _classic_is_passive true without any entry in
+        # config.classic_passive_names. The bd_addr arrives as a real Bumble
+        # Address whose str() carries the "/P" transport suffix, while the
+        # configured device address is the plain devices.conf form — the
+        # write and read must resolve to the same cache entry regardless.
+        async def scenario():
+            host = self.make_host()
+            host.classic_devices = [
+                DeviceConfig(self.ADDR, Protocol.CLASSIC, "Some Phone")
+            ]
+            host.device = FakeClassicDevice()
+            host._classic_active_connect_loop = lambda addrs: asyncio.sleep(0)
+            await host._run_classic_handler()
+
+            phone_cod = self._cod(major=0x02, minor=0x01)  # Phone
+            bd_addr = Address(self.ADDR, Address.PUBLIC_DEVICE_ADDRESS)
+            # Guard: the fake must reproduce real Bumble's "/P" suffix so this
+            # test genuinely exercises the address-normalization path.
+            self.assertTrue(str(bd_addr).endswith("/P"))
+            host.device.host.emit(
+                'connection_request', bd_addr, phone_cod, 0
+            )
+            return host
+
+        host = asyncio.run(scenario())
+
+        # Readable via the plain devices.conf-style address (no "/P").
+        self.assertTrue(host.device_cache.get_is_phone(self.ADDR))
+        self.assertTrue(host._classic_is_passive(self.ADDR))
+
+    def test_cache_key_is_transport_suffix_invariant(self):
+        # Regression: a "/P"-suffixed write (as str(bd_addr) yields on a real
+        # connection request) and a plain-address read must hit ONE cache
+        # file, so is_phone / descriptor data round-trips.
+        host = self.make_host()
+        suffixed = f"{self.ADDR}/P"
+        host.device_cache.set_class(suffixed, True)
+
+        self.assertTrue(host.device_cache.get_is_phone(self.ADDR))
+        self.assertTrue(host.device_cache.get_is_phone(suffixed))
+        self.assertEqual(
+            host.device_cache._get_cache_path(suffixed),
+            host.device_cache._get_cache_path(self.ADDR),
+        )
+        self.assertTrue(host._classic_is_passive(self.ADDR))
+
+    def test_connection_request_non_phone_cod_does_not_mark_phone(self):
+        async def scenario():
+            host = self.make_host()
+            host.classic_devices = [
+                DeviceConfig(self.ADDR, Protocol.CLASSIC, "Some Keyboard")
+            ]
+            host.device = FakeClassicDevice()
+            host._classic_active_connect_loop = lambda addrs: asyncio.sleep(0)
+            await host._run_classic_handler()
+
+            peripheral_cod = self._cod(major=0x05, minor=0x40)  # Peripheral/Keyboard
+            bd_addr = Address(self.ADDR, Address.PUBLIC_DEVICE_ADDRESS)
+            host.device.host.emit(
+                'connection_request', bd_addr, peripheral_cod, 0
+            )
+            return host
+
+        host = asyncio.run(scenario())
+
+        self.assertIsNone(host.device_cache.get_is_phone(self.ADDR))
+        self.assertFalse(host._classic_is_passive(self.ADDR))
+
+    def test_connection_request_from_disallowed_address_is_ignored(self):
+        async def scenario():
+            host = self.make_host()
+            host.classic_devices = [
+                DeviceConfig(self.ADDR, Protocol.CLASSIC, "Some Keyboard")
+            ]
+            host.device = FakeClassicDevice()
+            host._classic_active_connect_loop = lambda addrs: asyncio.sleep(0)
+            await host._run_classic_handler()
+
+            phone_cod = self._cod(major=0x02, minor=0x01)
+            bd_addr = Address("AA:BB:CC:DD:EE:FF", Address.PUBLIC_DEVICE_ADDRESS)
+            # Must not raise even though the address isn't configured/paired.
+            host.device.host.emit(
+                'connection_request', bd_addr, phone_cod, 0
+            )
+            return host
+
+        host = asyncio.run(scenario())
+
+        self.assertIsNone(host.device_cache.get_is_phone("AA:BB:CC:DD:EE:FF"))
+
+    def test_connection_request_listener_cleaned_up_on_restart(self):
+        async def scenario():
+            host = self.make_host()
+            host.classic_devices = [
+                DeviceConfig(self.ADDR, Protocol.CLASSIC, "Some Phone")
+            ]
+            host.device = FakeClassicDevice()
+            host._classic_active_connect_loop = lambda addrs: asyncio.sleep(0)
+            await host._run_classic_handler()
+            first_listener = host._classic_connection_request_listener
+            controller = host.device.host
+
+            await host._run_classic_handler()
+
+            self.assertNotIn(
+                first_listener,
+                controller._listeners.get('connection_request', []),
+            )
+            self.assertEqual(
+                1, len(controller._listeners.get('connection_request', []))
+            )
+
+        asyncio.run(scenario())
+
+    def test_passive_device_idle_drop_does_not_restore_or_restart(self):
+        config.classic_passive_names = ["Example Phone"]
+        host = self.make_host()
+        host.classic_devices = [
+            DeviceConfig(self.ADDR, Protocol.CLASSIC, "Example Phone")
+        ]
+        session = self.make_session(Protocol.CLASSIC)
+        session.device_name = "Example Phone"
+        session.established_at = time.monotonic() - 1.0
+        host.sessions[Protocol.CLASSIC] = session
+        scheduled = []
+        host._schedule_protocol_restore = scheduled.append
+
+        host._on_protocol_disconnection(Protocol.CLASSIC, self.ADDR, 0x13)
+
+        self.assertFalse(host._disconnection_event.is_set())
+        self.assertEqual([], scheduled)
+
+    def test_non_passive_classic_idle_drop_still_restores(self):
+        config.classic_passive_names = ["Some Other Phone"]
+        host = self.make_host()
+        host.classic_devices = [
+            DeviceConfig(self.ADDR, Protocol.CLASSIC, "Phone HID App")
+        ]
+        session = self.make_session(Protocol.CLASSIC)
+        session.device_name = "Phone HID App\x00"
+        session.established_at = time.monotonic() - 2.0
+        host.sessions[Protocol.CLASSIC] = session
+        scheduled = []
+        host._schedule_protocol_restore = scheduled.append
+
+        host._on_protocol_disconnection(Protocol.CLASSIC, self.ADDR, 0x13)
+
+        self.assertFalse(host._disconnection_event.is_set())
+        self.assertEqual([Protocol.CLASSIC], scheduled)
+
     def test_phone_idle_drop_waits_longer_when_ble_is_pending(self):
         config.classic_short_idle_retry_names = ["Phone HID App"]
         host = self.make_host()
@@ -1289,9 +1713,32 @@ class PhoneHidBehaviorTests(unittest.TestCase):
             keystore = FakeKeystore()
             host.device = types.SimpleNamespace(keystore=keystore)
             host._protocol_disconnection_events[Protocol.BLE].set()
-            # 0x3E = Connection Failed to be Established: peer dropped us during
-            # encryption because it no longer holds our bond.
-            host._last_ble_disconnect_reason = 0x3E
+            # 0x05 = Authentication Failure: an unambiguous credential
+            # rejection, forgotten immediately (one-shot).
+            host._last_ble_disconnect_reason = 0x05
+
+            with self.assertRaises(Exception):
+                await host._ble_restore_or_pair()
+
+            return connection, keystore
+
+        connection, keystore = asyncio.run(scenario())
+
+        self.assertEqual([connection.peer_address], keystore.deleted)
+        self.assertFalse(connection.pair_called)
+
+    def test_ble_restore_forgets_bond_on_pin_or_key_missing(self):
+        async def scenario():
+            host = self.make_host()
+            connection = FakeConnection()
+            host.connection = connection
+            host.connected_protocol = Protocol.BLE
+            keystore = FakeKeystore()
+            host.device = types.SimpleNamespace(keystore=keystore)
+            host._protocol_disconnection_events[Protocol.BLE].set()
+            # 0x06 = PIN or Key Missing: also an unambiguous credential
+            # rejection, forgotten immediately (one-shot).
+            host._last_ble_disconnect_reason = 0x06
 
             with self.assertRaises(Exception):
                 await host._ble_restore_or_pair()
@@ -1324,6 +1771,247 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         keystore = asyncio.run(scenario())
 
         self.assertEqual([], keystore.deleted)
+
+    def test_ble_restore_keeps_bond_on_single_0x3e(self):
+        """0x3E is transient (RF/timing), not a credential rejection, so a
+        single occurrence must not forget the bond."""
+        async def scenario():
+            host = self.make_host()
+            connection = FakeConnection()
+            host.connection = connection
+            host.connected_protocol = Protocol.BLE
+            keystore = FakeKeystore()
+            host.device = types.SimpleNamespace(keystore=keystore)
+            host._protocol_disconnection_events[Protocol.BLE].set()
+            host._last_ble_disconnect_reason = 0x3E
+
+            with self.assertRaises(Exception):
+                await host._ble_restore_or_pair()
+
+            return host, keystore
+
+        host, keystore = asyncio.run(scenario())
+
+        self.assertEqual([], keystore.deleted)
+        self.assertEqual(
+            1, host._ble_bond_3e_fail_counts[host.connection.peer_address]
+        )
+
+    def test_ble_restore_forgets_bond_after_repeated_0x3e(self):
+        """0x3E repeated BLE_BOND_3E_FORGET_THRESHOLD times in a row against
+        the same bond corroborates a real rejection and forgets it."""
+        async def scenario():
+            host = self.make_host()
+            keystore = FakeKeystore()
+            host.device = types.SimpleNamespace(keystore=keystore)
+            host.connected_protocol = Protocol.BLE
+            host._protocol_disconnection_events[Protocol.BLE].set()
+            host._last_ble_disconnect_reason = 0x3E
+
+            connection = None
+            for _ in range(host.BLE_BOND_3E_FORGET_THRESHOLD):
+                connection = FakeConnection()
+                host.connection = connection
+                with self.assertRaises(Exception):
+                    await host._ble_restore_or_pair()
+
+            return host, connection, keystore
+
+        host, connection, keystore = asyncio.run(scenario())
+
+        self.assertEqual([connection.peer_address], keystore.deleted)
+        self.assertNotIn(connection.peer_address, host._ble_bond_3e_fail_counts)
+
+    def test_ble_restore_success_resets_0x3e_counter(self):
+        """A successful bonding restore must reset the corroboration counter,
+        so a later isolated 0x3E does not compound with earlier failures."""
+        async def scenario():
+            host = self.make_host()
+            keystore = FakeKeystore()
+            host.device = types.SimpleNamespace(keystore=keystore)
+            host.connected_protocol = Protocol.BLE
+            host._protocol_disconnection_events[Protocol.BLE].set()
+            host._last_ble_disconnect_reason = 0x3E
+
+            # First 0x3E failure.
+            connection = FakeConnection()
+            host.connection = connection
+            with self.assertRaises(Exception):
+                await host._ble_restore_or_pair()
+            self.assertEqual(1, host._ble_bond_3e_fail_counts[connection.peer_address])
+
+            # A successful restore (already encrypted) resets the counter.
+            success_connection = FakeConnection()
+            success_connection.is_encrypted = True
+            host.connection = success_connection
+            await host._ble_restore_or_pair()
+
+            # Another isolated 0x3E afterwards should not immediately forget.
+            connection2 = FakeConnection()
+            host.connection = connection2
+            with self.assertRaises(Exception):
+                await host._ble_restore_or_pair()
+
+            return host, connection2, keystore
+
+        host, connection2, keystore = asyncio.run(scenario())
+
+        self.assertEqual([], keystore.deleted)
+        self.assertEqual(1, host._ble_bond_3e_fail_counts[connection2.peer_address])
+
+    IDENTITY_ADDR = "AA:BB:CC:44:55:66"
+    RPA_ADDR = "7F:11:22:33:44:55"
+
+    def _make_resolving_host(self, keystore):
+        host = self.make_host()
+        resolver = types.SimpleNamespace(
+            resolve=lambda addr: self.IDENTITY_ADDR
+        )
+        host.device = types.SimpleNamespace(
+            keystore=keystore, address_resolver=resolver
+        )
+        host.connected_protocol = Protocol.BLE
+        host._protocol_disconnection_events[Protocol.BLE].set()
+        connection = FakeConnection(peer_address=FakeResolvableAddress(self.RPA_ADDR))
+        host.connection = connection
+        return host, connection
+
+    def test_ble_restore_looks_up_bond_by_resolved_identity_not_rpa(self):
+        """When the peer connects via an RPA, the keystore lookup, counter, and
+        forget must all key off the resolved identity address, not the RPA."""
+        async def scenario():
+            # Bond stored under the identity address; a raw-RPA lookup would miss.
+            keystore = RecordingKeystore(known_addresses={self.IDENTITY_ADDR})
+            host, connection = self._make_resolving_host(keystore)
+            # 0x05 = immediate credential rejection, so we reach forget in one go.
+            host._last_ble_disconnect_reason = 0x05
+
+            with self.assertRaises(Exception):
+                await host._ble_restore_or_pair()
+
+            return host, keystore
+
+        host, keystore = asyncio.run(scenario())
+
+        # get() and delete() both operated on the identity address, not the RPA.
+        self.assertEqual([self.IDENTITY_ADDR], keystore.requested)
+        self.assertEqual([self.IDENTITY_ADDR], keystore.deleted)
+        self.assertNotIn(self.RPA_ADDR, keystore.requested)
+
+    def test_ble_restore_counts_0x3e_by_resolved_identity(self):
+        """The 0x3E corroboration counter is keyed by the resolved identity
+        address even when the peer connects via a rotating RPA."""
+        async def scenario():
+            keystore = RecordingKeystore(known_addresses={self.IDENTITY_ADDR})
+            host = self.make_host()
+            resolver = types.SimpleNamespace(resolve=lambda addr: self.IDENTITY_ADDR)
+            host.device = types.SimpleNamespace(
+                keystore=keystore, address_resolver=resolver
+            )
+            host.connected_protocol = Protocol.BLE
+            host._protocol_disconnection_events[Protocol.BLE].set()
+            host._last_ble_disconnect_reason = 0x3E
+
+            # Each reconnect arrives via a fresh RPA; the counter must still
+            # accumulate against the single identity address.
+            for i in range(host.BLE_BOND_3E_FORGET_THRESHOLD):
+                host.connection = FakeConnection(
+                    peer_address=FakeResolvableAddress(f"7F:00:00:00:00:{i:02X}")
+                )
+                with self.assertRaises(Exception):
+                    await host._ble_restore_or_pair()
+
+            return host, keystore
+
+        host, keystore = asyncio.run(scenario())
+
+        self.assertEqual([self.IDENTITY_ADDR], keystore.deleted)
+        self.assertNotIn(self.IDENTITY_ADDR, host._ble_bond_3e_fail_counts)
+
+    def test_ble_restore_happy_path_via_encrypt_resets_counter(self):
+        """The real bond-restore path (encrypt() succeeding, not the
+        is_encrypted shortcut) succeeds and clears any prior 0x3E count."""
+        async def scenario():
+            keystore = RecordingKeystore(known_addresses={self.IDENTITY_ADDR})
+            host, connection = self._make_resolving_host(keystore)
+            connection.encrypt_succeeds = True
+            # The link stays up for a real restore, so clear the drop event that
+            # _make_resolving_host sets for the failure-path tests.
+            host._protocol_disconnection_events[Protocol.BLE].clear()
+            # A prior 0x3E failure left a count that a real restore must clear.
+            host._ble_bond_3e_fail_counts[self.IDENTITY_ADDR] = 2
+
+            await host._ble_restore_or_pair()
+
+            return host, connection, keystore
+
+        host, connection, keystore = asyncio.run(scenario())
+
+        self.assertTrue(connection.is_encrypted)
+        self.assertFalse(connection.pair_called)
+        self.assertEqual([self.IDENTITY_ADDR], keystore.requested)
+        self.assertEqual([], keystore.deleted)
+        self.assertNotIn(self.IDENTITY_ADDR, host._ble_bond_3e_fail_counts)
+
+    def test_ble_accept_list_session_setup_clears_stale_disconnect_reason(self):
+        """A reject-class reason left over from a previous BLE session must
+        not survive into a fresh accept-list session and wrongly trigger a
+        forget on a later, unrelated failure (e.g. a plain timeout)."""
+        async def scenario():
+            host = self.make_host()
+            host.ble_devices = [
+                DeviceConfig(FakeConnection().peer_address, Protocol.BLE, "Keyboard")
+            ]
+            keystore = FakeKeystore()
+            connection = FakeConnection()
+            connection.on = lambda event, callback: None
+
+            async def fake_send_command(*_args, **_kwargs):
+                return None
+
+            host.device = types.SimpleNamespace(
+                keystore=keystore,
+                send_command=fake_send_command,
+            )
+            host._session_setup_lock = asyncio.Lock()
+            host._radio_lock = asyncio.Lock()
+            host._keystore_address_types = {}
+            # Simulate a reject-class reason lingering from a prior session.
+            host._last_ble_disconnect_reason = 0x05
+
+            async def fake_initiate(window, peer=None):
+                return connection
+
+            async def fake_reject(conn, matched_dev):
+                return False
+
+            async def fake_configured_name(addr):
+                return None
+
+            async def fake_restore_or_pair():
+                # By the time session setup runs, the stale reason from the
+                # previous session must already be cleared.
+                assert host._last_ble_disconnect_reason is None, (
+                    "stale disconnect reason leaked into new BLE session"
+                )
+                host._last_ble_disconnect_reason = 0x08  # plain timeout, this session
+                raise RuntimeError("simulated unrelated restore failure")
+
+            host._ble_initiate = fake_initiate
+            host._reject_unconfigured_ble_connection = fake_reject
+            host._configured_name = lambda addr: None
+            host._ble_restore_or_pair = fake_restore_or_pair
+
+            await host._run_ble_accept_list_handler(
+                [dev.address for dev in host.ble_devices]
+            )
+
+            return host, keystore
+
+        host, keystore = asyncio.run(scenario())
+
+        self.assertEqual([], keystore.deleted)
+        self.assertIsNone(host.connection)
 
 
 class DaemonHostStateTests(unittest.TestCase):

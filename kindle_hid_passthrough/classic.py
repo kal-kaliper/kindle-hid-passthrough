@@ -18,6 +18,7 @@ from bumble.sdp import Client as SDPClient
 
 from config import Protocol, config, normalize_addr
 from logging_utils import log
+from scanner import classic_cod_is_phone
 
 FALLBACK_HID_DESCRIPTOR = bytes([
     0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x01,
@@ -44,6 +45,15 @@ class ClassicMixin:
             except Exception:
                 pass
             self._classic_connection_listener = None
+
+        if hasattr(self, '_classic_connection_request_listener') and self._classic_connection_request_listener:
+            try:
+                self.device.host.remove_listener(
+                    'connection_request', self._classic_connection_request_listener
+                )
+            except Exception:
+                pass
+            self._classic_connection_request_listener = None
 
         classic_hid_host = BumbleHIDHost(self.device)
         self.hid_host = classic_hid_host
@@ -129,9 +139,59 @@ class ClassicMixin:
         self._classic_connection_listener = on_connection_event
         self.device.on('connection', on_connection_event)
 
-        active_addresses = [d.address for d in self.classic_devices if d.address != '*']
+        def on_connection_request(bd_addr, class_of_device, link_type):
+            # Fires for INBOUND Classic connections only (the HCI
+            # Connection Request event), before ACL setup completes. This
+            # is the only place the remote's Class of Device is available —
+            # `Connection` objects never carry it. Used to auto-detect
+            # phones so `_classic_is_passive` can treat them as
+            # connect-on-demand without a hardcoded name in
+            # `classic_passive_names`. An outbound-only device we always
+            # dial first (never yet seen inbound) won't be classified via
+            # this path; it converges to passive after its first inbound
+            # connect, which matches observed phone behavior (phones
+            # reconnect to the last-used host on their own).
+            try:
+                addr_str = str(bd_addr)
+                if not self._is_classic_allowed(addr_str):
+                    return
+                if not classic_cod_is_phone(class_of_device):
+                    return
+                if self.device_cache.get_is_phone(addr_str) is True:
+                    return
+                self.device_cache.set_class(addr_str, True)
+                log.info(
+                    f"[Classic] Auto-detected phone from CoD: "
+                    f"{self._format_device(addr_str)} (now passive/connect-on-demand)"
+                )
+            except Exception as e:
+                log.debug(f"[Classic] connection_request phone-detection failed: {e}")
+
+        self._classic_connection_request_listener = on_connection_request
+        self.device.host.on('connection_request', on_connection_request)
+
+        configured_addresses = [d.address for d in self.classic_devices if d.address != '*']
+        passive_addresses = [
+            d.address for d in self.classic_devices
+            if d.address != '*' and self._classic_is_passive(d.address, d.name)
+        ]
+        active_addresses = [a for a in configured_addresses if a not in passive_addresses]
+        if passive_addresses:
+            log.info(
+                "[Classic] Passive (connect-on-demand) devices, not actively dialed: "
+                f"{[self._format_device(a) for a in passive_addresses]}"
+            )
         if active_addresses:
+            log.info(
+                "[Classic] Actively dialing: "
+                f"{[self._format_device(a) for a in active_addresses]}"
+            )
             await self._classic_active_connect_loop(active_addresses)
+        elif configured_addresses:
+            log.info(
+                "[Classic] All configured devices are passive; active-connect "
+                "loop not started, page-scan remains on for inbound connections"
+            )
 
     async def _setup_classic_connection(self, connection, hid_host):
         addr_str = str(connection.peer_address)

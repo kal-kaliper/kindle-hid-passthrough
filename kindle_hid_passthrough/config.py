@@ -129,6 +129,8 @@ class Config:
             'classic', 'defer_uhid_until_input_names', [])
         self.classic_short_idle_retry_names = self._get_list(
             'classic', 'short_idle_retry_names', [])
+        self.classic_passive_names = self._get_list(
+            'classic', 'passive_names', [])
         self.ble_kindle_text_mode = self._getbool(
             'ble', 'kindle_text_mode', False)
         self.ble_serialize_keyboard_reports = self._getbool(

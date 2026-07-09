@@ -6,6 +6,8 @@ import logging
 import os
 from typing import Dict, Optional
 
+from config import normalize_addr
+
 logger = logging.getLogger(__name__)
 
 
@@ -24,13 +26,22 @@ class DeviceCache:
     def _get_cache_path(self, address: str) -> str:
         """Get cache file path for device address
 
+        The address is normalized first (`normalize_addr` strips any Bumble
+        transport suffix like "/P" and upper-cases), so a Classic address
+        passed as "AA:BB:CC:11:22:33/P" (as `str(bd_addr)` yields on a real
+        connection request) and the same address from devices.conf
+        ("AA:BB:CC:11:22:33") resolve to ONE canonical cache file. Without
+        this, writes and reads land in different files and phone-class /
+        descriptor data silently fails to round-trip.
+
         Args:
-            address: Device address (e.g., "AA:BB:CC:DD:EE:FF")
+            address: Device address (e.g., "AA:BB:CC:DD:EE:FF" or
+                "AA:BB:CC:DD:EE:FF/P")
 
         Returns:
             Path to cache file
         """
-        safe_addr = address.replace(':', '_').replace('/', '_')
+        safe_addr = normalize_addr(address).replace(':', '_').replace('/', '_')
         return os.path.join(self.cache_dir, f"{safe_addr}.json")
 
     def load(self, address: str) -> Optional[Dict]:

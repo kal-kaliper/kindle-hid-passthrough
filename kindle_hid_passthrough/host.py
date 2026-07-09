@@ -90,12 +90,17 @@ class HIDHost(ClassicMixin, BLEMixin):
     CLASSIC_FLAP_BACKOFF_MAX = 300.0
     CLASSIC_PARKED_RETRY_DELAY = 5.0
     CLASSIC_REMOTE_DISCONNECT_REASONS = frozenset({0x13, 0x14, 0x15})
-    # HCI disconnect reasons that mean the BLE peer rejected our stored bond:
-    # 0x05 Authentication Failure, 0x06 PIN or Key Missing,
-    # 0x3E Connection Failed to be Established (link dropped during encryption).
-    # A bond that fails this way will fail every future restore identically, so
-    # it must be forgotten to let reconnection fall back to fresh pairing.
-    BLE_BOND_REJECT_REASONS = frozenset({0x05, 0x06, 0x3E})
+    # HCI disconnect reasons that unambiguously mean the BLE peer rejected our
+    # stored bond: 0x05 Authentication Failure, 0x06 PIN or Key Missing. A bond
+    # that fails this way will fail every future restore identically, so it is
+    # forgotten immediately to let reconnection fall back to fresh pairing.
+    BLE_BOND_REJECT_REASONS = frozenset({0x05, 0x06})
+    # 0x3E "Connection Failed to be Established" is overwhelmingly a transient
+    # RF/timing failure, not a credential rejection, so it is NOT one-shot
+    # forgotten. Instead we require this many *consecutive* restore failures
+    # against the same (resolved) identity address before treating it as a
+    # rejected bond. Any successful restore resets the count to zero.
+    BLE_BOND_3E_FORGET_THRESHOLD = 3
 
     def __init__(self, transport_spec: str = None):
         self.transport_spec = transport_spec or config.transport
@@ -129,6 +134,10 @@ class HIDHost(ClassicMixin, BLEMixin):
         self._disconnection_event = None
         self._protocol_disconnection_events: dict[Protocol, asyncio.Event] = {}
         self._last_ble_disconnect_reason = None
+        # Consecutive-0x3E-restore-failure count per resolved BLE identity
+        # address; carried across host restarts via daemon._seed_host_state /
+        # _capture_host_state (lost on suspend/process restart, which is fine).
+        self._ble_bond_3e_fail_counts: dict[str, int] = {}
         self._connection_future = None
         self._session_setup_lock = None
         self._allow_legacy_connection_state = False
@@ -517,6 +526,13 @@ class HIDHost(ClassicMixin, BLEMixin):
             and session.source_report_count == 0
             and self._classic_short_idle_retry(session)
         )
+        # A passive (connect-on-demand) device's idle drop is not restored:
+        # never dial it back, just leave the host alive and let page-scan
+        # accept its next self-initiated connection whenever it comes.
+        passive_classic_idle_drop = bool(
+            short_idle_classic_drop
+            and self._classic_is_passive(session.address, session.device_name)
+        )
 
         if protocol in self._protocol_disconnection_events:
             self._protocol_disconnection_events[protocol].set()
@@ -526,6 +542,11 @@ class HIDHost(ClassicMixin, BLEMixin):
         if self._disconnection_event:
             if was_pending and self._has_configured_devices(protocol):
                 log.info(f"[{proto}] Parked link dropped before input; keeping host alive")
+            elif passive_classic_idle_drop:
+                log.info(
+                    f"[Classic] Passive device {self._format_device(session.address)} "
+                    "idle drop; awaiting inbound reconnect"
+                )
             elif session and self._has_configured_devices(protocol):
                 if live_sessions:
                     log.info(
@@ -861,6 +882,48 @@ class HIDHost(ClassicMixin, BLEMixin):
             return True
         return self._classic_name_matches(session.address, names, session.device_name)
 
+    def _classic_is_passive(self, address: str, name: str = None) -> bool:
+        """True if a Classic device is connect-on-demand: never actively
+        dialed and never auto-restored after an idle drop, but still
+        accepted whenever it initiates the connection (page-scan stays on).
+
+        Primary signal is the configured `classic.passive_names` list
+        (matched by this device's own name or address), which still works as
+        a manual override. Belt-and-suspenders: also treat a device as
+        passive if the device-class cache has resolved it as a phone.
+        `is_phone` is populated by the manual-scan flow
+        (`device_cache.set_class()` in controller.py) and, live, by
+        `classic.py`'s `on_connection_request` handler, which reads the
+        remote's Class of Device off the inbound HCI connection request and
+        auto-classifies phones — no name needs to be hardcoded for this to
+        work. That handler only sees INBOUND connections, so a device this
+        host always dials first (never yet seen inbound) won't be
+        auto-classified until its first self-initiated connection.
+
+        Deliberately does NOT use `_classic_name_matches`: that helper also
+        matches against the global `self.device_name`, which is a stale field
+        (the last-connected device's name) and would leak one device's name
+        onto another in the multi-device dial loop, silently making a real
+        keyboard passive. The match is scoped to this address's identifiers.
+        """
+        names = config.classic_passive_names
+        if names:
+            normalized = {
+                n.replace("\x00", "").strip().lower()
+                for n in names if n and n.strip()
+            }
+            candidates = [self._configured_name(address), name]
+            if any(
+                c and c.replace("\x00", "").strip().lower() in normalized
+                for c in candidates
+            ):
+                return True
+            if address and normalize_addr(address) in {
+                normalize_addr(n) for n in names if n and n.strip()
+            }:
+                return True
+        return self.device_cache.get_is_phone(address) is True
+
     def _classic_name_matches(self, address: str, names, extra_name: str = None) -> bool:
         configured_name = self._configured_name(address)
         candidates = [configured_name, extra_name, self.device_name]
@@ -933,7 +996,8 @@ class HIDHost(ClassicMixin, BLEMixin):
                 getattr(self, "_classic_connection_listener", None)
             )
             active_addresses = [
-                dev.address for dev in self.classic_devices if dev.address != '*'
+                dev.address for dev in self.classic_devices
+                if dev.address != '*' and not self._classic_is_passive(dev.address, dev.name)
             ]
             if has_classic_listener and active_addresses:
                 coro = self._classic_active_connect_loop(active_addresses)
@@ -1145,6 +1209,18 @@ class HIDHost(ClassicMixin, BLEMixin):
             except Exception:
                 pass
             self._classic_connection_listener = None
+
+        if (
+            hasattr(self, '_classic_connection_request_listener')
+            and self._classic_connection_request_listener
+        ):
+            try:
+                self.device.host.remove_listener(
+                    'connection_request', self._classic_connection_request_listener
+                )
+            except Exception:
+                pass
+            self._classic_connection_request_listener = None
 
         if self.transport:
             try:

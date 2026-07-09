@@ -78,6 +78,7 @@ async def create_bumble_device(transport_spec=None, configure=None):
     from bt_setup import chip
     chip().on_transport_open()
 
+    transport_closed = False
     try:
         device = Device.with_hci(
             config.device_name,
@@ -99,7 +100,12 @@ async def create_bumble_device(transport_spec=None, configure=None):
             await asyncio.sleep(0.2)
         except asyncio.TimeoutError:
             log.error("HCI Reset timed out")
-            chip().on_hci_reset_timeout()
+            try:
+                await transport.close()
+                transport_closed = True
+            except Exception:
+                pass
+            await asyncio.to_thread(chip().on_hci_reset_timeout)
             raise
 
         device.address_resolution_offload = (
@@ -110,10 +116,11 @@ async def create_bumble_device(transport_spec=None, configure=None):
         await device.power_on()
         log.success(f"Device powered on: {device.public_address}")
     except BaseException:
-        try:
-            await transport.close()
-        except Exception:
-            pass
+        if not transport_closed:
+            try:
+                await transport.close()
+            except Exception:
+                pass
         raise
 
     return transport, device

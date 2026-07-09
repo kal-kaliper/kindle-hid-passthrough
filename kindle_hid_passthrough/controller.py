@@ -171,7 +171,7 @@ class DaemonController:
 
                 # Re-warm the chip if a prior /stop powered it off; opening the
                 # transport against a cold chip makes HCI Reset time out.
-                chip().ensure_powered()
+                await asyncio.to_thread(chip().ensure_powered)
 
                 await self.daemon.scan(
                     duration=10.0,
@@ -210,7 +210,7 @@ class DaemonController:
 
                 # Re-warm the chip if a prior /stop powered it off; opening the
                 # transport against a cold chip makes HCI Reset time out.
-                chip().ensure_powered()
+                await asyncio.to_thread(chip().ensure_powered)
 
                 success = await self.daemon.pair(address, protocol, name)
                 if success:
@@ -276,7 +276,7 @@ class DaemonController:
             if self.daemon._power_resume_task and not self.daemon._power_resume_task.done():
                 self.daemon._power_resume_task.cancel()
             await self.daemon.suspend(reason="power")
-            chip().power_off()
+            await asyncio.to_thread(chip().power_off)
             self.daemon._power_resume_task = asyncio.create_task(
                 self.daemon._delayed_power_resume(
                     config.power_resume_max_delay,
@@ -335,7 +335,7 @@ class DaemonController:
             try:
                 if suspend:
                     await self.daemon.suspend(reason="manual")
-                    chip().power_off()
+                    await asyncio.to_thread(chip().power_off)
                 else:
                     await self.daemon.disconnect()
             except Exception as e:
