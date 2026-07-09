@@ -10,6 +10,7 @@ import time
 
 from bt_chip import BtChip, free_device, run
 from config import config
+from fd_utils import close_own_fds_for_path
 from logging_utils import log
 
 DEFAULT_MODULE_PATTERNS = [
@@ -100,25 +101,7 @@ def _is_device_free(device_path):
 
 
 def _release_own_fds(device_path):
-    """Close this process's own leaked fds for device_path. Returns count."""
-    closed = 0
-    try:
-        entries = os.listdir('/proc/self/fd')
-    except OSError:
-        return 0
-    for entry in entries:
-        try:
-            target = os.readlink(f'/proc/self/fd/{entry}')
-        except OSError:
-            continue
-        if target != device_path:
-            continue
-        try:
-            os.close(int(entry))
-            closed += 1
-        except OSError:
-            pass
-    return closed
+    return close_own_fds_for_path(device_path)
 
 
 def _run_logged(cmd, timeout=10):

@@ -2,36 +2,16 @@
 """Bumble transport and device initialization."""
 
 import asyncio
-import os
 
 from bumble.device import Device
 from bumble.hci import HCI_LE_ADD_DEVICE_TO_RESOLVING_LIST_COMMAND, LeFeatureMask
 from bumble.transport import open_transport
 
 from config import config
+from fd_utils import close_own_fds_for_path
 from logging_utils import log
 
 __all__ = ['create_bumble_device']
-
-
-def _release_leaked_fds(device_path: str) -> int:
-    """Close fds in this process pointing at device_path. Returns count."""
-    closed = 0
-    try:
-        for entry in os.listdir('/proc/self/fd'):
-            try:
-                target = os.readlink(f'/proc/self/fd/{entry}')
-            except OSError:
-                continue
-            if target == device_path:
-                try:
-                    os.close(int(entry))
-                    closed += 1
-                except OSError:
-                    pass
-    except OSError:
-        pass
-    return closed
 
 
 async def _open_transport_with_recovery(spec: str):
@@ -42,7 +22,7 @@ async def _open_transport_with_recovery(spec: str):
         if e.errno != 16 or not spec.startswith('file:'):
             raise
         device_path = spec[5:]
-        n = _release_leaked_fds(device_path)
+        n = close_own_fds_for_path(device_path)
         if n == 0:
             raise
         log.warning(f"Released {n} leaked fd(s) for {device_path}, retrying")

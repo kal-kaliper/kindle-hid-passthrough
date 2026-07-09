@@ -17,6 +17,7 @@ from host import HIDHost
 from logging_utils import errstr, log, setup_daemon_logging
 from power_monitor import PowerMonitor
 from scanner import Scanner
+from wifi_ready import wifi_readiness
 
 logger = logging.getLogger(__name__)
 
@@ -184,11 +185,21 @@ class HIDDaemon:
         if self._power_resume_task and not self._power_resume_task.done():
             self._power_resume_task.cancel()
         self._power_resume_task = asyncio.create_task(
-            self._delayed_power_resume(config.power_resume_delay, "power"),
-            name="power_resume_delay",
+            self._delayed_power_resume(config.power_resume_max_delay, "power"),
+            name="power_resume_wifi_gate",
         )
 
     async def _delayed_power_resume(self, delay, reason):
+        if reason == "power":
+            if config.power_wifi_gate_enabled:
+                try:
+                    await self._wait_for_power_resume_ready(delay)
+                except asyncio.CancelledError:
+                    return
+                await self.resume(reason=reason)
+                return
+            delay = config.power_resume_delay
+
         if delay > 0:
             logger.info(f"Power resume: waiting {delay:.0f}s for WMT/Wi-Fi")
             try:
@@ -196,6 +207,65 @@ class HIDDaemon:
             except asyncio.CancelledError:
                 return
         await self.resume(reason=reason)
+
+    async def _wait_for_power_resume_ready(self, max_delay):
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + max_delay
+
+        min_delay = max(0.0, config.power_resume_min_delay)
+        if min_delay > 0:
+            logger.info(
+                f"Power resume: waiting {min_delay:.0f}s minimum for WMT/Wi-Fi"
+            )
+            try:
+                await asyncio.sleep(min_delay)
+            except asyncio.CancelledError:
+                raise
+
+        stable_required = max(1, config.power_resume_stable_polls)
+        poll_interval = max(0.1, config.power_resume_poll_interval)
+        stable_count = 0
+        last_reason = None
+
+        logger.info(
+            f"Power resume: waiting for Wi-Fi readiness "
+            f"(max {max_delay:.0f}s, stable={stable_required})"
+        )
+
+        while True:
+            readiness = await asyncio.to_thread(wifi_readiness)
+            elapsed = loop.time() - started
+            if readiness.ready:
+                stable_count += 1
+                if stable_count >= stable_required:
+                    logger.info(
+                        f"Power resume: Wi-Fi ready after {elapsed:.1f}s "
+                        f"({readiness.reason})"
+                    )
+                    return
+            else:
+                stable_count = 0
+                if readiness.reason != last_reason:
+                    logger.info(
+                        f"Power resume: Wi-Fi not ready after {elapsed:.1f}s "
+                        f"({readiness.reason})"
+                    )
+                    last_reason = readiness.reason
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning(
+                    f"Power resume: Wi-Fi readiness timed out after "
+                    f"{max_delay:.0f}s; resuming anyway "
+                    f"(last={readiness.reason})"
+                )
+                return
+
+            try:
+                await asyncio.sleep(min(poll_interval, remaining))
+            except asyncio.CancelledError:
+                raise
 
     def _has_devices(self, log_details=False) -> bool:
         """Check if any devices are configured."""

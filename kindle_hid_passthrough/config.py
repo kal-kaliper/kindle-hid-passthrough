@@ -147,6 +147,12 @@ class Config:
         self.power_startup_delay = float(self._get('power', 'startup_delay', '8.0'))
         self.power_resume_delay = float(self._get('power', 'resume_delay', '20.0'))
         self.power_resume_max_delay = float(self._get('power', 'resume_max_delay', '90.0'))
+        self.power_wifi_gate_enabled = self._getbool('power', 'wifi_gate_enabled', True)
+        self.power_resume_min_delay = float(self._get('power', 'resume_min_delay', '2.0'))
+        self.power_resume_poll_interval = float(
+            self._get('power', 'resume_poll_interval', '1.0'))
+        self.power_resume_stable_polls = self._getint(
+            'power', 'resume_stable_polls', 2)
         self.diagnostics_include_reports = self._getbool(
             'diagnostics', 'include_reports', False)
         self.diagnostics_recent_report_count = self._getint(

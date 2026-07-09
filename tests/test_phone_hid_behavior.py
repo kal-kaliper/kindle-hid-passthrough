@@ -200,6 +200,8 @@ from host import DeviceConfig, DeviceSession, HIDHost  # noqa: E402
 from scanner import BLE_APPEARANCE_CATEGORY_PHONE  # noqa: E402
 from bt_mtk import MtkChip  # noqa: E402
 import transport as transport_module  # noqa: E402
+import daemon as daemon_module  # noqa: E402
+from wifi_ready import WifiReadiness, wifi_readiness  # noqa: E402
 
 
 class FakeConnection:
@@ -585,6 +587,126 @@ class TransportRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(1, events.count("close"))
         self.assertLess(events.index("close"), events.index("reset_timeout_hook"))
+
+
+class WifiReadinessTests(unittest.TestCase):
+    def test_wifi_readiness_accepts_connected_wifi(self):
+        lipc = {
+            ('com.lab126.cmd', 'wirelessEnable'): '1',
+            ('com.lab126.wifid', 'enable'): '1',
+            ('com.lab126.cmd', 'activeInterface'): 'wifi',
+            ('com.lab126.wifid', 'cmState'): 'CONNECTED',
+        }
+
+        with unittest.mock.patch(
+                "wifi_ready._lipc_get",
+                side_effect=lambda service, prop: lipc[(service, prop)]), \
+                unittest.mock.patch(
+                    "wifi_ready._read_text",
+                    side_effect=lambda path: {
+                        '/sys/class/net/wlan0/operstate': 'up',
+                        '/sys/class/net/wlan0/carrier': '1',
+                    }[path]), \
+                unittest.mock.patch(
+                    "wifi_ready._ifconfig_ipv4",
+                    return_value='192.168.100.143'), \
+                unittest.mock.patch(
+                    "wifi_ready._has_default_route",
+                    return_value=True), \
+                unittest.mock.patch(
+                    "wifi_ready.os.path.exists",
+                    return_value=True):
+            readiness = wifi_readiness()
+
+        self.assertTrue(readiness.ready)
+        self.assertEqual('ready', readiness.reason)
+        self.assertEqual('192.168.100.143', readiness.details['ipv4'])
+
+    def test_wifi_readiness_waits_for_wifid_connected_state(self):
+        lipc = {
+            ('com.lab126.cmd', 'wirelessEnable'): '1',
+            ('com.lab126.wifid', 'enable'): '1',
+            ('com.lab126.cmd', 'activeInterface'): 'wifi',
+            ('com.lab126.wifid', 'cmState'): 'CONNECTING',
+        }
+
+        with unittest.mock.patch(
+                "wifi_ready._lipc_get",
+                side_effect=lambda service, prop: lipc[(service, prop)]), \
+                unittest.mock.patch(
+                    "wifi_ready._read_text",
+                    side_effect=lambda path: {
+                        '/sys/class/net/wlan0/operstate': 'up',
+                        '/sys/class/net/wlan0/carrier': '1',
+                    }[path]), \
+                unittest.mock.patch(
+                    "wifi_ready._ifconfig_ipv4",
+                    return_value='192.168.100.143'), \
+                unittest.mock.patch(
+                    "wifi_ready._has_default_route",
+                    return_value=True), \
+                unittest.mock.patch(
+                    "wifi_ready.os.path.exists",
+                    return_value=True):
+            readiness = wifi_readiness()
+
+        self.assertFalse(readiness.ready)
+        self.assertIn('cmState=CONNECTING', readiness.reason)
+
+    def test_wifi_readiness_waits_for_default_route(self):
+        lipc = {
+            ('com.lab126.cmd', 'wirelessEnable'): '1',
+            ('com.lab126.wifid', 'enable'): '1',
+            ('com.lab126.cmd', 'activeInterface'): 'wifi',
+            ('com.lab126.wifid', 'cmState'): 'CONNECTED',
+        }
+
+        with unittest.mock.patch(
+                "wifi_ready._lipc_get",
+                side_effect=lambda service, prop: lipc[(service, prop)]), \
+                unittest.mock.patch(
+                    "wifi_ready._read_text",
+                    side_effect=lambda path: {
+                        '/sys/class/net/wlan0/operstate': 'up',
+                        '/sys/class/net/wlan0/carrier': '1',
+                    }[path]), \
+                unittest.mock.patch(
+                    "wifi_ready._ifconfig_ipv4",
+                    return_value='192.168.100.143'), \
+                unittest.mock.patch(
+                    "wifi_ready._has_default_route",
+                    return_value=False), \
+                unittest.mock.patch(
+                    "wifi_ready.os.path.exists",
+                    return_value=True):
+            readiness = wifi_readiness()
+
+        self.assertFalse(readiness.ready)
+        self.assertIn('default_route=missing', readiness.reason)
+
+    def test_wifi_readiness_does_not_block_when_wifi_is_disabled(self):
+        with unittest.mock.patch(
+                "wifi_ready._lipc_get",
+                side_effect=lambda service, prop: (
+                    '0' if (service, prop) == (
+                        'com.lab126.cmd', 'wirelessEnable') else None
+                )), \
+                unittest.mock.patch(
+                    "wifi_ready._read_text",
+                    return_value=None), \
+                unittest.mock.patch(
+                    "wifi_ready._ifconfig_ipv4",
+                    return_value=None), \
+                unittest.mock.patch(
+                    "wifi_ready._has_default_route",
+                    return_value=False), \
+                unittest.mock.patch(
+                    "wifi_ready.os.path.exists",
+                    return_value=True):
+            readiness = wifi_readiness()
+
+        self.assertTrue(readiness.ready)
+        self.assertEqual('wifi-disabled', readiness.reason)
 
 
 class PhoneHidBehaviorTests(unittest.TestCase):
@@ -2043,6 +2165,20 @@ class DaemonHostStateTests(unittest.TestCase):
 
 
 class PowerLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._old_power_wifi_gate_enabled = config.power_wifi_gate_enabled
+        self._old_power_resume_delay = config.power_resume_delay
+        self._old_power_resume_min_delay = config.power_resume_min_delay
+        self._old_power_resume_poll_interval = config.power_resume_poll_interval
+        self._old_power_resume_stable_polls = config.power_resume_stable_polls
+
+    def tearDown(self):
+        config.power_wifi_gate_enabled = self._old_power_wifi_gate_enabled
+        config.power_resume_delay = self._old_power_resume_delay
+        config.power_resume_min_delay = self._old_power_resume_min_delay
+        config.power_resume_poll_interval = self._old_power_resume_poll_interval
+        config.power_resume_stable_polls = self._old_power_resume_stable_polls
+
     async def test_going_to_screensaver_suspends_for_power(self):
         daemon = HIDDaemon()
 
@@ -2101,6 +2237,61 @@ class PowerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await daemon.resume(reason="power-watchdog")
 
         self.assertTrue(daemon._suspended)
+        self.assertFalse(daemon._power_blocked)
+
+    async def test_power_resume_waits_for_wifi_readiness_gate(self):
+        daemon = HIDDaemon()
+        daemon._suspended = True
+        daemon._suspend_reason = "power"
+        daemon._power_blocked = True
+
+        config.power_wifi_gate_enabled = True
+        config.power_resume_min_delay = 0
+        config.power_resume_poll_interval = 0.01
+        config.power_resume_stable_polls = 2
+
+        samples = [
+            WifiReadiness(False, 'cmState=CONNECTING', {}),
+            WifiReadiness(True, 'ready', {}),
+            WifiReadiness(True, 'ready', {}),
+        ]
+        observed = []
+
+        def fake_readiness():
+            sample = samples.pop(0)
+            observed.append(sample.reason)
+            return sample
+
+        with unittest.mock.patch.object(
+                daemon_module, "wifi_readiness", fake_readiness):
+            await daemon._delayed_power_resume(1.0, "power")
+
+        self.assertEqual(
+            ['cmState=CONNECTING', 'ready', 'ready'],
+            observed,
+        )
+        self.assertFalse(daemon._suspended)
+        self.assertFalse(daemon._power_blocked)
+
+    async def test_power_resume_gate_disabled_uses_resume_delay_fallback(self):
+        daemon = HIDDaemon()
+        daemon._suspended = True
+        daemon._suspend_reason = "power"
+        daemon._power_blocked = True
+
+        config.power_wifi_gate_enabled = False
+        config.power_resume_delay = 3.5
+        sleep_calls = []
+
+        async def fake_sleep(delay):
+            sleep_calls.append(delay)
+
+        with unittest.mock.patch.object(
+                daemon_module.asyncio, "sleep", fake_sleep):
+            await daemon._delayed_power_resume(90.0, "power")
+
+        self.assertEqual([3.5], sleep_calls)
+        self.assertFalse(daemon._suspended)
         self.assertFalse(daemon._power_blocked)
 
 
