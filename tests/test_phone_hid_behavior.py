@@ -970,6 +970,28 @@ class PhoneHidBehaviorTests(unittest.TestCase):
 
         self.assertEqual([], session.uhid_device.inputs)
 
+    def test_serialized_physical_release_is_not_forwarded_after_tap(self):
+        host = self.make_host()
+        session = self.make_session(Protocol.BLE)
+        host.sessions[Protocol.BLE] = session
+
+        host._forward_report_for_protocol(
+            Protocol.BLE,
+            b"\x02\x00\x00\x04\x00\x00\x00\x00\x00",
+        )
+        host._forward_report_for_protocol(
+            Protocol.BLE,
+            b"\x02\x00\x00\x00\x00\x00\x00\x00\x00",
+        )
+
+        self.assertEqual(
+            [
+                b"\x02\x00\x00\x04\x00\x00\x00\x00\x00",
+                b"\x02\x00\x00\x00\x00\x00\x00\x00\x00",
+            ],
+            session.uhid_device.inputs,
+        )
+
     def test_session_state_keeps_status_telemetry_minimal(self):
         host = self.make_host()
         session = self.make_session(Protocol.CLASSIC)
@@ -1066,6 +1088,28 @@ class PhoneHidBehaviorTests(unittest.TestCase):
             session.uhid_device.inputs,
         )
 
+    def test_classic_modifier_release_does_not_duplicate_held_key(self):
+        host = self.make_host()
+        session = self.make_session(Protocol.CLASSIC)
+        host.sessions[Protocol.CLASSIC] = session
+
+        host._forward_report_for_protocol(
+            Protocol.CLASSIC,
+            b"\x01\x02\x00\x0c\x00\x00\x00\x00",
+        )
+        host._forward_report_for_protocol(
+            Protocol.CLASSIC,
+            b"\x01\x00\x00\x0c\x00\x00\x00\x00",
+        )
+
+        self.assertEqual(
+            [
+                b"\x01\x02\x00\x0c\x00\x00\x00\x00",
+                b"\x01\x00\x00\x00\x00\x00\x00\x00",
+            ],
+            session.uhid_device.inputs,
+        )
+
     def test_classic_serialized_report_preserves_modifier(self):
         host = self.make_host()
         session = self.make_session(Protocol.CLASSIC)
@@ -1095,8 +1139,64 @@ class PhoneHidBehaviorTests(unittest.TestCase):
                 Protocol.CLASSIC,
                 b"\x01\x00\x00\x04\x00\x00\x00\x00",
             )
+            session.report_queue.join()
 
         sleep.assert_called_once_with(0.008)
+        self.assertEqual(
+            [
+                b"\x01\x00\x00\x04\x00\x00\x00\x00",
+                b"\x01\x00\x00\x00\x00\x00\x00\x00",
+            ],
+            session.uhid_device.inputs,
+        )
+
+    def test_paced_reports_return_without_sending_inline(self):
+        config.ble_serialized_report_delay_ms = 8
+        host = self.make_host()
+        session = self.make_session(Protocol.BLE)
+        host.sessions[Protocol.BLE] = session
+
+        with unittest.mock.patch("host.time.sleep"):
+            host._forward_report_for_protocol(
+                Protocol.BLE,
+                b"\x02\x00\x00\x04\x00\x00\x00\x00\x00",
+            )
+            self.assertIsNotNone(session.report_queue)
+            session.report_queue.join()
+
+        self.assertEqual(
+            [
+                b"\x02\x00\x00\x04\x00\x00\x00\x00\x00",
+                b"\x02\x00\x00\x00\x00\x00\x00\x00\x00",
+            ],
+            session.uhid_device.inputs,
+        )
+
+    def test_paced_single_report_uses_existing_ordered_queue(self):
+        config.ble_serialized_report_delay_ms = 8
+        host = self.make_host()
+        session = self.make_session(Protocol.BLE)
+        host.sessions[Protocol.BLE] = session
+
+        host._queue_reports_for_session(
+            session,
+            (b"first", b"second"),
+            0.008,
+        )
+        host._forward_report_for_protocol(
+            Protocol.BLE,
+            b"\x01\x00\x00\x04\x00\x00\x00\x00",
+        )
+        session.report_queue.join()
+
+        self.assertEqual(
+            [
+                b"first",
+                b"second",
+                b"\x01\x00\x00\x04\x00\x00\x00\x00",
+            ],
+            session.uhid_device.inputs,
+        )
 
     def test_remote_drop_without_input_adds_classic_dial_backoff(self):
         host = self.make_host()
@@ -2208,6 +2308,24 @@ class PowerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(daemon._suspended)
         self.assertFalse(daemon._resume_after_power)
 
+    async def test_user_resume_overrides_power_recovery_gate(self):
+        daemon = HIDDaemon()
+        daemon._suspended = True
+        daemon._suspend_reason = "power"
+        daemon._power_blocked = True
+
+        async def never_resume():
+            await asyncio.sleep(60)
+
+        daemon._power_resume_task = asyncio.create_task(never_resume())
+
+        await daemon.resume(reason="user")
+        await asyncio.gather(daemon._power_resume_task, return_exceptions=True)
+
+        self.assertFalse(daemon._suspended)
+        self.assertFalse(daemon._power_blocked)
+        self.assertTrue(daemon._power_resume_task.cancelled())
+
     async def test_power_resume_does_not_override_manual_suspend(self):
         daemon = HIDDaemon()
         daemon._suspended = True
@@ -2239,6 +2357,47 @@ class PowerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await daemon.resume(reason="power-watchdog")
 
         self.assertTrue(daemon._suspended)
+        self.assertFalse(daemon._power_blocked)
+
+    async def test_power_watchdog_waits_for_powerd_active(self):
+        daemon = HIDDaemon()
+        daemon._suspended = True
+        daemon._suspend_reason = "power"
+        daemon._power_blocked = True
+
+        config.power_wifi_gate_enabled = False
+        config.power_resume_poll_interval = 0.01
+        samples = ["screen saver", "ready to suspend", "active"]
+        observed = []
+
+        def fake_powerd_state():
+            state = samples.pop(0)
+            observed.append(state)
+            return state
+
+        with unittest.mock.patch.object(
+                daemon_module, "powerd_state", fake_powerd_state):
+            await daemon._delayed_power_resume(0, "power-watchdog")
+
+        self.assertEqual(
+            ["screen saver", "ready to suspend", "active"],
+            observed,
+        )
+        self.assertFalse(daemon._suspended)
+        self.assertFalse(daemon._power_blocked)
+
+    async def test_power_watchdog_keeps_legacy_fallback_without_lipc(self):
+        daemon = HIDDaemon()
+        daemon._suspended = True
+        daemon._suspend_reason = "power"
+        daemon._power_blocked = True
+
+        config.power_wifi_gate_enabled = False
+        with unittest.mock.patch.object(
+                daemon_module, "powerd_state", return_value=None):
+            await daemon._delayed_power_resume(0, "power-watchdog")
+
+        self.assertFalse(daemon._suspended)
         self.assertFalse(daemon._power_blocked)
 
     async def test_power_resume_waits_for_wifi_readiness_gate(self):

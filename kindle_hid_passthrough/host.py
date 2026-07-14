@@ -2,6 +2,8 @@
 """HID Host — runs BLE + Classic handlers on a single Bumble device."""
 
 import asyncio
+import queue
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -54,6 +56,10 @@ class DeviceSession:
     disconnection_event: Optional[asyncio.Event] = None
     last_report: Optional[bytes] = None
     keyboard_last_keys: tuple = field(default_factory=tuple)
+    keyboard_last_modifier: int = 0
+    report_queue: Optional[queue.Queue] = None
+    report_worker: Optional[threading.Thread] = None
+    report_sender_stopped: bool = False
     established_at: float = 0.0
     uhid_created_at: float = 0.0
     source_report_count: int = 0
@@ -607,18 +613,60 @@ class HIDHost(ClassicMixin, BLEMixin):
         self._append_recent_report(session.recent_source_reports, source_hex)
 
         escape_report = self._remap_consumer_home_to_escape(session, data)
-        if escape_report is not None:
-            self._send_report_for_session(session, escape_report)
+        reports = (
+            (escape_report,)
+            if escape_report is not None
+            else self._reports_for_session(session, data)
+        )
+        delay_ms = self._serialized_report_delay_ms(session)
+        if delay_ms > 0:
+            self._queue_reports_for_session(session, reports, delay_ms / 1000.0)
             return
 
-        reports = self._reports_for_session(session, data)
-        delay_ms = self._serialized_report_delay_ms(session)
-        paced = delay_ms > 0 and len(reports) > 1
-        delay = delay_ms / 1000.0
-        for index, report in enumerate(reports):
-            if paced and index:
-                time.sleep(delay)
+        for report in reports:
             self._send_report_for_session(session, report)
+
+    def _queue_reports_for_session(self, session: DeviceSession, reports, delay: float):
+        if not reports:
+            return
+        if session.report_queue is None:
+            session.report_sender_stopped = False
+            session.report_queue = queue.Queue()
+            session.report_worker = threading.Thread(
+                target=self._report_sender_worker,
+                args=(session,),
+                name=f"hid_report_sender_{session.protocol.value}",
+                daemon=True,
+            )
+            session.report_worker.start()
+        for index, report in enumerate(reports):
+            session.report_queue.put((report, delay if index else 0.0))
+
+    def _report_sender_worker(self, session: DeviceSession):
+        while True:
+            item = session.report_queue.get()
+            try:
+                if item is None:
+                    return
+                report, delay = item
+                if session.report_sender_stopped:
+                    return
+                if delay > 0:
+                    time.sleep(delay)
+                if session.report_sender_stopped:
+                    return
+                self._send_report_for_session(session, report)
+            finally:
+                session.report_queue.task_done()
+
+    def _stop_report_sender(self, session: DeviceSession):
+        session.report_sender_stopped = True
+        if session.report_queue is not None:
+            session.report_queue.put(None)
+        if session.report_worker is not None:
+            session.report_worker.join(timeout=0.5)
+        session.report_queue = None
+        session.report_worker = None
 
     def _send_report_for_session(self, session: DeviceSession, data: bytes):
         session.report_count += 1
@@ -668,20 +716,25 @@ class HIDHost(ClassicMixin, BLEMixin):
             data, self._keyboard_report_ids(session))
         if not parsed:
             session.keyboard_last_keys = ()
+            session.keyboard_last_modifier = 0
             return (data,)
 
         report_id, modifier, keys, report_len = parsed
         modifier &= self._keyboard_modifier_mask(session)
         current = tuple(key for key in keys if key)
         previous = session.keyboard_last_keys
+        previous_modifier = session.keyboard_last_modifier
         previous_set = set(previous)
         session.keyboard_last_keys = current
+        session.keyboard_last_modifier = modifier
 
         release = self._make_keyboard_report(report_id, 0, (), report_len)
         if not current:
-            return (release,) if previous else ()
+            return ()
 
         if current == previous:
+            if modifier != previous_modifier:
+                return ()
             keys_to_tap = current
         else:
             keys_to_tap = tuple(key for key in current if key not in previous_set)
@@ -690,7 +743,7 @@ class HIDHost(ClassicMixin, BLEMixin):
         for key in keys_to_tap:
             reports.append(self._make_keyboard_report(report_id, modifier, (key,), report_len))
             reports.append(release)
-        return tuple(reports) or (release,)
+        return tuple(reports)
 
     def _serialize_keyboard_reports(self, session: DeviceSession) -> bool:
         if session.protocol == Protocol.BLE:
@@ -1113,6 +1166,7 @@ class HIDHost(ClassicMixin, BLEMixin):
             self._connection_tasks.clear()
 
         for session in list(self.sessions.values()):
+            self._stop_report_sender(session)
             if session.uhid_device:
                 try:
                     session.uhid_device.destroy()
@@ -1142,6 +1196,7 @@ class HIDHost(ClassicMixin, BLEMixin):
 
         if self._classic_pending_session:
             pending = self._classic_pending_session
+            self._stop_report_sender(pending)
             if pending.uhid_device:
                 try:
                     pending.uhid_device.destroy()

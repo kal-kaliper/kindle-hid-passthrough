@@ -4,6 +4,7 @@
 import asyncio
 import logging
 import signal
+import subprocess
 import sys
 import threading
 
@@ -20,6 +21,22 @@ from scanner import Scanner
 from wifi_ready import wifi_readiness
 
 logger = logging.getLogger(__name__)
+
+
+def powerd_state():
+    """Return powerd's normalized state, or None when LIPC is unavailable."""
+    try:
+        result = subprocess.run(
+            ['lipc-get-prop', 'com.lab126.powerd', 'state'],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip().lower() or None
 
 
 class HIDDaemon:
@@ -127,7 +144,12 @@ class HIDDaemon:
     async def resume(self, reason=None):
         """Resume connections after scan/pair."""
         async with self._lifecycle_lock:
-            if self._power_blocked and reason not in ("power", "power-watchdog"):
+            if self._power_blocked and reason == "user":
+                logger.info("User resume requested during WMT/Wi-Fi recovery; resuming now")
+                self._power_blocked = False
+                if self._power_resume_task and not self._power_resume_task.done():
+                    self._power_resume_task.cancel()
+            elif self._power_blocked and reason not in ("power", "power-watchdog"):
                 if reason == "user" or self._suspend_reason != "manual":
                     self._resume_after_power = True
                     self._resume_after_power_reason = reason
@@ -206,6 +228,35 @@ class HIDDaemon:
                 await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 return
+
+        if reason == "power-watchdog":
+            # This fallback exists for a missed wake event, but screensaver ->
+            # readyToSuspend can itself take longer than the watchdog ceiling.
+            # Do not re-arm the shared MTK BT/Wi-Fi stack while powerd still
+            # says the device is asleep. Polling also preserves recovery: if
+            # the wake event was genuinely missed, powerd eventually reports
+            # active and the normal Wi-Fi readiness gate runs before resume.
+            last_state = None
+            while True:
+                state = await asyncio.to_thread(powerd_state)
+                if state is None or state == "active":
+                    break
+                if state != last_state:
+                    logger.info(
+                        f"Power watchdog: powerd state is {state}; keeping BT off"
+                    )
+                    last_state = state
+                try:
+                    await asyncio.sleep(max(0.1, config.power_resume_poll_interval))
+                except asyncio.CancelledError:
+                    return
+            if state == "active" and config.power_wifi_gate_enabled:
+                try:
+                    await self._wait_for_power_resume_ready(
+                        config.power_resume_max_delay
+                    )
+                except asyncio.CancelledError:
+                    return
         await self.resume(reason=reason)
 
     async def _wait_for_power_resume_ready(self, max_delay):
