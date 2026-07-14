@@ -245,7 +245,8 @@ class Scanner:
                 return
             seen_addresses.add(addr_str)
 
-            # Check if HID device (Peripheral device class)
+            # Check if this may be an HID device. Android keyboard/mouse apps can
+            # expose HID while the host still advertises as a Phone.
             is_hid = False
             major_class_name = "Unknown"
             try:
@@ -260,8 +261,11 @@ class Scanner:
                 )
                 major_class_name = f"0x{major_class:02X}"
 
-            # Log ALL devices found, not just HID
-            log.info(f"  Classic: {addr_str} CoD=0x{class_of_device:06X} ({major_class_name}) HID={is_hid}")
+            # Log ALL devices found, not just HID candidates.
+            log.info(
+                f"  Classic: {addr_str} CoD=0x{class_of_device:06X} "
+                f"({major_class_name}) HID-candidate={is_hid}"
+            )
 
             if is_hid:
                 name = 'Unknown'
