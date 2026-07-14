@@ -350,6 +350,30 @@ class HIDDaemon:
         self._classic_retry_not_before = host._classic_retry_not_before
         self._ble_bond_3e_fail_counts = host._ble_bond_3e_fail_counts
 
+    async def _start_host_task_if_active(self) -> bool:
+        """Start the next host task unless an operation suspended the daemon."""
+        async with self._lifecycle_lock:
+            if self._suspended or not self.running:
+                return False
+
+            # Use handed-off host from controller pairing if available.
+            if self._paired_host:
+                logger.info("=== Continuing with paired device ===")
+                self.host = self._paired_host
+                self._paired_host = None
+                self._seed_host_state(self.host)
+                self._host_task = asyncio.create_task(
+                    self.host.continue_after_pairing()
+                )
+            else:
+                logger.info("=== Starting connection ===")
+                self.host = HIDHost()
+                self._seed_host_state(self.host)
+                self._host_task = asyncio.create_task(
+                    self.host.run()
+                )
+            return True
+
     async def run(self):
         """Main daemon loop."""
         self.running = True
@@ -378,22 +402,8 @@ class HIDDaemon:
             await asyncio.to_thread(chip().ensure_powered)
 
             try:
-                # Use handed-off host from controller pairing if available
-                if self._paired_host:
-                    logger.info("=== Continuing with paired device ===")
-                    self.host = self._paired_host
-                    self._paired_host = None
-                    self._seed_host_state(self.host)
-                    self._host_task = asyncio.create_task(
-                        self.host.continue_after_pairing()
-                    )
-                else:
-                    logger.info("=== Starting connection ===")
-                    self.host = HIDHost()
-                    self._seed_host_state(self.host)
-                    self._host_task = asyncio.create_task(
-                        self.host.run()
-                    )
+                if not await self._start_host_task_if_active():
+                    continue
                 await self._host_task
 
             except asyncio.CancelledError:

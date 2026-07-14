@@ -358,6 +358,40 @@ class ScanControlTests(unittest.TestCase):
         self.assertTrue(controller._scan_stop_event.is_set())
 
 
+class DaemonRunLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_suspend_during_power_warmup_prevents_normal_host_start(self):
+        daemon = HIDDaemon()
+        daemon._has_devices = lambda log_details=False: True
+        host_starts = []
+
+        class FakeChip:
+            def ensure_powered(self):
+                daemon._suspended = True
+                daemon._suspend_reason = "operation"
+
+        class FakeHost:
+            def __init__(self):
+                host_starts.append("created")
+
+            async def run(self):
+                host_starts.append("run")
+
+        with unittest.mock.patch.object(daemon_module, "chip", return_value=FakeChip()), \
+                unittest.mock.patch.object(daemon_module, "HIDHost", FakeHost):
+            run_task = asyncio.create_task(daemon.run())
+            for _ in range(20):
+                if daemon._suspended:
+                    break
+                await asyncio.sleep(0.01)
+
+            self.assertTrue(daemon._suspended)
+            self.assertEqual([], host_starts)
+
+            daemon.running = False
+            daemon._resume_event.set()
+            await asyncio.wait_for(run_task, timeout=1.0)
+
+
 class ControllerStatusTests(unittest.TestCase):
     def setUp(self):
         self._old_include_reports = config.diagnostics_include_reports
