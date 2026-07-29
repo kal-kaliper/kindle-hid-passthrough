@@ -11,5 +11,25 @@ env KINDLE_HID_BASE=/mnt/us/kindle_hid_passthrough
 console none
 
 script
-    exec /mnt/us/python3.10-kindle/python3-wrapper.sh /mnt/us/kindle_hid_passthrough/main.py --daemon >>/var/log/hid_passthrough.log 2>&1
+    # Find the bundled interpreter rather than naming a version. Which CPython
+    # a dev device has under /mnt/us depends on how that bundle was built, and a
+    # conf naming a version the device does not ship cannot start the daemon at
+    # all, which is a silent brick: upstart reports the job stopped with no
+    # reason in the log. Release installs are unaffected, they run the compiled
+    # binary via assets/hid-passthrough.upstart.
+    #
+    # Discovery is inlined rather than delegated to a helper in the deployed
+    # tree so this job stays startable even when that tree is incomplete. The
+    # last glob match wins, which is the newest of the 3.1x bundles in use.
+    PY=""
+    for wrapper in /mnt/us/python3.*-kindle/python3-wrapper.sh; do
+        [ -x "$wrapper" ] && PY="$wrapper"
+    done
+    if [ ! -x "$PY" ]; then
+        echo "hid-passthrough: no python3-wrapper.sh under /mnt/us/python3.*-kindle" \
+            >>/var/log/hid_passthrough.log
+        exit 1
+    fi
+    exec "$PY" /mnt/us/kindle_hid_passthrough/main.py --daemon \
+        >>/var/log/hid_passthrough.log 2>&1
 end script

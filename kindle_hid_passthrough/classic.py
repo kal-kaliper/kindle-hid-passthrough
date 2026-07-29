@@ -5,7 +5,8 @@ import asyncio
 import time
 from typing import List
 
-from bumble.core import BT_BR_EDR_TRANSPORT, BT_HUMAN_INTERFACE_DEVICE_SERVICE, InvalidStateError, TimeoutError as BumbleTimeoutError
+from bumble.core import BT_BR_EDR_TRANSPORT, BT_HUMAN_INTERFACE_DEVICE_SERVICE, InvalidStateError
+from bumble.core import TimeoutError as BumbleTimeoutError
 from bumble.hci import (
     Address,
     HCI_Exit_Sniff_Mode_Command,

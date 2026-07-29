@@ -6,10 +6,20 @@ remote_dir := "/mnt/us/kindle_hid_passthrough"
 waf_dir := "/mnt/us/kindle_hid_passthrough/illusion/BTManager"
 upstart_conf := "/etc/upstart/hid-passthrough.conf"
 log_file := "/var/log/hid_passthrough.log"
-python := "/mnt/us/python3.10-kindle/python3-wrapper.sh"
 
 # Target Kindle SSH host (override: `just host=mykindle deploy`, or set KINDLE_HOST)
 host := env_var_or_default("KINDLE_HOST", "kindle")
+
+# Pin the bundled interpreter (override: set KINDLE_PYTHON to a wrapper path).
+# Empty means discover it on the device. The version is deliberately not
+# hardcoded here: which CPython a dev device has under /mnt/us depends on how
+# that bundle was built, and naming a version it does not ship fails with
+# nothing useful in the log.
+python := env_var_or_default("KINDLE_PYTHON", "")
+
+# Remote shell prelude that leaves the interpreter path in $PY. Use inside
+# SINGLE-quoted ssh arguments so the substitution runs on the device, not here.
+remote_python := 'PY="' + python + '"; [ -x "$PY" ] || PY=$(ls -d /mnt/us/python3.*-kindle/python3-wrapper.sh 2>/dev/null | tail -1); [ -x "$PY" ] || { echo "no python3-wrapper.sh under /mnt/us/python3.*-kindle" >&2; exit 1; }'
 
 default:
     @just --list
@@ -22,24 +32,20 @@ deploy:
     git -C {{src_dir}} rev-parse --short HEAD > {{src_dir}}/kindle_hid_passthrough/BUILD_SHA
     @echo "Remounting filesystems as writable..."
     ssh {{host}} "/usr/sbin/mntroot rw && mount -o remount,rw /mnt/base-us"
-    @echo "Copying all files via tar pipe..."
-    (cd {{src_dir}} && tar cf - \
-        --transform='s|^kindle_hid_passthrough/hid-passthrough-dev.upstart|etc/upstart/hid-passthrough.conf|' \
-        --transform='s|^kindle_hid_passthrough/|mnt/us/kindle_hid_passthrough/|' \
-        --transform='s|^assets/99-hid-keyboard.rules|etc/udev/rules.d/99-hid-keyboard.rules|' \
-        --transform='s|^scripts/dev_is_keyboard.sh|mnt/us/kindle_hid_passthrough/scripts/dev_is_keyboard.sh|' \
-        --transform='s|^illusion/BTManager/|mnt/us/kindle_hid_passthrough/illusion/BTManager/|' \
-        --transform='s|^illusion/BTManager.sh|mnt/us/kindle_hid_passthrough/illusion/BTManager.sh|' \
-        kindle_hid_passthrough/*.py \
-        kindle_hid_passthrough/config.ini \
-        kindle_hid_passthrough/BUILD_SHA \
-        kindle_hid_passthrough/hid-passthrough-dev.upstart \
-        kindle_hid_passthrough/modules/*.ko \
-        assets/99-hid-keyboard.rules \
-        scripts/dev_is_keyboard.sh \
-        illusion/BTManager/* \
-        illusion/BTManager.sh \
-    ) | ssh {{host}} "tar xf - -C /"
+    @echo "Copying files..."
+    # One tar per destination, with paths already relative to it. The previous
+    # single archive rewrote paths with --transform, which is GNU tar only, so
+    # deploying from macOS (bsdtar) failed with "Option is not supported" and
+    # copied nothing while the rest of the recipe carried on regardless.
+    ssh {{host}} "mkdir -p {{remote_dir}}/scripts {{remote_dir}}/modules {{remote_dir}}/illusion"
+    (cd {{src_dir}}/kindle_hid_passthrough && tar cf - *.py config.ini BUILD_SHA modules/*.ko) \
+        | ssh {{host}} "tar xf - -C {{remote_dir}}"
+    (cd {{src_dir}}/scripts && tar cf - dev_is_keyboard.sh) \
+        | ssh {{host}} "tar xf - -C {{remote_dir}}/scripts"
+    (cd {{src_dir}}/illusion && tar cf - BTManager BTManager.sh) \
+        | ssh {{host}} "tar xf - -C {{remote_dir}}/illusion"
+    scp -q {{src_dir}}/kindle_hid_passthrough/hid-passthrough-dev.upstart {{host}}:{{upstart_conf}}
+    scp -q {{src_dir}}/assets/99-hid-keyboard.rules {{host}}:/etc/udev/rules.d/99-hid-keyboard.rules
     -ssh {{host}} "udevadm control --reload-rules" 2>/dev/null || true
     @echo "Clearing Python bytecode cache..."
     ssh {{host}} "rm -rf {{remote_dir}}/__pycache__"
@@ -79,8 +85,14 @@ kill:
 
 # Start daemon + API server
 server:
+    # Start through upstart rather than launching the interpreter directly.
+    # A direct launch produced a process upstart did not own, so respawn never
+    # applied to it and `just status`/`restart`/`stop` acted on a different
+    # thing than the one actually running. It also means the interpreter path
+    # lives in exactly one place: the upstart conf, which discovers it.
+    -ssh {{host}} "/sbin/initctl stop hid-passthrough" 2>/dev/null || true
     -ssh {{host}} "pkill -9 -f 'main.py --daemon'" 2>/dev/null || true
-    ssh {{host}} "sleep 2 && /mnt/us/python3.10-kindle/python3-wrapper.sh /mnt/us/kindle_hid_passthrough/main.py --daemon > /dev/null 2>&1 &"
+    ssh {{host}} "/sbin/initctl start hid-passthrough"
     @echo "Daemon + API starting (takes ~8s on Kindle)."
 
 # Check daemon status
@@ -147,23 +159,22 @@ deploy-watch: deploy
 
 # Pair a new device (Classic)
 pair-classic:
-    ssh {{host}} "{{python}} {{remote_dir}}/main.py --pair --protocol classic"
+    ssh {{host}} '{{remote_python}}; "$PY" {{remote_dir}}/main.py --pair --protocol classic'
 
 # Pair a new device (BLE)
 pair-ble:
-    ssh {{host}} "{{python}} {{remote_dir}}/main.py --pair --protocol ble"
+    ssh {{host}} '{{remote_python}}; "$PY" {{remote_dir}}/main.py --pair --protocol ble'
 
 # Run manually (for debugging)
 run:
-    ssh {{host}} "{{python}} {{remote_dir}}/main.py"
+    ssh {{host}} '{{remote_python}}; "$PY" {{remote_dir}}/main.py'
 
 # Deploy KOReader plugin to Kindle
 deploy-koreader:
     @echo "Deploying KOReader plugin..."
-    (cd {{src_dir}} && tar cf - \
-        --transform='s|^koreader-plugin/hidpassthrough.koplugin/|mnt/us/koreader/plugins/hidpassthrough.koplugin/|' \
-        koreader-plugin/hidpassthrough.koplugin/ \
-    ) | ssh {{host}} "tar xf - -C /"
+    ssh {{host}} "mkdir -p /mnt/us/koreader/plugins"
+    (cd {{src_dir}}/koreader-plugin && tar cf - hidpassthrough.koplugin) \
+        | ssh {{host}} "tar xf - -C /mnt/us/koreader/plugins"
     @echo "KOReader plugin deployed!"
 
 # Remove autostart (removes upstart config)

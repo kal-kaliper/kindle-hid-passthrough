@@ -6,7 +6,6 @@ import re
 import subprocess
 from dataclasses import dataclass
 
-
 WIFI_INTERFACE = 'wlan0'
 
 

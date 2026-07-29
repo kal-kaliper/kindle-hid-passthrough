@@ -3,7 +3,7 @@
 
 import asyncio
 
-from bumble.core import AdvertisingData, BT_LE_TRANSPORT, InvalidStateError
+from bumble.core import BT_LE_TRANSPORT, AdvertisingData, InvalidStateError
 from bumble.device import Device, Peer
 from bumble.gatt import (
     GATT_DEVICE_NAME_CHARACTERISTIC,

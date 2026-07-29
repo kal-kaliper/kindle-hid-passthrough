@@ -21,9 +21,9 @@ import sys
 # Add current directory to path for imports
 sys.path.insert(0, '/mnt/us/kindle_hid_passthrough')
 
+from bt_setup import prepare_bt
 from config import Protocol, config, get_version
 from daemon import main as daemon_main
-from bt_setup import prepare_bt
 from host import HIDHost
 from logging_utils import log
 from scanner import Scanner
