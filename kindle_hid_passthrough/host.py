@@ -52,6 +52,7 @@ class DeviceSession:
     device_name: Optional[str] = None
     report_map: Optional[bytes] = None
     is_phone: Optional[bool] = None
+    device_class_resolved: bool = False
     uhid_device: Optional[UHIDDevice] = None
     disconnection_event: Optional[asyncio.Event] = None
     last_report: Optional[bytes] = None
@@ -797,7 +798,35 @@ class HIDHost(ClassicMixin, BLEMixin):
             return True
         if mode == 'never':
             return False
-        return session.is_phone is True
+        return self._session_is_phone(session) is True
+
+    def _session_is_phone(self, session: DeviceSession) -> Optional[bool]:
+        """Resolve this session's device class, re-reading the cache once.
+
+        `is_phone` is a snapshot taken when the session was recorded, and a
+        device can be classified after that: both writers (the inbound
+        connection_request handler and the manual scan) run independently of
+        session setup. Re-read once per session rather than per report, since
+        this is on the report path.
+
+        A device this host always dials first is never classified by either
+        writer, so its class can stay unknown indefinitely. Unknown means
+        "treat as a physical keyboard", which is the safe direction, but say so
+        once instead of letting it decide silently.
+        """
+        if session.is_phone is None and not session.device_class_resolved:
+            session.device_class_resolved = True
+            session.is_phone = self.device_cache.get_is_phone(session.address)
+            if session.is_phone is None:
+                log.warning(
+                    f"[{session.protocol.value.upper()}] Device class unknown "
+                    f"for {self._format_device(session.address)}; treating it "
+                    "as a physical keyboard and not serializing reports. "
+                    "Re-add it through a scan so its class is cached, or set "
+                    f"[{session.protocol.value}] serialize_keyboard_reports = "
+                    "always, if it is a phone running a HID keyboard app."
+                )
+        return session.is_phone
 
     def _serialized_report_delay_ms(self, session: DeviceSession) -> int:
         if session.protocol == Protocol.BLE:

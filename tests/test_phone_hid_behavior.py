@@ -951,6 +951,52 @@ class PhoneHidBehaviorTests(unittest.TestCase):
 
         self.assertEqual([report, report], session.uhid_device.inputs)
 
+    def test_classic_auto_resolves_a_class_cached_after_session_start(self):
+        # is_phone on the session is a snapshot. The inbound connection_request
+        # handler and the manual scan both write the class independently of
+        # session setup, so a session that began before classification must
+        # still pick it up rather than stay stuck on the snapshot.
+        config.classic_serialize_keyboard_reports_mode = 'auto'
+        host = self.make_host()
+        session = self.make_session(Protocol.CLASSIC)
+        host.sessions[Protocol.CLASSIC] = session
+        self.assertIsNone(session.is_phone)
+
+        host.device_cache.set_class(self.ADDR, True)
+        host._forward_report_for_protocol(
+            Protocol.CLASSIC, b"\x01\x00\x00\x04\x00\x00\x00\x00")
+
+        self.assertTrue(session.is_phone)
+        self.assertEqual(
+            [
+                b"\x01\x00\x00\x04\x00\x00\x00\x00",
+                b"\x01\x00\x00\x00\x00\x00\x00\x00",
+            ],
+            session.uhid_device.inputs,
+        )
+
+    def test_classic_auto_warns_once_when_device_class_stays_unknown(self):
+        # A device this host always dials first is never classified by either
+        # writer, so 'auto' silently picks the physical-keyboard branch. That
+        # is the safe direction but it must be visible, and the cache re-read
+        # must not happen per report: this is the report path.
+        config.classic_serialize_keyboard_reports_mode = 'auto'
+        host = self.make_host()
+        session = self.make_session(Protocol.CLASSIC)
+        host.sessions[Protocol.CLASSIC] = session
+
+        report = b"\x01\x00\x00\x04\x00\x00\x00\x00"
+        with unittest.mock.patch.object(
+            host.device_cache, "get_is_phone", return_value=None
+        ) as get_is_phone, unittest.mock.patch("host.log.warning") as warn:
+            host._forward_report_for_protocol(Protocol.CLASSIC, report)
+            host._forward_report_for_protocol(Protocol.CLASSIC, report)
+
+        self.assertEqual(1, get_is_phone.call_count)
+        self.assertEqual(1, warn.call_count)
+        self.assertIn("Device class unknown", warn.call_args[0][0])
+        self.assertEqual([report, report], session.uhid_device.inputs)
+
     def test_classic_auto_forwards_unknown_keyboard_reports(self):
         config.classic_serialize_keyboard_reports_mode = 'auto'
         host = self.make_host()
