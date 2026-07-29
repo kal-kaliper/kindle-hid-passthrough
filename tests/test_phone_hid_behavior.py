@@ -1,4 +1,5 @@
 import asyncio
+import configparser
 import os
 import sys
 import tempfile
@@ -780,11 +781,11 @@ class PhoneHidBehaviorTests(unittest.TestCase):
     ADDR = "AA:BB:CC:11:22:33"
 
     def setUp(self):
-        self._old_serialize = config.classic_serialize_keyboard_reports
+        self._old_serialize_mode = config.classic_serialize_keyboard_reports_mode
         self._old_report_delay = config.classic_serialized_report_delay_ms
         self._old_modifier_mask = config.classic_keyboard_modifier_mask
         self._old_ble_kindle_text_mode = config.ble_kindle_text_mode
-        self._old_ble_serialize = config.ble_serialize_keyboard_reports
+        self._old_ble_serialize_mode = config.ble_serialize_keyboard_reports_mode
         self._old_ble_report_delay = config.ble_serialized_report_delay_ms
         self._old_ble_modifier_mask = config.ble_keyboard_modifier_mask
         self._old_defer_names = config.classic_defer_uhid_until_input_names
@@ -792,11 +793,11 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self._old_passive_names = config.classic_passive_names
         self._old_include_reports = config.diagnostics_include_reports
         self._old_ble_remap_home = config.ble_remap_consumer_home_to_escape
-        config.classic_serialize_keyboard_reports = True
+        config.classic_serialize_keyboard_reports_mode = 'always'
         config.classic_serialized_report_delay_ms = 0
         config.classic_keyboard_modifier_mask = 0xff
         config.ble_kindle_text_mode = True
-        config.ble_serialize_keyboard_reports = True
+        config.ble_serialize_keyboard_reports_mode = 'always'
         config.ble_serialized_report_delay_ms = 0
         config.ble_keyboard_modifier_mask = 0x22
         config.classic_defer_uhid_until_input_names = []
@@ -806,11 +807,11 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         config.ble_remap_consumer_home_to_escape = False
 
     def tearDown(self):
-        config.classic_serialize_keyboard_reports = self._old_serialize
+        config.classic_serialize_keyboard_reports_mode = self._old_serialize_mode
         config.classic_serialized_report_delay_ms = self._old_report_delay
         config.classic_keyboard_modifier_mask = self._old_modifier_mask
         config.ble_kindle_text_mode = self._old_ble_kindle_text_mode
-        config.ble_serialize_keyboard_reports = self._old_ble_serialize
+        config.ble_serialize_keyboard_reports_mode = self._old_ble_serialize_mode
         config.ble_serialized_report_delay_ms = self._old_ble_report_delay
         config.ble_keyboard_modifier_mask = self._old_ble_modifier_mask
         config.classic_defer_uhid_until_input_names = self._old_defer_names
@@ -915,9 +916,103 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self.assertEqual("0100000405000000", session.last_source_report_hex)
         self.assertEqual("0100000000000000", session.last_uhid_report_hex)
 
-    def test_ble_keyboard_overlap_is_serialized_into_taps(self):
+    def test_classic_auto_serializes_phone_keyboard_reports(self):
+        config.classic_serialize_keyboard_reports_mode = 'auto'
+        host = self.make_host()
+        session = self.make_session(Protocol.CLASSIC)
+        session.is_phone = True
+        host.sessions[Protocol.CLASSIC] = session
+
+        host._forward_report_for_protocol(
+            Protocol.CLASSIC, b"\x01\x00\x00\x04\x00\x00\x00\x00")
+        host._forward_report_for_protocol(
+            Protocol.CLASSIC, b"\x01\x00\x00\x04\x05\x00\x00\x00")
+
+        self.assertEqual(
+            [
+                b"\x01\x00\x00\x04\x00\x00\x00\x00",
+                b"\x01\x00\x00\x00\x00\x00\x00\x00",
+                b"\x01\x00\x00\x05\x00\x00\x00\x00",
+                b"\x01\x00\x00\x00\x00\x00\x00\x00",
+            ],
+            session.uhid_device.inputs,
+        )
+
+    def test_classic_auto_forwards_physical_keyboard_reports(self):
+        config.classic_serialize_keyboard_reports_mode = 'auto'
+        host = self.make_host()
+        session = self.make_session(Protocol.CLASSIC)
+        session.is_phone = False
+        host.sessions[Protocol.CLASSIC] = session
+
+        report = b"\x01\x00\x00\x04\x00\x00\x00\x00"
+        host._forward_report_for_protocol(Protocol.CLASSIC, report)
+        host._forward_report_for_protocol(Protocol.CLASSIC, report)
+
+        self.assertEqual([report, report], session.uhid_device.inputs)
+
+    def test_classic_auto_forwards_unknown_keyboard_reports(self):
+        config.classic_serialize_keyboard_reports_mode = 'auto'
+        host = self.make_host()
+        session = self.make_session(Protocol.CLASSIC)
+        host.sessions[Protocol.CLASSIC] = session
+
+        report = b"\x01\x00\x00\x04\x00\x00\x00\x00"
+        host._forward_report_for_protocol(Protocol.CLASSIC, report)
+
+        self.assertEqual([report], session.uhid_device.inputs)
+
+    def test_classic_always_serializes_non_phone_keyboard_reports(self):
+        host = self.make_host()
+        session = self.make_session(Protocol.CLASSIC)
+        session.is_phone = False
+        host.sessions[Protocol.CLASSIC] = session
+
+        host._forward_report_for_protocol(
+            Protocol.CLASSIC, b"\x01\x00\x00\x04\x00\x00\x00\x00")
+
+        self.assertEqual(
+            [
+                b"\x01\x00\x00\x04\x00\x00\x00\x00",
+                b"\x01\x00\x00\x00\x00\x00\x00\x00",
+            ],
+            session.uhid_device.inputs,
+        )
+
+    def test_classic_never_forwards_phone_keyboard_reports(self):
+        config.classic_serialize_keyboard_reports_mode = 'never'
+        host = self.make_host()
+        session = self.make_session(Protocol.CLASSIC)
+        session.is_phone = True
+        host.sessions[Protocol.CLASSIC] = session
+
+        report = b"\x01\x00\x00\x04\x00\x00\x00\x00"
+        host._forward_report_for_protocol(Protocol.CLASSIC, report)
+
+        self.assertEqual([report], session.uhid_device.inputs)
+
+    def test_legacy_serialize_keyboard_report_values_parse_as_modes(self):
+        parser = configparser.ConfigParser()
+        parser.read_dict({'classic': {'serialize_keyboard_reports': 'true'}})
+        previous_parser = config._parser
+        config._parser = parser
+        try:
+            self.assertEqual(
+                'always',
+                config._get_tristate('classic', 'serialize_keyboard_reports', 'auto'),
+            )
+            parser.set('classic', 'serialize_keyboard_reports', 'false')
+            self.assertEqual(
+                'never',
+                config._get_tristate('classic', 'serialize_keyboard_reports', 'auto'),
+            )
+        finally:
+            config._parser = previous_parser
+
+    def test_ble_kindle_text_mode_serializes_non_phone_keyboard_reports(self):
         host = self.make_host()
         session = self.make_session(Protocol.BLE)
+        session.is_phone = False
         host.sessions[Protocol.BLE] = session
 
         host._forward_report_for_protocol(
@@ -943,7 +1038,7 @@ class PhoneHidBehaviorTests(unittest.TestCase):
 
     def test_ble_keyboard_passthrough_is_default_outside_kindle_text_mode(self):
         config.ble_kindle_text_mode = False
-        config.ble_serialize_keyboard_reports = False
+        config.ble_serialize_keyboard_reports_mode = 'never'
         host = self.make_host()
         session = self.make_session(Protocol.BLE)
         host.sessions[Protocol.BLE] = session

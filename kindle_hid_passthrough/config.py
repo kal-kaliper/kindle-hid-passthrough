@@ -119,8 +119,8 @@ class Config:
         self.bt_settle_time = float(self._get('bluetooth', 'settle_time', '0.5'))
         self.classic_require_live_descriptor = self._getbool(
             'classic', 'require_live_descriptor', True)
-        self.classic_serialize_keyboard_reports = self._getbool(
-            'classic', 'serialize_keyboard_reports', True)
+        self.classic_serialize_keyboard_reports_mode = self._get_tristate(
+            'classic', 'serialize_keyboard_reports', 'auto')
         self.classic_serialized_report_delay_ms = self._getint(
             'classic', 'serialized_report_delay_ms', 0)
         self.classic_keyboard_modifier_mask = self._getint_auto(
@@ -133,8 +133,9 @@ class Config:
             'classic', 'passive_names', [])
         self.ble_kindle_text_mode = self._getbool(
             'ble', 'kindle_text_mode', False)
-        self.ble_serialize_keyboard_reports = self._getbool(
-            'ble', 'serialize_keyboard_reports', self.ble_kindle_text_mode)
+        self.ble_serialize_keyboard_reports_mode = self._get_tristate(
+            'ble', 'serialize_keyboard_reports',
+            'always' if self.ble_kindle_text_mode else 'never')
         self.ble_serialized_report_delay_ms = self._getint(
             'ble', 'serialized_report_delay_ms',
             8 if self.ble_kindle_text_mode else 0)
@@ -246,6 +247,22 @@ class Config:
             return self._parser.getboolean(section, key)
         except (configparser.NoSectionError, configparser.NoOptionError, ValueError):
             return default
+
+    def _get_tristate(self, section: str, key: str, default: str) -> str:
+        try:
+            value = self._parser.get(section, key).lower()
+        except (configparser.NoSectionError, configparser.NoOptionError):
+            return default
+        values = {
+            'true': 'always', 'yes': 'always', 'on': 'always', '1': 'always',
+            'false': 'never', 'no': 'never', 'off': 'never', '0': 'never',
+            'auto': 'auto',
+        }
+        if value in values:
+            return values[value]
+        logging.getLogger(__name__).warning(
+            "Invalid [%s] %s value %r; using %r", section, key, value, default)
+        return default
 
     def validate_keystore(self):
         """Validate pairing_keys.json; back up and reset if corrupt."""

@@ -788,10 +788,16 @@ class HIDHost(ClassicMixin, BLEMixin):
 
     def _serialize_keyboard_reports(self, session: DeviceSession) -> bool:
         if session.protocol == Protocol.BLE:
-            return config.ble_serialize_keyboard_reports
-        if session.protocol == Protocol.CLASSIC:
-            return config.classic_serialize_keyboard_reports
-        return False
+            mode = config.ble_serialize_keyboard_reports_mode
+        elif session.protocol == Protocol.CLASSIC:
+            mode = config.classic_serialize_keyboard_reports_mode
+        else:
+            return False
+        if mode == 'always':
+            return True
+        if mode == 'never':
+            return False
+        return session.is_phone is True
 
     def _serialized_report_delay_ms(self, session: DeviceSession) -> int:
         if session.protocol == Protocol.BLE:
@@ -821,15 +827,6 @@ class HIDHost(ClassicMixin, BLEMixin):
         if report_id not in report_ids:
             return None
         return report_id, data[1], tuple(data[3:]), len(data)
-
-    def _parse_classic_keyboard_report(self, data: bytes):
-        parsed = self._parse_keyboard_report(data)
-        if not parsed or parsed[0] != 1:
-            return None
-        return parsed[1], parsed[2]
-
-    def _make_classic_keyboard_report(self, modifier: int, keys):
-        return self._make_keyboard_report(1, modifier, keys, 8)
 
     def _make_keyboard_report(self, report_id: int, modifier: int, keys, report_len: int):
         slot_count = max(0, report_len - 3)
