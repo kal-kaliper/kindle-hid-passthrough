@@ -54,5 +54,15 @@ class BtChip:
     def power_off(self):
         """Turn the radio off (BT-off toggle)."""
 
+    def quiesce(self):
+        """Release the transport before system sleep.
+
+        Called instead of power_off() on the suspend path. Defaults to a full
+        power_off() so chips without a lighter option keep their existing
+        behaviour; chips whose radio shares a kernel module with Wi-Fi
+        override this to release only their own handles.
+        """
+        self.power_off()
+
     def ensure_powered(self):
         """Re-arm the chip before a (re)connect if it was powered off."""

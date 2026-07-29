@@ -198,6 +198,7 @@ from controller import DaemonController  # noqa: E402
 from daemon import HIDDaemon  # noqa: E402
 from host import DeviceConfig, DeviceSession, HIDHost  # noqa: E402
 from scanner import BLE_APPEARANCE_CATEGORY_PHONE  # noqa: E402
+from bt_chip import BtChip  # noqa: E402
 from bt_mtk import MtkChip  # noqa: E402
 import transport as transport_module  # noqa: E402
 import daemon as daemon_module  # noqa: E402
@@ -567,6 +568,38 @@ class MtkPowerTests(unittest.TestCase):
         run_cmd.assert_called_once()
         self.assertEqual(["/sbin/rmmod", "wmt_cdev_bt"], run_cmd.call_args[0][0])
         self.assertEqual(3, is_free.call_count)
+
+    def test_mtk_quiesce_releases_fds_without_unloading_module(self):
+        chip = MtkChip(None)
+        chip._powered = True
+
+        with unittest.mock.patch("bt_mtk.os.path.exists", return_value=True), \
+                unittest.mock.patch(
+                    "bt_mtk._release_own_fds",
+                    return_value=1,
+                ) as release_own_fds, \
+                unittest.mock.patch("bt_mtk._find_bt_module") as find_module, \
+                unittest.mock.patch("bt_mtk.subprocess.run") as run_cmd:
+            chip.quiesce()
+
+        self.assertFalse(chip._powered)
+        release_own_fds.assert_called_once_with("/dev/stpbt")
+        find_module.assert_not_called()
+        run_cmd.assert_not_called()
+
+    def test_chip_without_quiesce_support_falls_back_to_power_off(self):
+        # The suspend path calls quiesce() unconditionally. Chips that have no
+        # lighter option (e.g. Broadcom) must keep powering off rather than
+        # raising AttributeError and stranding the daemon suspended.
+        calls = []
+
+        class PowerOffOnlyChip(BtChip):
+            def power_off(self):
+                calls.append("power_off")
+
+        PowerOffOnlyChip(None).quiesce()
+
+        self.assertEqual(["power_off"], calls)
 
 
 class TransportRecoveryTests(unittest.IsolatedAsyncioTestCase):

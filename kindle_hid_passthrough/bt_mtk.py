@@ -132,6 +132,8 @@ class MtkChip(BtChip):
         super().__init__(kindle)
         self._power_lock = threading.RLock()
         self._powered = False
+        self._last_forced_recovery = 0.0
+        self._forced_recovery_cooldown = 300.0
 
     def _device_path(self):
         return self.kindle.device_path if self.kindle else '/dev/stpbt'
@@ -240,8 +242,32 @@ class MtkChip(BtChip):
 
             self._powered = False
 
+    def quiesce(self):
+        """Release our transport before Kindle sleep without cycling WMT.
+
+        WMT is shared by Wi-Fi and Bluetooth on these Kindles.  Removing the
+        BT cdev for every screensaver transition creates wake IRQ churn and
+        is not needed once the Bumble transport has been cleaned up.
+        """
+        with self._power_lock:
+            device_path = self._device_path()
+            if os.path.exists(device_path):
+                released = _release_own_fds(device_path)
+                if released:
+                    log.info(f"Released {released} {device_path} fd(s) before suspend")
+            self._powered = False
+
     def on_hci_reset_timeout(self):
-        log.warning("HCI Reset timed out on MTK; unloading BT module for a clean restart")
+        now = time.monotonic()
+        if now - self._last_forced_recovery < self._forced_recovery_cooldown:
+            log.warning(
+                "HCI Reset timed out on MTK; recovery is rate-limited, "
+                "leaving the shared WMT stack alone"
+            )
+            self._powered = False
+            return
+        self._last_forced_recovery = now
+        log.warning("HCI Reset timed out on MTK; unloading BT module for one clean restart")
         self.power_off()
 
     def ensure_powered(self):

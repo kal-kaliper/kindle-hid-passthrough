@@ -271,12 +271,14 @@ class DaemonController:
         async with self._op_lock:
             if self.daemon._suspended:
                 return
-            logger.info(f"System suspend ({event}): powering BT off")
+            logger.info(f"System suspend ({event}): quiescing HID transport")
             self._suspended_by_system = True
             if self.daemon._power_resume_task and not self.daemon._power_resume_task.done():
                 self.daemon._power_resume_task.cancel()
             await self.daemon.suspend(reason="power")
-            await asyncio.to_thread(chip().power_off)
+            # Keep the shared MTK WMT module loaded.  Repeated rmmod/insmod
+            # cycles around sleep were the source of the wake interrupt storm.
+            await asyncio.to_thread(chip().quiesce)
             self.daemon._power_resume_task = asyncio.create_task(
                 self.daemon._delayed_power_resume(
                     config.power_resume_max_delay,
