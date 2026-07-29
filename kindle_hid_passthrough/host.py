@@ -818,13 +818,16 @@ class HIDHost(ClassicMixin, BLEMixin):
             session.device_class_resolved = True
             session.is_phone = self.device_cache.get_is_phone(session.address)
             if session.is_phone is None:
-                log.warning(
+                # Info, not a warning: an unknown class is the normal state for
+                # any device paired before class capture existed, and the
+                # physical-keyboard fallback is correct for almost all of them.
+                # It only needs acting on if the device really is a phone.
+                log.info(
                     f"[{session.protocol.value.upper()}] Device class unknown "
                     f"for {self._format_device(session.address)}; treating it "
-                    "as a physical keyboard and not serializing reports. "
-                    "Re-add it through a scan so its class is cached, or set "
-                    f"[{session.protocol.value}] serialize_keyboard_reports = "
-                    "always, if it is a phone running a HID keyboard app."
+                    "as a physical keyboard, reports not serialized. If it is "
+                    "a phone running a HID keyboard app, re-add it through a "
+                    "scan to cache its class."
                 )
         return session.is_phone
 

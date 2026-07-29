@@ -975,7 +975,7 @@ class PhoneHidBehaviorTests(unittest.TestCase):
             session.uhid_device.inputs,
         )
 
-    def test_classic_auto_warns_once_when_device_class_stays_unknown(self):
+    def test_classic_auto_logs_once_when_device_class_stays_unknown(self):
         # A device this host always dials first is never classified by either
         # writer, so 'auto' silently picks the physical-keyboard branch. That
         # is the safe direction but it must be visible, and the cache re-read
@@ -988,13 +988,15 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         report = b"\x01\x00\x00\x04\x00\x00\x00\x00"
         with unittest.mock.patch.object(
             host.device_cache, "get_is_phone", return_value=None
-        ) as get_is_phone, unittest.mock.patch("host.log.warning") as warn:
+        ) as get_is_phone, unittest.mock.patch("host.log.info") as info:
             host._forward_report_for_protocol(Protocol.CLASSIC, report)
             host._forward_report_for_protocol(Protocol.CLASSIC, report)
 
         self.assertEqual(1, get_is_phone.call_count)
-        self.assertEqual(1, warn.call_count)
-        self.assertIn("Device class unknown", warn.call_args[0][0])
+        self.assertEqual(
+            1,
+            sum("Device class unknown" in c[0][0] for c in info.call_args_list),
+        )
         self.assertEqual([report, report], session.uhid_device.inputs)
 
     def test_classic_auto_forwards_unknown_keyboard_reports(self):
