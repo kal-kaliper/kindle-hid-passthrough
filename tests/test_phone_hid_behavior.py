@@ -1667,6 +1667,43 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self.assertTrue(host.device_cache.get_is_phone(self.ADDR))
         self.assertTrue(host._classic_is_passive(self.ADDR))
 
+    def test_connection_request_logs_the_raw_cod(self):
+        # The inbound connection request is the only place the remote's Class
+        # of Device is observable, so the value has to reach the log or there
+        # is no way to explain a classification after the fact. Asserted for
+        # both outcomes: a phone CoD and a non-phone one.
+        async def scenario(cod):
+            host = self.make_host()
+            host.classic_devices = [
+                DeviceConfig(self.ADDR, Protocol.CLASSIC, "Some Device")
+            ]
+            host.device = FakeClassicDevice()
+            host._classic_active_connect_loop = lambda addrs: asyncio.sleep(0)
+            await host._run_classic_handler()
+
+            with unittest.mock.patch("classic.log.info") as log_info:
+                host.device.host.emit(
+                    'connection_request',
+                    Address(self.ADDR, Address.PUBLIC_DEVICE_ADDRESS),
+                    cod,
+                    0,
+                )
+            return [c[0][0] for c in log_info.call_args_list]
+
+        phone_lines = asyncio.run(scenario(self._cod(major=0x02, minor=0x01)))
+        self.assertTrue(
+            any("CoD=0x000204" in line and "phone=True" in line
+                for line in phone_lines),
+            phone_lines,
+        )
+
+        keyboard_lines = asyncio.run(scenario(self._cod(major=0x05, minor=0x10)))
+        self.assertTrue(
+            any("CoD=0x000540" in line and "phone=False" in line
+                for line in keyboard_lines),
+            keyboard_lines,
+        )
+
     def test_cache_key_is_transport_suffix_invariant(self):
         # Regression: a "/P"-suffixed write (as str(bd_addr) yields on a real
         # connection request) and a plain-address read must hit ONE cache

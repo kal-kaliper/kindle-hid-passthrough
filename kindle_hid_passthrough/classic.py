@@ -155,7 +155,17 @@ class ClassicMixin:
                 addr_str = str(bd_addr)
                 if not self._is_classic_allowed(addr_str):
                     return
-                if not classic_cod_is_phone(class_of_device):
+                is_phone = classic_cod_is_phone(class_of_device)
+                # Log the raw CoD even when it changes nothing. This handler is
+                # the only place it is observable, and without the value there
+                # is no way to explain after the fact why a device was or was
+                # not classified. Same format as the scanner's inquiry line so
+                # one pattern finds both.
+                log.info(
+                    f"[Classic] Inbound from {self._format_device(addr_str)} "
+                    f"CoD=0x{class_of_device:06X} phone={is_phone}"
+                )
+                if not is_phone:
                     return
                 if self.device_cache.get_is_phone(addr_str) is True:
                     return
