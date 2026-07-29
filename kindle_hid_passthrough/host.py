@@ -86,7 +86,11 @@ class HIDHost(ClassicMixin, BLEMixin):
     PROTOCOL_NAME = "HID"
 
     ACTIVE_DELAY = 2.0
-    ACTIVE_RETRY_INTERVAL = 5.0
+    # Do not keep waking the shared MTK radio just because a configured
+    # keyboard is not nearby.  The first probe remains quick; subsequent
+    # probes are deliberately sparse and happen on the already-open host.
+    IDLE_PROBE_INITIAL_DELAY = 60.0
+    IDLE_PROBE_MAX_DELAY = 300.0
     CLASSIC_BACKOFF_POLL_INTERVAL = 30.0
     ACTIVE_CONNECT_TIMEOUT = 10
     CLASSIC_AUTH_RETRY_DELAY = 8.0
@@ -165,6 +169,11 @@ class HIDHost(ClassicMixin, BLEMixin):
         self._classic_set_protocol_error = None
         self.last_pair_error = None
         self._radio_lock = None
+        self._connection_wait_started_at = None
+        self._idle_probe_failures = {
+            Protocol.CLASSIC: 0,
+            Protocol.BLE: 0,
+        }
 
     @property
     def connection_state(self) -> dict:
@@ -353,6 +362,7 @@ class HIDHost(ClassicMixin, BLEMixin):
         self._session_setup_lock = asyncio.Lock()
         self._allow_legacy_connection_state = False
         self._radio_lock = asyncio.Lock()
+        self._connection_wait_started_at = time.monotonic()
         self._protocol_restore_tasks = {}
         self._classic_active_connect_task = None
 
@@ -386,12 +396,12 @@ class HIDHost(ClassicMixin, BLEMixin):
         log.info(f"Waiting for connection (Classic: {len(self.classic_devices)}, BLE: {len(self.ble_devices)})")
 
         try:
-            await asyncio.wait_for(self._connection_future, timeout=60.0)
+            # An absent keyboard is normal.  Keeping this host alive avoids
+            # the old 60-second failure path, which destroyed the transport
+            # and caused the daemon to issue a fresh HCI Reset every minute.
+            await self._connection_future
             log.success("\nReceiving HID reports. Press Ctrl+C to exit.")
             await self._disconnection_event.wait()
-        except asyncio.TimeoutError:
-            log.warning("Connection timeout - no device connected")
-            raise InvalidStateError("No device connected within timeout")
         finally:
             for task in tasks:
                 if not task.done():
@@ -400,6 +410,37 @@ class HIDHost(ClassicMixin, BLEMixin):
                         await task
                     except asyncio.CancelledError:
                         pass
+
+    async def _acquire_radio_lock(self, operation: str) -> float:
+        """Acquire the shared controller lock and log how long it queued."""
+        started = time.monotonic()
+        await self._radio_lock.acquire()
+        waited = time.monotonic() - started
+        log.info(f"[Radio] {operation}: lock acquired after {waited:.2f}s")
+        return time.monotonic()
+
+    def _connection_wait_elapsed(self) -> float:
+        """Seconds since this host began waiting for a configured device."""
+        if self._connection_wait_started_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._connection_wait_started_at)
+
+    def _next_idle_probe_delay(self, protocol: Protocol) -> float:
+        """Return a bounded exponential delay after an unsuccessful probe."""
+        failures = self._idle_probe_failures.get(protocol, 0) + 1
+        self._idle_probe_failures[protocol] = failures
+        delay = min(
+            self.IDLE_PROBE_INITIAL_DELAY * (2 ** (failures - 1)),
+            self.IDLE_PROBE_MAX_DELAY,
+        )
+        log.info(
+            f"[{protocol.value.upper()}] No device present; idle for "
+            f"{delay:.0f}s before probe {failures + 1}"
+        )
+        return delay
+
+    def _reset_idle_probe_backoff(self, protocol: Protocol):
+        self._idle_probe_failures[protocol] = 0
 
     # ==================== PAIRING ====================
 
@@ -843,6 +884,7 @@ class HIDHost(ClassicMixin, BLEMixin):
             log.error(f"Failed to create UHID device: {e}")
 
     def _record_current_session(self, protocol: Protocol):
+        self._reset_idle_probe_backoff(protocol)
         event = self._protocol_disconnection_events.get(protocol)
         recorded_at = time.monotonic()
         session = DeviceSession(

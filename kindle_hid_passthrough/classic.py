@@ -298,7 +298,10 @@ class ClassicMixin:
             return
         self._finalize_classic_hid()
         self._record_current_session(Protocol.CLASSIC)
-        log.success(f"[Classic] Session ready: {self._format_device(addr_str)}")
+        log.success(
+            f"[Classic] Session ready: {self._format_device(addr_str)} "
+            f"(waited {self._connection_wait_elapsed():.2f}s)"
+        )
 
     def _is_classic_allowed(self, addr_str: str) -> bool:
         """Check if Classic address is allowed."""
@@ -345,6 +348,7 @@ class ClassicMixin:
             await asyncio.sleep(self.ACTIVE_DELAY)
 
             attempt = 0
+            waiting_for_ble = False
             while not self._is_protocol_connected(Protocol.CLASSIC):
                 retry_delay = self._protocol_retry_delay(Protocol.CLASSIC)
                 if retry_delay > 0:
@@ -356,8 +360,15 @@ class ClassicMixin:
                     continue
 
                 if getattr(self.device, 'le_connecting', False):
+                    if not waiting_for_ble:
+                        log.info(
+                            "[Classic] Waiting for active BLE procedure to yield "
+                            "the controller"
+                        )
+                        waiting_for_ble = True
                     await asyncio.sleep(0.5)
                     continue
+                waiting_for_ble = False
 
                 all_backoff_delay = self._classic_backoff_delay_for_all(addresses)
                 if all_backoff_delay > 0:
@@ -401,7 +412,9 @@ class ClassicMixin:
                     log.info(f"[Classic] Attempt {attempt}: {self._format_device(addr)}")
 
                     target = Address(addr, Address.PUBLIC_DEVICE_ADDRESS)
-                    await self._radio_lock.acquire()
+                    radio_started = await self._acquire_radio_lock(
+                        f"Classic connect ({self._format_device(addr)})"
+                    )
                     connect_task = asyncio.create_task(
                         self.device.connect(target, transport=BT_BR_EDR_TRANSPORT)
                     )
@@ -437,13 +450,22 @@ class ClassicMixin:
                             await connect_task
                         except (asyncio.CancelledError, Exception):
                             pass
+                        log.info(
+                            f"[Radio] Classic connect ({self._format_device(addr)}): "
+                            f"held lock for {time.monotonic() - radio_started:.2f}s"
+                        )
                         self._radio_lock.release()
 
                     if backoff:
                         await asyncio.sleep(backoff)
 
                 if not self._is_protocol_connected(Protocol.CLASSIC):
-                    await asyncio.sleep(self.ACTIVE_RETRY_INTERVAL)
+                    # Leave page scan on while idle so a keyboard that
+                    # reconnects by itself is accepted without another dial.
+                    await self._set_classic_page_scan(True)
+                    await asyncio.sleep(
+                        self._next_idle_probe_delay(Protocol.CLASSIC)
+                    )
         finally:
             if getattr(self, "_classic_active_connect_task", None) is current_task:
                 self._classic_active_connect_task = None

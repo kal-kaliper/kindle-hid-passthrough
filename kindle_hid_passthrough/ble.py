@@ -106,6 +106,12 @@ class BLEMixin:
                         continue
                 if connection is None:
                     await self._ble_coexist_pause()
+                    # A BLE central must initiate, but an absent keyboard is
+                    # not a fault.  Back off on the live host instead of
+                    # churning the shared MTK controller and page scan.
+                    await asyncio.sleep(
+                        self._next_idle_probe_delay(Protocol.BLE)
+                    )
 
             if connection is None:
                 return
@@ -137,6 +143,7 @@ class BLEMixin:
                 # only this session's disconnect reason.
                 self._last_ble_disconnect_reason = None
                 self.connected_protocol = Protocol.BLE
+                self._reset_idle_probe_backoff(Protocol.BLE)
                 connection.on(
                     'disconnection',
                     lambda reason, p=Protocol.BLE, a=addr_str:
@@ -150,7 +157,10 @@ class BLEMixin:
                     self._save_rotated_address(matched_dev, normalize_addr(addr_str))
 
                 self._record_current_session(Protocol.BLE)
-                log.success(f"[BLE] Session ready: {self._format_device(addr_str)}")
+                log.success(
+                    f"[BLE] Session ready: {self._format_device(addr_str)} "
+                    f"(waited {self._connection_wait_elapsed():.2f}s)"
+                )
 
         except asyncio.CancelledError:
             raise
@@ -226,6 +236,7 @@ class BLEMixin:
         delay = self._ble_coexist_pause_delay()
         if delay <= 0:
             return
+        log.info(f"[BLE] Yielding radio to Classic for {delay:.1f}s")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + delay
         while True:
@@ -269,7 +280,7 @@ class BLEMixin:
                 future.exception()
         pending.add_done_callback(consume_exception)
 
-        await self._radio_lock.acquire()
+        radio_started = await self._acquire_radio_lock(f"BLE initiate ({mode})")
         self.device.on(Device.EVENT_CONNECTION, on_connection)
         self.device.on(Device.EVENT_CONNECTION_FAILURE, on_failure)
         classic_page_scan_paused = False
@@ -367,6 +378,10 @@ class BLEMixin:
                     await self._set_classic_page_scan(True)
                 except Exception as e:
                     log.warning(f"[BLE] Could not restore Classic Page Scan: {e}")
+            log.info(
+                f"[Radio] BLE initiate ({mode}): held lock for "
+                f"{asyncio.get_running_loop().time() - radio_started:.2f}s"
+            )
             self._radio_lock.release()
 
     async def _ble_scan_for_rotated(self, known: set, window: float):
@@ -385,7 +400,7 @@ class BLEMixin:
             if match:
                 rotated.set_result((advertisement.address,) + match)
 
-        await self._radio_lock.acquire()
+        radio_started = await self._acquire_radio_lock("BLE rotation scan")
         self.device.on('advertisement', on_advertisement)
         scanning = False
         try:
@@ -422,6 +437,10 @@ class BLEMixin:
                     await self.device.stop_scanning(legacy=True)
                 except Exception:
                     pass
+            log.info(
+                "[Radio] BLE rotation scan: held lock for "
+                f"{asyncio.get_running_loop().time() - radio_started:.2f}s"
+            )
             self._radio_lock.release()
 
     def _match_rotated_ble_device(self, advertisement, known: set):
