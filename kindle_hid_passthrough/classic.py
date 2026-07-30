@@ -154,18 +154,23 @@ class ClassicMixin:
             # reconnect to the last-used host on their own).
             try:
                 addr_str = str(bd_addr)
-                if not self._is_classic_allowed(addr_str):
-                    return
+                allowed = self._is_classic_allowed(addr_str)
                 is_phone = classic_cod_is_phone(class_of_device)
-                # Log the raw CoD even when it changes nothing. This handler is
-                # the only place it is observable, and without the value there
-                # is no way to explain after the fact why a device was or was
-                # not classified. Same format as the scanner's inquiry line so
-                # one pattern finds both.
+                # Log before the allow-check, not after. This is the only proof a
+                # request reached us at all, and the previous ordering returned
+                # silently for a disallowed address — so "no log" was ambiguous
+                # between "nothing arrived" and "arrived and was dropped", which
+                # cost a long debugging session on real hardware.
                 log.info(
-                    f"[Classic] Inbound from {self._format_device(addr_str)} "
-                    f"CoD=0x{class_of_device:06X} phone={is_phone}"
+                    f"[Classic] Connection request from {addr_str} "
+                    f"CoD=0x{class_of_device:06X} phone={is_phone} allowed={allowed}"
                 )
+                if not allowed:
+                    log.warning(
+                        f"[Classic] Ignoring request from {addr_str}: not in "
+                        "devices.conf and not in the keystore"
+                    )
+                    return
                 if not is_phone:
                     return
                 if self.device_cache.get_is_phone(addr_str) is True:
