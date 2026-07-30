@@ -1832,6 +1832,90 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self.assertIsNone(host._parse_sdp_boolean(types.SimpleNamespace(value='yes')))
         self.assertIsNone(host._parse_sdp_boolean(types.SimpleNamespace(value=None)))
 
+    def _live_descriptor_host(self, sdp_result, cached=False, is_phone=False):
+        """A host poised at _handle_classic_connection with SDP stubbed."""
+        host = self.make_host()
+        host.current_device_address = self.ADDR
+        host.connection = FakeConnection(peer_address=self.ADDR)
+        host.hid_host = types.SimpleNamespace(l2cap_intr_channel=object())
+        host._create_uhid_device = lambda: None
+        if is_phone:
+            host.device_cache.set_class(self.ADDR, True)
+
+        async def fake_sdp(address=None):
+            return sdp_result
+
+        host._query_classic_sdp = fake_sdp
+
+        def fake_cache():
+            if cached:
+                host.report_map = b"\x05\x01"
+            return cached
+
+        host._load_cached_descriptor = fake_cache
+        return host
+
+    def test_link_dropped_when_device_answers_sdp_with_no_hid_record(self):
+        # The flag is called require_live_descriptor. A False result means the
+        # device answered and offered no HID service -- proof the keyboard is
+        # gone -- so a cached descriptor contradicts it and must not be used.
+        # Observed on hardware: a phone with its keyboard app closed got a UHID
+        # node built from a stale 141-byte descriptor and dropped the link 1.3s
+        # later having sent nothing.
+        host = self._live_descriptor_host(sdp_result=False, cached=True)
+
+        ok = asyncio.run(host._handle_classic_connection())
+
+        self.assertFalse(ok)
+        self.assertTrue(host.connection.is_disconnected)
+        self.assertIsNone(host.report_map)
+
+    def test_link_dropped_when_sdp_unreachable_on_a_phone(self):
+        # None means we could not ask. On a phone that most likely means the
+        # app that registers the HID record has exited.
+        host = self._live_descriptor_host(
+            sdp_result=None, cached=True, is_phone=True)
+
+        ok = asyncio.run(host._handle_classic_connection())
+
+        self.assertFalse(ok)
+        self.assertTrue(host.connection.is_disconnected)
+
+    def test_cached_descriptor_still_used_when_sdp_times_out_on_a_keyboard(self):
+        # The one defensible fallback: a non-phone whose query did not
+        # complete. Dropping here would flap a physical keyboard on a
+        # transient SDP timeout.
+        host = self._live_descriptor_host(
+            sdp_result=None, cached=True, is_phone=False)
+
+        ok = asyncio.run(host._handle_classic_connection())
+
+        self.assertTrue(ok)
+        self.assertFalse(host.connection.is_disconnected)
+        self.assertEqual(b"\x05\x01", host.report_map)
+
+    def test_link_dropped_when_sdp_fails_and_nothing_is_cached(self):
+        host = self._live_descriptor_host(
+            sdp_result=None, cached=False, is_phone=False)
+
+        ok = asyncio.run(host._handle_classic_connection())
+
+        self.assertFalse(ok)
+        self.assertTrue(host.connection.is_disconnected)
+
+    def test_live_descriptor_accepted_without_touching_the_cache(self):
+        host = self._live_descriptor_host(sdp_result=True, cached=False)
+
+        def fail():
+            raise AssertionError("cache must not be consulted on a live hit")
+
+        host._load_cached_descriptor = fail
+
+        ok = asyncio.run(host._handle_classic_connection())
+
+        self.assertTrue(ok)
+        self.assertFalse(host.connection.is_disconnected)
+
     def test_restore_does_not_rebuild_handler_when_all_devices_passive(self):
         # Regression, and the one that would have bricked a real device.
         # _run_classic_handler constructs a BumbleHIDHost on a Device that

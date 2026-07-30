@@ -650,16 +650,46 @@ class ClassicMixin:
 
         if config.classic_require_live_descriptor:
             self.report_map = None
+            # `_query_classic_sdp` is tri-state and the distinction carries the
+            # decision: True = a live HID record, False = the device answered
+            # SDP and offered no HID service, None = we could not ask at all.
+            # Collapsing these to falsy is what made this flag a misnomer — it
+            # fell back to the cache in every case, so a phone whose keyboard
+            # app had exited still got a UHID node built from a stale
+            # descriptor, on a link with no HID channels.
             live = await self._query_classic_sdp()
-            if not live and self._load_cached_descriptor():
-                log.warning("[Classic] Live SDP descriptor unavailable; using cached descriptor")
-            elif not live:
-                log.warning("[Classic] No live HID descriptor; dropping link")
-                try:
-                    await self.connection.disconnect()
-                except Exception:
-                    pass
-                return False
+            if not live:
+                address = self.current_device_address
+                if live is False:
+                    # The device told us it has no HID service. That is proof,
+                    # not a hiccup, and a cached descriptor contradicts it.
+                    refusal = "device answered SDP with no HID record"
+                elif self.device_cache.get_is_phone(address) is True:
+                    # A phone's HID record exists only while its app is
+                    # registered, so an unreachable SDP server on a phone is
+                    # far more likely to mean "app closed" than "bad moment".
+                    refusal = "SDP unreachable on a phone (its app registers the HID record)"
+                elif self._load_cached_descriptor():
+                    # Only here is falling back defensible: a non-phone whose
+                    # SDP query failed to complete. Dropping instead would
+                    # flap a physical keyboard on a transient timeout.
+                    refusal = None
+                    log.warning(
+                        "[Classic] SDP query did not complete; using the cached "
+                        "descriptor for this non-phone device"
+                    )
+                else:
+                    refusal = "SDP query did not complete and no descriptor is cached"
+
+                if refusal is not None:
+                    log.warning(
+                        f"[Classic] No live HID descriptor ({refusal}); dropping link"
+                    )
+                    try:
+                        await self.connection.disconnect()
+                    except Exception:
+                        pass
+                    return False
         elif not self._load_cached_descriptor():
             await self._query_classic_sdp()
 
