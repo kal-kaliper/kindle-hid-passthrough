@@ -39,6 +39,9 @@ class BLEMixin:
     BLE_CLASSIC_IDLE_WINDOW = 12.0
     BLE_CLASSIC_IDLE_RETRY_DELAY = 2.0
     BLE_COEXIST_RETRY_DELAY = 60.0
+    # Floor on how often _ble_sliced may re-enter the radio. Guards the case
+    # where an initiate returns without consuming its window at all.
+    BLE_SLICE_MIN_INTERVAL = 0.05
 
     async def _run_ble_handler(self):
         """Handle BLE connections."""
@@ -297,23 +300,12 @@ class BLEMixin:
         waiting to page us" — see `_ble_should_pause_classic_page_scan`.
         """
         total_window = self._ble_window_for_radio_state(total_window)
-        if not self._ble_should_pause_classic_page_scan():
-            return await run(total_window)
-
-        # `run` can return without consuming its window at all (a failed
-        # create-connection returns immediately), so a wall-clock deadline
-        # alone does not bound this loop: with dwell=0 that path spins tens of
-        # thousands of times per second, each iteration blanking and restoring
-        # page scan. Bound the iterations too, from the shape of the window.
-        slice_window = max(0.01, config.classic_page_scan_max_dark)
         dwell = max(0.0, config.classic_page_scan_dwell)
-        max_slices = max(1, int(total_window / max(slice_window + dwell, 0.01)) + 1)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + total_window
         first = True
-        slices = 0
 
-        while slices < max_slices:
+        while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return None
@@ -324,7 +316,12 @@ class BLEMixin:
             if self._ble_has_classic_setup_activity():
                 return None
 
-            if not first and dwell > 0:
+            # Dwell only while something is actually being blanked. When page
+            # scan is up, `run` gets the whole remaining window in one go and
+            # this loop makes exactly one pass, as before slicing existed.
+            if first or dwell <= 0 or not self._ble_should_pause_classic_page_scan():
+                pass
+            else:
                 # `run` restored page scan in its finally before returning, so
                 # the host is pageable for the whole of this sleep.
                 await asyncio.sleep(min(dwell, remaining))
@@ -332,30 +329,34 @@ class BLEMixin:
                 if remaining <= 0:
                     return None
             first = False
-            slices += 1
 
-            result = await run(min(slice_window, remaining))
+            # Hand over the FULL remaining window, not a slice. `_ble_initiate`
+            # clamps itself if and only if it actually blanks page scan, so the
+            # decision is made where the facts are current — and whatever it
+            # gives up stays in `remaining` for the next pass instead of being
+            # discarded.
+            iteration_started = loop.time()
+            result = await run(remaining)
             if result is not None:
                 return result
 
-        return None
+            # `run` can return without consuming any of its window (a failed
+            # create-connection returns at once). A wall-clock deadline alone
+            # would then spin thousands of times a second, blanking and
+            # restoring page scan on each pass, so make every pass cost
+            # something. Bounds the rate rather than truncating the window,
+            # which a slice-count cap would do whenever `run` under-consumes.
+            spent = loop.time() - iteration_started
+            if spent < self.BLE_SLICE_MIN_INTERVAL:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return None
+                await asyncio.sleep(
+                    min(self.BLE_SLICE_MIN_INTERVAL - spent, remaining))
 
     async def _ble_initiate(self, window: float, peer: Address = None):
         """Legacy create-connection to `peer`, or to the accept list when
         None. Returns the connection, or None on window timeout."""
-        landed = []
-        result = await self._ble_initiate_window(window, peer, landed)
-        if result is None and landed:
-            # The controller completed the link while we were cancelling, so
-            # the window "timed out" on a connection that actually exists.
-            # Dropping it leaves bumble holding a link the peer believes is
-            # up; slicing multiplies these cancel boundaries, so honour it
-            # rather than amplifying a silent loss.
-            log.info("[BLE] Connection landed during cancel; keeping it")
-            return landed[0]
-        return result
-
-    async def _ble_initiate_window(self, window: float, peer, landed: list):
         window = self._ble_window_for_radio_state(window)
 
         mode = f"peer {peer}" if peer is not None else "accept-list"
@@ -393,16 +394,26 @@ class BLEMixin:
                 log.info("[BLE] Initiate window skipped: Classic setup active")
                 return None
 
-            if self._ble_should_pause_classic_page_scan():
+            # `self._classic_page_scan_enabled` guard: if page scan is already
+            # down, this call blanks nothing, so clamping the window would
+            # surrender BLE scanning time to buy no inbound responsiveness.
+            if (self._ble_should_pause_classic_page_scan()
+                    and self._classic_page_scan_enabled):
                 # Bound the dark window HERE, where the blanking happens.
                 # _ble_sliced decides whether to slice *before* taking the
                 # radio lock, and Classic can drop while we wait on it, so
                 # that decision is stale by the time we arrive: the unsliced
                 # path would then blank page scan for a full uncapped window.
                 # Clamping at the point of truth makes the bound hold on
-                # every path into here, sliced or not.
+                # every path into here, sliced or not. _ble_sliced keeps
+                # looping, so the window this gives up is not lost.
                 max_dark = max(0.01, config.classic_page_scan_max_dark)
-                window = min(window, max_dark)
+                if window > max_dark:
+                    log.info(
+                        f"[BLE] Window clamped {window:.1f}s -> {max_dark:.1f}s "
+                        "to bound page-scan darkness"
+                    )
+                    window = max_dark
                 await self._set_classic_page_scan(False)
                 classic_page_scan_paused = True
 
@@ -485,10 +496,7 @@ class BLEMixin:
                 try:
                     await self.device.send_command(
                         HCI_LE_Create_Connection_Cancel_Command())
-                    raced = await asyncio.wait_for(
-                        asyncio.shield(pending), timeout=1.0)
-                    if raced is not None:
-                        landed.append(raced)
+                    await asyncio.wait_for(asyncio.shield(pending), timeout=1.0)
                 except Exception:
                     pass
             self.device.le_connecting = False

@@ -1095,13 +1095,13 @@ class HIDHost(ClassicMixin, BLEMixin):
         dialed and never auto-restored after an idle drop, but still
         accepted whenever it initiates the connection (page-scan stays on).
 
-        Three signals, any of which is sufficient.
+        Three independent signals. The first is a conjunction of two facts;
+        the other two are each sufficient on their own.
 
-        The device's own SDP declaration is the authoritative one:
+        First, the device's own SDP declaration together with evidence:
         HIDReconnectInitiate (0x0205) true means it re-establishes the link
-        itself, so dialing it is wasted radio time that also blanks page scan
-        so dialing it wastes radio-lock time and HCI churn on a link the peer
-        would have established itself. (It does NOT blank page scan — the
+        itself, so dialing it wastes radio-lock time and HCI churn on a link
+        the peer would have made anyway. (It does NOT blank page scan — the
         Classic dial only ever turns page scan on; the sole caller of
         `_set_classic_page_scan(False)` is `_ble_initiate`.)
 
@@ -1244,10 +1244,19 @@ class HIDHost(ClassicMixin, BLEMixin):
                     # that function has already cleared both listeners,
                     # leaving Classic permanently deaf while the daemon still
                     # reports healthy.
+                    # Deliberately does not claim page scan is up: this
+                    # code never reads _classic_page_scan_enabled, and if a
+                    # BLE restore threw, the flag can disagree with the radio.
+                    # Re-assert it rather than assume, since the keeper's own
+                    # 30s tick skips while the radio lock is held.
                     log.info(
-                        "[Classic] Nothing to restore: all configured devices "
-                        "are connect-on-demand and page scan is already up"
+                        "[Classic] Nothing to dial: every configured device is "
+                        "connect-on-demand; re-asserting page scan"
                     )
+                    task = asyncio.create_task(
+                        self._set_classic_page_scan(True, force=True))
+                    self._connection_tasks.add(task)
+                    task.add_done_callback(self._connection_tasks.discard)
                     return
                 coro = self._classic_active_connect_loop(active_addresses)
             else:

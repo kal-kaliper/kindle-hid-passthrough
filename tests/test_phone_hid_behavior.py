@@ -1832,6 +1832,103 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self.assertIsNone(host._parse_sdp_boolean(types.SimpleNamespace(value='yes')))
         self.assertIsNone(host._parse_sdp_boolean(types.SimpleNamespace(value=None)))
 
+    def test_restore_does_not_rebuild_handler_when_all_devices_passive(self):
+        # Regression, and the one that would have bricked a real device.
+        # _run_classic_handler constructs a BumbleHIDHost on a Device that
+        # already has the HID PSMs registered, which raises 'PSM already in
+        # use' AFTER it has cleared both inbound listeners. With every device
+        # passive the restore arm fell through to exactly that, leaving
+        # Classic deaf for the life of the process.
+        host = self.make_host()
+        host.classic_devices = [
+            DeviceConfig(self.ADDR, Protocol.CLASSIC, "Example Phone")
+        ]
+        host.device_cache.set_class(self.ADDR, True)
+        host._classic_connection_listener = lambda *a: None
+        rebuilt = []
+        host._run_classic_handler = lambda: rebuilt.append(True)
+        dialed = []
+        host._classic_active_connect_loop = lambda addrs: dialed.append(addrs)
+        reasserted = []
+
+        async def fake_page_scan(enabled, force=False):
+            reasserted.append((enabled, force))
+
+        host._set_classic_page_scan = fake_page_scan
+
+        async def scenario():
+            # Called from inside the loop, as _on_protocol_disconnection does.
+            host._schedule_protocol_restore(Protocol.CLASSIC)
+            await asyncio.sleep(0)
+
+        asyncio.run(scenario())
+
+        self.assertEqual([], rebuilt, "must not rebuild the Classic handler")
+        self.assertEqual([], dialed, "nothing to dial when all are passive")
+        self.assertNotIn(Protocol.CLASSIC, host._protocol_restore_tasks)
+        # Page scan re-asserted rather than assumed: this path never reads the
+        # tracked flag, and the keeper skips while the radio lock is held.
+        self.assertEqual([(True, True)], reasserted)
+
+    def test_restore_still_dials_when_an_active_device_remains(self):
+        host = self.make_host()
+        other = "AA:BB:CC:DD:EE:FF"
+        host.classic_devices = [
+            DeviceConfig(self.ADDR, Protocol.CLASSIC, "Example Phone"),
+            DeviceConfig(other, Protocol.CLASSIC, "Real Keyboard"),
+        ]
+        host.device_cache.set_class(self.ADDR, True)
+        host._classic_connection_listener = lambda *a: None
+        dialed = []
+
+        async def fake_loop(addrs):
+            dialed.append(addrs)
+
+        host._classic_active_connect_loop = fake_loop
+
+        async def scenario():
+            host._schedule_protocol_restore(Protocol.CLASSIC)
+            task = host._protocol_restore_tasks.get(Protocol.CLASSIC)
+            if task is not None:
+                await task
+
+        asyncio.run(scenario())
+
+        self.assertEqual([[other]], dialed)
+
+    def test_inbound_request_records_evidence_and_flips_to_passive(self):
+        # Producer -> consumer. The declaration alone must not stop dialing;
+        # an observed inbound connection is what completes the pair.
+        host = self.make_host()
+        host.classic_devices = [
+            DeviceConfig(self.ADDR, Protocol.CLASSIC, "Real Keyboard")
+        ]
+        host.device_cache.set_reconnect_initiate(self.ADDR, True)
+        self.assertFalse(host._classic_is_passive(self.ADDR))
+
+        # A keyboard's CoD, not a phone's: the evidence must be recorded
+        # regardless of device class.
+        host._on_classic_connection_request(Address(self.ADDR), 0x000540, 1)
+
+        self.assertTrue(host.device_cache.get_seen_inbound(self.ADDR))
+        self.assertTrue(host._classic_is_passive(self.ADDR))
+
+    def test_seen_inbound_survives_a_descriptor_recache(self):
+        # The SDP descriptor save passes only report_map/device_name, so
+        # without the sticky merge the device would silently revert to being
+        # dialed on every reconnect.
+        host = self.make_host()
+        host.device_cache.set_reconnect_initiate(self.ADDR, True)
+        host.device_cache.set_seen_inbound(self.ADDR, True)
+
+        host.device_cache.save(self.ADDR, {
+            'report_map': 'aabb',
+            'device_name': 'Real Keyboard',
+        })
+
+        self.assertTrue(host.device_cache.get_seen_inbound(self.ADDR))
+        self.assertTrue(host._classic_is_passive(self.ADDR))
+
     def test_classic_is_passive_ignores_stale_global_device_name(self):
         # Regression: _classic_is_passive must not consult the global
         # self.device_name (the last-connected device's name). Otherwise, once
@@ -2039,13 +2136,16 @@ class PhoneHidBehaviorTests(unittest.TestCase):
 
             await host._run_classic_handler()
 
-            self.assertNotIn(
-                first_listener,
-                controller._listeners.get('connection_request', []),
-            )
+            # The property that matters is that a restart does not leak a
+            # listener. Identity is no longer a useful probe for it: the
+            # handler is a bound method now, not a fresh closure per call, so
+            # the old and new registrations compare equal by construction.
+            registered = controller._listeners.get('connection_request', [])
+            self.assertEqual(1, len(registered))
             self.assertEqual(
-                1, len(controller._listeners.get('connection_request', []))
+                host._classic_connection_request_listener, registered[0]
             )
+            self.assertEqual(first_listener, registered[0])
 
         asyncio.run(scenario())
 
@@ -2298,24 +2398,26 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         )
         self.assertFalse(host.device.le_connecting)
 
-    def test_ble_sliced_bounds_each_slice_window(self):
-        # Window arithmetic only: asserts no slice exceeds page_scan_max_dark
-        # and the slices sum within the total. It does NOT prove page scan is
-        # restored -- the stub `run` never touches it, and _ble_sliced never
-        # sets it. The dark bound itself is enforced and tested in
-        # _ble_initiate (test_ble_initiate_clamps_window_when_it_blanks_page_scan).
+    def test_ble_sliced_keeps_looping_until_the_window_is_spent(self):
+        # _ble_sliced hands over the FULL remaining window and lets
+        # _ble_initiate clamp itself. Whatever a pass gives up must remain
+        # available to the next one. Regression: an earlier version returned
+        # after a single clamped pass, turning an 18s BLE window into 2s and
+        # discarding the other 16.
         config.classic_page_scan_max_dark = 0.02
+        config.classic_page_scan_dwell = 0.0
 
         async def scenario():
             host = self.make_host()
             windows = []
 
             async def run(window):
+                # Under-consumes, as a clamped _ble_initiate does.
                 windows.append(window)
-                await asyncio.sleep(window)
+                await asyncio.sleep(0.02)
                 return None
 
-            result = await host._ble_sliced(0.1, run)
+            result = await host._ble_sliced(0.3, run)
             return host, windows, result
 
         host, windows, result = asyncio.run(scenario())
@@ -2323,8 +2425,10 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertTrue(host._ble_should_pause_classic_page_scan())
         self.assertGreater(len(windows), 1)
-        self.assertTrue(all(w <= 0.02 + 1e-9 for w in windows), windows)
-        self.assertLessEqual(sum(windows), 0.1 + 1e-6)
+        # Each pass is offered what is left, so offers shrink toward zero
+        # rather than repeating a fixed slice.
+        self.assertAlmostEqual(0.3, windows[0], delta=0.05)
+        self.assertLess(windows[-1], windows[0])
 
     def test_ble_sliced_dwells_between_slices(self):
         # Asserts the dwell timer only: that consecutive `run` invocations are
@@ -2343,11 +2447,11 @@ class PhoneHidBehaviorTests(unittest.TestCase):
                 loop = asyncio.get_running_loop()
                 if last_end is not None:
                     gaps.append(loop.time() - last_end)
-                await asyncio.sleep(window)
+                await asyncio.sleep(0.02)
                 last_end = loop.time()
                 return None
 
-            await host._ble_sliced(0.2, run)
+            await host._ble_sliced(0.4, run)
             return gaps
 
         gaps = asyncio.run(scenario())
@@ -2363,8 +2467,10 @@ class PhoneHidBehaviorTests(unittest.TestCase):
             windows = []
 
             async def run(window):
+                # Under-consumes, as a clamped _ble_initiate does, so the
+                # loop gets a second pass to hand a connection back on.
                 windows.append(window)
-                await asyncio.sleep(window)
+                await asyncio.sleep(0.02)
                 return "connection" if len(windows) == 2 else None
 
             result = await host._ble_sliced(1.0, run)
@@ -2378,14 +2484,22 @@ class PhoneHidBehaviorTests(unittest.TestCase):
     def test_ble_initiate_clamps_window_when_it_blanks_page_scan(self):
         # The real dark bound. _ble_sliced decides whether to slice before
         # taking the radio lock, and Classic can drop while we wait on it, so
-        # the unsliced path could otherwise blank page scan for a full 18s
-        # window. _ble_initiate must clamp at the point it actually blanks.
+        # the decision can be stale by the time we blank. This test drives the
+        # common case, where _ble_window_for_radio_state has already capped at
+        # BLE_CLASSIC_IDLE_WINDOW (12s); the uncapped 18s is reachable only in
+        # the narrower race where Classic is connected at entry and drops
+        # during the lock wait. Either way the clamp must bind here, at the
+        # point the blanking actually happens.
         config.classic_page_scan_max_dark = 0.05
 
         async def scenario():
             host = self.make_host()
             host.device = FakeBleDevice()
             host._radio_lock = asyncio.Lock()
+            # Page scan must actually be up: the clamp is deliberately skipped
+            # when the blank would be a no-op, so that BLE does not surrender
+            # scanning time to buy inbound responsiveness it already has.
+            host._classic_page_scan_enabled = True
             writes = []
 
             async def fake_page_scan(enabled, force=False):
@@ -2403,6 +2517,35 @@ class PhoneHidBehaviorTests(unittest.TestCase):
 
         self.assertEqual([False, True], writes)
         self.assertLess(elapsed, 1.0, f"stayed dark {elapsed:.2f}s")
+
+    def test_ble_initiate_does_not_clamp_when_page_scan_is_already_down(self):
+        # Complement of the clamp test. If page scan is already down, blanking
+        # it changes nothing, so surrendering BLE scanning time to bound the
+        # darkness would buy inbound responsiveness that already exists.
+        config.classic_page_scan_max_dark = 0.02
+
+        async def scenario():
+            host = self.make_host()
+            host.device = FakeBleDevice()
+            host._radio_lock = asyncio.Lock()
+            host._classic_page_scan_enabled = False
+            writes = []
+
+            async def fake_page_scan(enabled, force=False):
+                writes.append(enabled)
+
+            host._set_classic_page_scan = fake_page_scan
+
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            await host._ble_initiate(0.3)
+            return writes, loop.time() - started
+
+        writes, elapsed = asyncio.run(scenario())
+
+        self.assertEqual([], writes, "nothing to blank, so nothing written")
+        self.assertGreater(
+            elapsed, 0.2, f"window was clamped to {elapsed:.3f}s for no gain")
 
     def test_ble_sliced_is_bounded_when_slices_consume_no_time(self):
         # A failed create-connection returns without consuming its window, so
@@ -2472,7 +2615,8 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         host, windows, result = asyncio.run(scenario())
 
         self.assertEqual("connection", result)
-        self.assertEqual([host.BLE_CLASSIC_IDLE_WINDOW], windows)
+        self.assertEqual(1, len(windows))
+        self.assertAlmostEqual(host.BLE_CLASSIC_IDLE_WINDOW, windows[0], delta=0.1)
 
     def test_page_scan_pause_can_be_disabled(self):
         host = self.make_host()

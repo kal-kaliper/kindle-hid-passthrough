@@ -42,6 +42,58 @@ FALLBACK_HID_DESCRIPTOR = bytes([
 class ClassicMixin:
     """Classic Bluetooth methods for HIDHost."""
 
+    def _on_classic_connection_request(self, bd_addr, class_of_device, link_type):
+        # Fires for INBOUND Classic connections only (the HCI
+        # Connection Request event), before ACL setup completes. This
+        # is the only place the remote's Class of Device is available —
+        # `Connection` objects never carry it. Used to auto-detect
+        # phones so `_classic_is_passive` can treat them as
+        # connect-on-demand without a hardcoded name in
+        # `classic_passive_names`. An outbound-only device we always
+        # dial first (never yet seen inbound) won't be classified via
+        # this path; it converges to passive after its first inbound
+        # connect, which matches observed phone behavior (phones
+        # reconnect to the last-used host on their own).
+        try:
+            addr_str = str(bd_addr)
+            allowed = self._is_classic_allowed(addr_str)
+            is_phone = classic_cod_is_phone(class_of_device)
+            # Log before the allow-check, not after. This is the only proof a
+            # request reached us at all, and the previous ordering returned
+            # silently for a disallowed address — so "no log" was ambiguous
+            # between "nothing arrived" and "arrived and was dropped", which
+            # cost a long debugging session on real hardware.
+            log.info(
+                f"[Classic] Connection request from {addr_str} "
+                f"CoD=0x{class_of_device:06X} phone={is_phone} allowed={allowed}"
+            )
+            if not allowed:
+                log.warning(
+                    f"[Classic] Ignoring request from {addr_str}: not in "
+                    "devices.conf and not in the keystore"
+                )
+                return
+            # Proof, as opposed to the device's own claim, that this peer
+            # really does page us. Recorded before the phone check because
+            # it is what makes a keyboard's HIDReconnectInitiate=true
+            # declaration safe to act on: a device that declares it but
+            # never pages would otherwise be dropped from the dial list
+            # forever, and the only way to discover the mistake is the
+            # very inbound connection it is failing to make.
+            if self.device_cache.get_seen_inbound(addr_str) is not True:
+                self.device_cache.set_seen_inbound(addr_str, True)
+            if not is_phone:
+                return
+            if self.device_cache.get_is_phone(addr_str) is True:
+                return
+            self.device_cache.set_class(addr_str, True)
+            log.info(
+                f"[Classic] Auto-detected phone from CoD: "
+                f"{self._format_device(addr_str)} (now passive/connect-on-demand)"
+            )
+        except Exception as e:
+            log.debug(f"[Classic] connection_request phone-detection failed: {e}")
+
     async def _run_classic_handler(self):
         """Handle Classic Bluetooth connections."""
         if hasattr(self, '_classic_connection_listener') and self._classic_connection_listener:
@@ -144,60 +196,9 @@ class ClassicMixin:
         self._classic_connection_listener = on_connection_event
         self.device.on('connection', on_connection_event)
 
-        def on_connection_request(bd_addr, class_of_device, link_type):
-            # Fires for INBOUND Classic connections only (the HCI
-            # Connection Request event), before ACL setup completes. This
-            # is the only place the remote's Class of Device is available —
-            # `Connection` objects never carry it. Used to auto-detect
-            # phones so `_classic_is_passive` can treat them as
-            # connect-on-demand without a hardcoded name in
-            # `classic_passive_names`. An outbound-only device we always
-            # dial first (never yet seen inbound) won't be classified via
-            # this path; it converges to passive after its first inbound
-            # connect, which matches observed phone behavior (phones
-            # reconnect to the last-used host on their own).
-            try:
-                addr_str = str(bd_addr)
-                allowed = self._is_classic_allowed(addr_str)
-                is_phone = classic_cod_is_phone(class_of_device)
-                # Log before the allow-check, not after. This is the only proof a
-                # request reached us at all, and the previous ordering returned
-                # silently for a disallowed address — so "no log" was ambiguous
-                # between "nothing arrived" and "arrived and was dropped", which
-                # cost a long debugging session on real hardware.
-                log.info(
-                    f"[Classic] Connection request from {addr_str} "
-                    f"CoD=0x{class_of_device:06X} phone={is_phone} allowed={allowed}"
-                )
-                if not allowed:
-                    log.warning(
-                        f"[Classic] Ignoring request from {addr_str}: not in "
-                        "devices.conf and not in the keystore"
-                    )
-                    return
-                # Proof, as opposed to the device's own claim, that this peer
-                # really does page us. Recorded before the phone check because
-                # it is what makes a keyboard's HIDReconnectInitiate=true
-                # declaration safe to act on: a device that declares it but
-                # never pages would otherwise be dropped from the dial list
-                # forever, and the only way to discover the mistake is the
-                # very inbound connection it is failing to make.
-                if self.device_cache.get_seen_inbound(addr_str) is not True:
-                    self.device_cache.set_seen_inbound(addr_str, True)
-                if not is_phone:
-                    return
-                if self.device_cache.get_is_phone(addr_str) is True:
-                    return
-                self.device_cache.set_class(addr_str, True)
-                log.info(
-                    f"[Classic] Auto-detected phone from CoD: "
-                    f"{self._format_device(addr_str)} (now passive/connect-on-demand)"
-                )
-            except Exception as e:
-                log.debug(f"[Classic] connection_request phone-detection failed: {e}")
-
-        self._classic_connection_request_listener = on_connection_request
-        self.device.host.on('connection_request', on_connection_request)
+        self._classic_connection_request_listener = self._on_classic_connection_request
+        self.device.host.on(
+            'connection_request', self._classic_connection_request_listener)
 
         keeper = asyncio.create_task(
             self._classic_page_scan_keeper(), name="classic_page_scan_keeper")
@@ -884,11 +885,23 @@ class ClassicMixin:
             if reconnect_initiate is not None:
                 self.device_cache.set_reconnect_initiate(
                     address, reconnect_initiate)
+                # Report the resulting decision, not the declaration alone.
+                # First contact is normally our own dial, so seen_inbound is
+                # usually still unset here and the device keeps being dialed —
+                # a log claiming otherwise would describe a state that has not
+                # been reached.
+                seen = self.device_cache.get_seen_inbound(address) is True
+                if not reconnect_initiate:
+                    outcome = "; we must dial it"
+                elif seen:
+                    outcome = "; already seen paging us, so we stop dialing it"
+                else:
+                    outcome = (
+                        "; still dialing until we have actually seen it page us"
+                    )
                 log.info(
                     f"[Classic] {self._format_device(address)} declares "
-                    f"reconnect_initiate={reconnect_initiate}"
-                    + ("; it will page us, so we will not dial it"
-                       if reconnect_initiate else "; we must dial it")
+                    f"reconnect_initiate={reconnect_initiate}{outcome}"
                 )
 
             if self.report_map:

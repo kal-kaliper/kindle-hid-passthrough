@@ -133,8 +133,9 @@ class Config:
             'classic', 'passive_names', [])
         self.classic_trust_reconnect_initiate = self._getbool(
             'classic', 'trust_reconnect_initiate', True)
-        # Longest a BLE initiate may keep page scan dark before restoring it
-        # (plus up to ~1s while the create-connection cancel is awaited). A
+        # Longest a BLE initiate intends to keep page scan dark. Not a
+        # worst-case bound: several HCI commands sit inside the dark region,
+        # each bounded only by bumble's 10s command timeout. A
         # keyboard wakes on a keypress and pages for only a few seconds, so a
         # dark stretch longer than that burst loses the whole burst. This
         # bounds darkness, not radio-lock hold time: the radio is still held
