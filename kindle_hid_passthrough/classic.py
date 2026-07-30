@@ -80,8 +80,16 @@ class ClassicMixin:
             # never pages would otherwise be dropped from the dial list
             # forever, and the only way to discover the mistake is the
             # very inbound connection it is failing to make.
-            if self.device_cache.get_seen_inbound(addr_str) is not True:
-                self.device_cache.set_seen_inbound(addr_str, True)
+            #
+            # Called on EVERY inbound request, not just the first: this is
+            # what stamps seen_inbound_at, and _classic_is_passive's TTL
+            # judges freshness against that stamp. Guarding this with "if
+            # not already True" (as before) meant a healthy keyboard was
+            # stamped once and never again -- a delayed regression where the
+            # passive feature quietly expires under a device that has been
+            # paging reliably the whole time. set_seen_inbound itself is the
+            # one that refreshes the timestamp on every True write.
+            self.device_cache.set_seen_inbound(addr_str, True)
             if not is_phone:
                 return
             if self.device_cache.get_is_phone(addr_str) is True:
@@ -528,8 +536,66 @@ class ClassicMixin:
             delays.append(delay)
         return min(delays) if delays else 0.0
 
+    def _classic_maybe_start_active_dialing(self):
+        """Re-evaluate the passive/active split and start the dial loop if
+        evidence has expired for a device that was passive when
+        `_run_classic_handler` last computed it, and nothing is dialing yet.
+
+        That split (classic.py, `_run_classic_handler`) runs exactly once,
+        at handler start, and is then frozen for the handler's entire
+        lifetime. When every configured device was passive at that moment,
+        `_classic_active_connect_loop` is never even created -- the
+        `elif configured_addresses:` branch there just logs and returns --
+        so there is no dial loop and no other code path left to notice that
+        a device's CLASSIC_SEEN_INBOUND_TTL_SECONDS evidence has since
+        expired. `run()` just waits indefinitely on the connection future.
+        This keeper tick, running every CLASSIC_PAGE_SCAN_REASSERT_INTERVAL
+        regardless of what the initial split decided, is therefore the only
+        place left that ever revisits it on an already-running host; without
+        this hook a TTL expiry does nothing until the next full host
+        rebuild, which for an all-passive configuration with no live
+        session to ever disconnect from may not happen on its own at all.
+
+        Deliberately does NOT touch an already-running loop: only "nothing
+        is dialing at all" transitions to "start dialing everything that is
+        currently active" here. `_classic_active_connect_loop` takes a
+        fixed address list for its whole run and guards against a second
+        concurrent instance via `_classic_active_connect_task`; widening a
+        live instance's address list mid-flight would mean restructuring
+        that contract, which is out of scope for the fatal case this hook
+        exists to fix -- every configured device passive, so nothing is
+        dialing at all -- as opposed to the partial-dial case where a
+        second device's evidence expires after an unrelated device is
+        already being actively dialed.
+        """
+        existing = getattr(self, "_classic_active_connect_task", None)
+        if existing and not existing.done():
+            return
+        if not self.classic_devices:
+            return
+        active_addresses = [
+            d.address for d in self.classic_devices
+            if d.address != '*' and not self._classic_is_passive(d.address, d.name)
+        ]
+        if not active_addresses:
+            return
+        log.info(
+            "[Classic] Seen-inbound evidence expired for a previously "
+            "passive device; resuming active dialing for: "
+            f"{[self._format_device(a) for a in active_addresses]}"
+        )
+        task = asyncio.create_task(
+            self._classic_active_connect_loop(active_addresses),
+            name="classic_active_connect_loop_reeval",
+        )
+        self._connection_tasks.add(task)
+        task.add_done_callback(self._connection_tasks.discard)
+
     async def _classic_page_scan_keeper(self):
-        """Periodically re-assert page scan while no Classic session is live.
+        """Periodically re-assert page scan while no Classic session is live,
+        and re-evaluate the passive/active split so a TTL expiry can take
+        effect on an already-running host (see
+        `_classic_maybe_start_active_dialing`).
 
         Page scan is the only route in for a connect-on-demand device, and a
         single assertion at host start is not durable: bumble owns this register
@@ -557,6 +623,7 @@ class ClassicMixin:
             await asyncio.sleep(self.CLASSIC_PAGE_SCAN_REASSERT_INTERVAL)
             if self._is_protocol_connected(Protocol.CLASSIC):
                 continue
+            self._classic_maybe_start_active_dialing()
             if self._radio_lock is not None and self._radio_lock.locked():
                 dark_since = self._classic_page_scan_dark_since
                 dark_for = (

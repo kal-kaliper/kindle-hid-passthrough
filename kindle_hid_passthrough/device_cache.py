@@ -4,6 +4,7 @@
 import json
 import logging
 import os
+import time
 from typing import Dict, Optional
 
 from config import normalize_addr
@@ -18,7 +19,14 @@ class DeviceCache:
     # device class, SDP service attributes — and on their own schedule. A
     # descriptor re-cache passes only report_map/device_name, so without
     # carrying these across they would be dropped on every reconnect.
-    STICKY_KEYS = ('is_phone', 'reconnect_initiate', 'seen_inbound')
+    # seen_inbound_at MUST travel with seen_inbound: dropping it on a
+    # descriptor re-save (which happens on every live SDP fetch) would make
+    # the stamp look "missing" to _classic_is_passive's TTL check, whose
+    # missing-stamp rule is grace (stamp it now) rather than expiry -- so a
+    # dropped stamp would silently reset the 7-day TTL clock from a
+    # non-inbound event instead of preserving how long ago the device
+    # actually last paged us.
+    STICKY_KEYS = ('is_phone', 'reconnect_initiate', 'seen_inbound', 'seen_inbound_at')
 
     def __init__(self, cache_dir: str):
         """Initialize cache manager
@@ -158,14 +166,31 @@ class DeviceCache:
         return self._read_raw(address).get('reconnect_initiate')
 
     def set_seen_inbound(self, address: str, value: bool) -> bool:
-        """Record that this device has been observed paging us.
+        """Record that this device has been observed paging us, and stamp
+        when.
 
         Written from the inbound HCI connection-request handler only, so it
         is evidence rather than a claim: it is the counterweight to
         HIDReconnectInitiate, which a device can declare true without
         implementing.
+
+        A True value ALWAYS refreshes both the flag and seen_inbound_at,
+        even when the flag was already True: the caller (the inbound
+        connection-request handler) fires on every inbound connection, not
+        just the first, and this stamp is what _classic_is_passive's TTL
+        judges freshness against. The old behaviour here early-returned
+        whenever the stored value already matched, which meant a healthy
+        keyboard that pages reliably was stamped once on its very first
+        inbound connection and never again -- silently expiring 7 days
+        later regardless of how often it had paged since. False still
+        early-returns when unchanged: there is nothing useful to stamp for
+        "not seen", and no caller sets it that way today.
         """
         data = self._read_raw(address)
+        if value:
+            data['seen_inbound'] = True
+            data['seen_inbound_at'] = time.time()
+            return self.save(address, data)
         if data.get('seen_inbound') == value:
             return True
         data['seen_inbound'] = value
@@ -174,6 +199,26 @@ class DeviceCache:
     def get_seen_inbound(self, address: str) -> Optional[bool]:
         """Return whether this device has ever been seen connecting inbound."""
         return self._read_raw(address).get('seen_inbound')
+
+    def get_seen_inbound_at(self, address: str) -> Optional[float]:
+        """Return the wall-clock epoch seconds this device was last recorded
+        paging us, or None if never stamped (a cache predating this field,
+        or seen_inbound itself has never been set)."""
+        return self._read_raw(address).get('seen_inbound_at')
+
+    def set_seen_inbound_at(self, address: str, at: float) -> bool:
+        """Overwrite just the stamp, without touching the seen_inbound flag.
+
+        Used only by _classic_is_passive's TTL check, for the two
+        corrections that check needs to persist: a missing stamp being
+        given grace (stamped now rather than treated as instant expiry),
+        and a stamp in the future (the device clock can jump) being
+        clamped down to now. Both apply only once seen_inbound is already
+        True, so the flag itself is never in question at either call site.
+        """
+        data = self._read_raw(address)
+        data['seen_inbound_at'] = at
+        return self.save(address, data)
 
     def clear(self, address: Optional[str] = None) -> int:
         """Clear cache for specific device or all devices.

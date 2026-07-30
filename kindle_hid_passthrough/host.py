@@ -106,6 +106,18 @@ class HIDHost(ClassicMixin, BLEMixin):
     # the harm here is deafness to inbound pages, and force-asserting page
     # scan cannot fix a stuck lock anyway.
     CLASSIC_PAGE_SCAN_DARK_CEILING = 30.0
+    # How long HIDReconnectInitiate=true plus an observed inbound page
+    # (device_cache seen_inbound/seen_inbound_at) remain trusted as proof a
+    # device dials itself, without a fresh inbound connection to reaffirm
+    # it. Nothing else ever clears seen_inbound -- STICKY_KEYS carries it
+    # across every descriptor recache forever -- so without this expiry a
+    # keyboard that firmware-updated, got re-paired to a different host, or
+    # was simply retired stays passive (never dialed) permanently. Escaping
+    # that today needs a live SDP query, which needs a connection, which
+    # needs the very page the device has stopped making; only `just
+    # clear-cache` gets out. 7 days is long enough that a keyboard idle for
+    # a normal stretch (desk drawer, travel) is not needlessly re-dialed.
+    CLASSIC_SEEN_INBOUND_TTL_SECONDS = 7 * 24 * 3600.0
     ACTIVE_CONNECT_TIMEOUT = 10
     CLASSIC_AUTH_RETRY_DELAY = 8.0
     CLASSIC_AUTH_RETRY_DELAY_WITH_PENDING_BLE = 20.0
@@ -1159,11 +1171,20 @@ class HIDHost(ClassicMixin, BLEMixin):
         (the last-connected device's name) and would leak one device's name
         onto another in the multi-device dial loop, silently making a real
         keyboard passive. The match is scoped to this address's identifiers.
+
+        The reconnect_initiate+seen_inbound pair is also gated by
+        `_classic_seen_inbound_fresh`: that evidence is proof of behaviour
+        observed once, not a permanent fact, and nothing else ever clears it
+        (see CLASSIC_SEEN_INBOUND_TTL_SECONDS for why that matters). Neither
+        `classic_passive_names` nor `is_phone` carries any such expiry --
+        a manual override and a device-class fact don't go stale the way
+        "have we seen it page us lately" can.
         """
         if (
             config.classic_trust_reconnect_initiate
             and self.device_cache.get_reconnect_initiate(address) is True
             and self.device_cache.get_seen_inbound(address) is True
+            and self._classic_seen_inbound_fresh(address)
         ):
             return True
         names = config.classic_passive_names
@@ -1183,6 +1204,48 @@ class HIDHost(ClassicMixin, BLEMixin):
             }:
                 return True
         return self.device_cache.get_is_phone(address) is True
+
+    def _classic_seen_inbound_fresh(self, address: str) -> bool:
+        """True if the seen_inbound evidence backing reconnect_initiate
+        trust is still within CLASSIC_SEEN_INBOUND_TTL_SECONDS.
+
+        Only ever consulted from inside the reconnect_initiate+seen_inbound
+        branch above, so it never touches either of those two flags itself
+        -- an expired stamp must not clear reconnect_initiate or
+        seen_inbound, only stop this one signal from voting passive. The
+        device may still be voted passive via classic_passive_names or
+        is_phone, both of which are untouched by this TTL entirely.
+
+        Missing stamp is GRACE, not expiry: an older cache (from before
+        this field existed) or a would-be regression that ever drops
+        seen_inbound_at while keeping seen_inbound (see STICKY_KEYS) must
+        not be punished with instant expiry -- that would read as "device
+        gone" the instant this feature shipped, for every device that had
+        already earned trust. Treat it the same permissive way
+        get_reconnect_initiate/get_seen_inbound already treat "never
+        recorded" elsewhere in this class, and stamp it now so the TTL has
+        a real starting point going forward.
+
+        A stamp in the future is clamped to now and the correction is
+        persisted immediately, not just used for this one comparison: the
+        Kindle's RTC is not guaranteed correct before NTP sync, and simply
+        comparing against the bogus value every time would grant this
+        device fresh evidence for as long as it takes real wall-clock time
+        to catch up to it -- for a large clock error, years -- which
+        defeats the TTL just as thoroughly as never expiring at all.
+        Persisting the clamp the first time it is noticed means the very
+        next read already sees a sane, in-the-past stamp and the TTL
+        starts counting down for real.
+        """
+        stamp = self.device_cache.get_seen_inbound_at(address)
+        now = time.time()
+        if stamp is None:
+            self.device_cache.set_seen_inbound_at(address, now)
+            return True
+        if stamp > now:
+            self.device_cache.set_seen_inbound_at(address, now)
+            stamp = now
+        return (now - stamp) < self.CLASSIC_SEEN_INBOUND_TTL_SECONDS
 
     def _classic_name_matches(self, address: str, names, extra_name: str = None) -> bool:
         configured_name = self._configured_name(address)

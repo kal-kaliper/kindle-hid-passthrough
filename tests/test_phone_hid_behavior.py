@@ -1819,6 +1819,81 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self.assertTrue(host.device_cache.get_reconnect_initiate(self.ADDR))
         self.assertTrue(host.device_cache.get_is_phone(self.ADDR))
 
+    def test_classic_is_passive_false_once_seen_inbound_stamp_exceeds_ttl(self):
+        # Item B (TTL): reconnect_initiate + seen_inbound never expire on
+        # their own -- STICKY_KEYS carries seen_inbound across every
+        # descriptor recache forever -- so without this TTL a keyboard that
+        # stops paging (firmware update, re-paired to another host) stays
+        # passive, and therefore never dialed, permanently. The only escape
+        # today would be `just clear-cache`.
+        host = self.make_host()
+        host.device_cache.save(self.ADDR, {
+            'reconnect_initiate': True,
+            'seen_inbound': True,
+            'seen_inbound_at':
+                time.time() - host.CLASSIC_SEEN_INBOUND_TTL_SECONDS - 1.0,
+        })
+
+        self.assertFalse(host._classic_is_passive(self.ADDR))
+
+    def test_expired_seen_inbound_does_not_clear_reconnect_initiate_or_seen_inbound(self):
+        # Expiry is a judgment about freshness, not a correction to the
+        # underlying facts: a single fresh inbound page must be able to
+        # restore trust immediately, which requires reconnect_initiate and
+        # seen_inbound to still read True underneath an expired stamp.
+        host = self.make_host()
+        stale = time.time() - host.CLASSIC_SEEN_INBOUND_TTL_SECONDS - 1.0
+        host.device_cache.save(self.ADDR, {
+            'reconnect_initiate': True,
+            'seen_inbound': True,
+            'seen_inbound_at': stale,
+        })
+
+        self.assertFalse(host._classic_is_passive(self.ADDR))
+        self.assertTrue(host.device_cache.get_reconnect_initiate(self.ADDR))
+        self.assertTrue(host.device_cache.get_seen_inbound(self.ADDR))
+
+    def test_missing_seen_inbound_stamp_is_grace_and_gets_stamped(self):
+        # No seen_inbound_at at all -- an older cache written before this
+        # field existed -- must not read as instant expiry: that would flip
+        # every already-trusted device back to "dial it" the moment this
+        # feature ships. It gets a grace pass now, and the grace pass IS
+        # stamped so the TTL has a real starting point going forward
+        # instead of granting grace forever on every check.
+        host = self.make_host()
+        host.device_cache.save(self.ADDR, {
+            'reconnect_initiate': True,
+            'seen_inbound': True,
+        })
+        self.assertIsNone(host.device_cache.get_seen_inbound_at(self.ADDR))
+
+        self.assertTrue(host._classic_is_passive(self.ADDR))
+
+        stamped = host.device_cache.get_seen_inbound_at(self.ADDR)
+        self.assertIsNotNone(stamped)
+        self.assertLess(abs(time.time() - stamped), 5.0)
+
+    def test_future_seen_inbound_stamp_is_clamped_and_persisted(self):
+        # The Kindle's RTC is not guaranteed correct before NTP sync.
+        # Without clamping AND persisting the correction, a bogus future
+        # stamp would grant this device fresh evidence for as long as it
+        # takes real wall-clock time to catch up to the bogus value --
+        # potentially years -- which defeats the TTL just as thoroughly as
+        # never expiring at all.
+        host = self.make_host()
+        far_future = time.time() + 1_000_000.0
+        host.device_cache.save(self.ADDR, {
+            'reconnect_initiate': True,
+            'seen_inbound': True,
+            'seen_inbound_at': far_future,
+        })
+
+        self.assertTrue(host._classic_is_passive(self.ADDR))
+
+        corrected = host.device_cache.get_seen_inbound_at(self.ADDR)
+        self.assertLess(corrected, far_future)
+        self.assertLess(abs(time.time() - corrected), 5.0)
+
     def test_parse_sdp_boolean_distinguishes_false_from_absent(self):
         # "did not tell us" and "told us no" drive opposite dial decisions and
         # must not collapse to the same value.
@@ -2264,6 +2339,8 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         host = self.make_host()
         host.device_cache.set_reconnect_initiate(self.ADDR, True)
         host.device_cache.set_seen_inbound(self.ADDR, True)
+        stamped_at = host.device_cache.get_seen_inbound_at(self.ADDR)
+        self.assertIsNotNone(stamped_at)
 
         host.device_cache.save(self.ADDR, {
             'report_map': 'aabb',
@@ -2271,7 +2348,44 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         })
 
         self.assertTrue(host.device_cache.get_seen_inbound(self.ADDR))
+        # Item B (hole 3): the STAMP itself, not just the boolean, must
+        # survive the recache. Checking _classic_is_passive() alone here
+        # would NOT catch seen_inbound_at being dropped: its own
+        # missing-stamp grace rule stamps a fresh "now" the instant it finds
+        # seen_inbound_at absent, so _classic_is_passive would stay True
+        # either way and this test would pass for the wrong reason (an
+        # incidental proxy) while the TTL had silently been reset by a
+        # descriptor recache instead of a real inbound page. Comparing the
+        # raw stamp before and after is the only check that actually
+        # distinguishes "preserved" from "silently re-granted".
+        self.assertEqual(
+            stamped_at, host.device_cache.get_seen_inbound_at(self.ADDR))
         self.assertTrue(host._classic_is_passive(self.ADDR))
+
+    def test_inbound_connection_always_refreshes_an_existing_seen_inbound_stamp(self):
+        # Item B (hole 2): set_seen_inbound must refresh seen_inbound_at on
+        # every inbound connection, not just the first. The old early
+        # return-when-unchanged behaviour meant a healthy keyboard that
+        # pages reliably was stamped once and never again, so it would
+        # still expire at the TTL even though it never stopped paging --
+        # a delayed regression of the passive feature.
+        host = self.make_host()
+        host.classic_devices = [
+            DeviceConfig(self.ADDR, Protocol.CLASSIC, "Real Keyboard")
+        ]
+        old_stamp = time.time() - 100000.0
+        host.device_cache.save(self.ADDR, {
+            'reconnect_initiate': True,
+            'seen_inbound': True,
+            'seen_inbound_at': old_stamp,
+        })
+
+        # A keyboard's CoD, matching the other connection_request test.
+        host._on_classic_connection_request(Address(self.ADDR), 0x000540, 1)
+
+        refreshed = host.device_cache.get_seen_inbound_at(self.ADDR)
+        self.assertGreater(refreshed, old_stamp)
+        self.assertLess(abs(time.time() - refreshed), 5.0)
 
     def test_classic_is_passive_ignores_stale_global_device_name(self):
         # Regression: _classic_is_passive must not consult the global
@@ -2330,6 +2444,84 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         called = asyncio.run(scenario())
 
         self.assertEqual([], called)
+
+    def test_keeper_starts_dialing_when_seen_inbound_evidence_expires_on_a_live_host(self):
+        # Item B (hole 1), the fatal one: the passive/active split is
+        # computed once, at _run_classic_handler start, and then frozen.
+        # When every configured device is passive at that moment (this
+        # scenario), _classic_active_connect_loop is never created at all --
+        # run() just waits indefinitely -- so the keeper's own tick is the
+        # ONLY code left that can ever notice a TTL expiry.
+        #
+        # A test that instead rebuilt the host (a fresh
+        # _run_classic_handler call with an already-expired stamp) would go
+        # green on both the real fix AND a revert of it: _classic_is_passive
+        # alone already reacts to an expired stamp, with no re-evaluation
+        # hook involved at all. That would not detect the hook being
+        # entirely absent, which is the actual field failure -- a host that
+        # has been running for a while, past the TTL, with no live session
+        # ever dropping to trigger a rebuild. So this test starts the device
+        # genuinely passive, lets _run_classic_handler run to completion
+        # (confirming no dial loop starts), and only THEN ages the stamp
+        # past the TTL on that SAME already-running host -- crossing the
+        # TTL boundary live, with the keeper task already in flight.
+        async def scenario():
+            host = self.make_host()
+            host.classic_devices = [
+                DeviceConfig(self.ADDR, Protocol.CLASSIC, "Real Keyboard")
+            ]
+            host.device = FakeClassicDevice()
+            host.CLASSIC_PAGE_SCAN_REASSERT_INTERVAL = 0.01
+            dialed = []
+
+            async def fake_active_loop(addresses):
+                dialed.append(list(addresses))
+
+            host._classic_active_connect_loop = fake_active_loop
+
+            # Fresh evidence: the device is genuinely passive right now.
+            host.device_cache.set_reconnect_initiate(self.ADDR, True)
+            host.device_cache.set_seen_inbound(self.ADDR, True)
+
+            await host._run_classic_handler()
+            self.assertEqual(
+                [], dialed,
+                "sanity check: must start out genuinely passive, with no "
+                "active-connect loop running at all"
+            )
+
+            keeper_task = next(
+                t for t in host._connection_tasks
+                if t.get_name() == "classic_page_scan_keeper"
+            )
+
+            # Age the SAME live host past the TTL by rewriting the cache
+            # file directly -- no new _run_classic_handler call, no new
+            # host: this is the live-host path, not a fresh-start one.
+            stale_at = (
+                time.time() - host.CLASSIC_SEEN_INBOUND_TTL_SECONDS - 1.0
+            )
+            host.device_cache.save(self.ADDR, {
+                'reconnect_initiate': True,
+                'seen_inbound': True,
+                'seen_inbound_at': stale_at,
+            })
+
+            for _ in range(100):
+                if dialed:
+                    break
+                await asyncio.sleep(0.02)
+
+            keeper_task.cancel()
+            try:
+                await keeper_task
+            except asyncio.CancelledError:
+                pass
+            return dialed
+
+        dialed = asyncio.run(scenario())
+
+        self.assertEqual([[self.ADDR]], dialed)
 
     @staticmethod
     def _cod(major, minor=0, service=0):
