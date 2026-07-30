@@ -4,9 +4,21 @@
 import json
 import logging
 import os
+import re
 from typing import Dict, Optional
 
+from config import normalize_addr
+
 logger = logging.getLogger(__name__)
+
+# Pre-normalization filenames came straight from the address, so they may carry a
+# transport suffix (AA_BB_CC_DD_EE_FF_P.json for "AA:BB:CC:DD:EE:FF/P") and may be
+# in either case, because the old key was built without uppercasing. Both forms
+# have to be recognized, not just the suffixed one. The extension stays literal
+# lowercase: the old code only ever wrote ".json", so a ".JSON" file is somebody
+# else's, not a legacy cache entry.
+_LEGACY_KEY_RE = re.compile(
+    r'^([0-9A-Fa-f]{2}(?:_[0-9A-Fa-f]{2}){5})(?:_[PRpr])?\.json$')
 
 
 class DeviceCache:
@@ -20,17 +32,76 @@ class DeviceCache:
         """
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
+        self._migrate_legacy_keys()
+
+    def _migrate_legacy_keys(self):
+        """Fold pre-normalization cache files into their canonical name.
+
+        Before the address was normalized, the transport suffix became part of
+        the filename, so one device could hold both <addr>.json and
+        <addr>_P.json. Without this, a suffixed file is simply orphaned: never
+        read again, and not removed by a per-device clear() either, because that
+        resolves to the canonical name.
+        """
+        try:
+            names = os.listdir(self.cache_dir)
+        except OSError:
+            return
+        for name in names:
+            match = _LEGACY_KEY_RE.match(name)
+            if not match:
+                continue
+            canonical_name = f"{match.group(1).upper()}.json"
+            if name == canonical_name:
+                continue          # already canonical, nothing to do
+            legacy = os.path.join(self.cache_dir, name)
+            canonical = os.path.join(self.cache_dir, canonical_name)
+            try:
+                if not os.path.exists(canonical):
+                    os.rename(legacy, canonical)
+                    logger.info(
+                        f"Migrated cache file {name} -> {canonical_name}")
+                elif os.path.samefile(legacy, canonical):
+                    # Case-insensitive filesystem: the two names are one file, so
+                    # there is nothing to migrate and nothing to delete. Without
+                    # this the mtime comparison below would compare the file with
+                    # itself and then remove it, destroying the entry.
+                    continue
+                elif os.path.getmtime(legacy) > os.path.getmtime(canonical):
+                    # Both forms exist as separate files. Keep whichever was
+                    # written last: it came from the most recent SDP query, so it
+                    # is the descriptor the device most recently advertised.
+                    os.replace(legacy, canonical)
+                    logger.info(
+                        f"Migrated newer cache file {name} over {canonical_name}")
+                else:
+                    os.remove(legacy)
+                    logger.info(f"Removed superseded cache file {name}")
+            except OSError as e:
+                logger.warning(f"Could not migrate cache file {name}: {e}")
 
     def _get_cache_path(self, address: str) -> str:
         """Get cache file path for device address
 
+        The address is normalized first, so the two forms of one address resolve
+        to a single file. `str(connection.peer_address)` carries a transport
+        suffix ("AA:BB:CC:DD:EE:FF/P"), and the Classic connection listener puts
+        that in current_device_address, so the connection path reads and writes
+        <addr>_P.json. The pairing flow and the startup descriptor check pass the
+        plain devices.conf address instead, so they use <addr>.json. Keying on the
+        raw string therefore gives one device two independent files: the copy
+        written at pairing is never read by the connection path, and removing the
+        device deletes only that copy, leaving the suffixed one to be served if
+        the device is paired again.
+
         Args:
-            address: Device address (e.g., "AA:BB:CC:DD:EE:FF")
+            address: Device address, with or without a transport suffix
+                (e.g. "AA:BB:CC:DD:EE:FF" or "AA:BB:CC:DD:EE:FF/P")
 
         Returns:
             Path to cache file
         """
-        safe_addr = address.replace(':', '_').replace('/', '_')
+        safe_addr = normalize_addr(address).replace(':', '_')
         return os.path.join(self.cache_dir, f"{safe_addr}.json")
 
     def load(self, address: str) -> Optional[Dict]:
