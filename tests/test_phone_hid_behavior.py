@@ -1832,6 +1832,69 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self.assertIsNone(host._parse_sdp_boolean(types.SimpleNamespace(value='yes')))
         self.assertIsNone(host._parse_sdp_boolean(types.SimpleNamespace(value=None)))
 
+    def _sdp_contract_host(self, search_result):
+        """A host whose SDP client returns `search_result` (or raises it)."""
+        import classic as classic_module
+
+        host = self.make_host()
+        host.current_device_address = self.ADDR
+        host.connection = FakeConnection(peer_address=self.ADDR)
+
+        class FakeSDPClient:
+            def __init__(self, connection):
+                pass
+
+            async def connect(self):
+                pass
+
+            async def disconnect(self):
+                pass
+
+            async def search_attributes(self, uuids, attribute_ids):
+                if isinstance(search_result, Exception):
+                    raise search_result
+                return search_result
+
+        self._old_sdp_client = classic_module.SDPClient
+        classic_module.SDPClient = FakeSDPClient
+        self.addCleanup(
+            setattr, classic_module, 'SDPClient', self._old_sdp_client)
+        return host
+
+    def test_query_sdp_returns_true_on_a_usable_descriptor(self):
+        # Pins the tri-state contract of _query_classic_sdp itself. Every other
+        # test in this area stubs the method, so without this its return values
+        # could be changed and the whole require_live_descriptor feature would
+        # degrade silently with the suite still green.
+        descriptor = types.SimpleNamespace(
+            id=0x0206,
+            value=[[types.SimpleNamespace(value=0x22), b"\x05\x01\x09\x06"]],
+        )
+        host = self._sdp_contract_host([[descriptor]])
+
+        self.assertIs(True, asyncio.run(host._query_classic_sdp(self.ADDR)))
+        self.assertEqual(b"\x05\x01\x09\x06", host.report_map)
+
+    def test_query_sdp_returns_false_only_when_there_are_no_records(self):
+        # False is what callers treat as proof the keyboard is gone.
+        host = self._sdp_contract_host([])
+
+        self.assertIs(False, asyncio.run(host._query_classic_sdp(self.ADDR)))
+
+    def test_query_sdp_returns_none_when_records_yield_no_descriptor(self):
+        # Regression: a malformed 0x0206 is swallowed by the parser, and bumble
+        # returns [] when the outer element is not a SEQUENCE. Reporting either
+        # as False would convict a device that does have a HID record.
+        unusable = types.SimpleNamespace(id=0x0206, value="not-a-sequence")
+        host = self._sdp_contract_host([[unusable]])
+
+        self.assertIsNone(asyncio.run(host._query_classic_sdp(self.ADDR)))
+
+    def test_query_sdp_returns_none_when_the_query_raises(self):
+        host = self._sdp_contract_host(RuntimeError("sdp connect refused"))
+
+        self.assertIsNone(asyncio.run(host._query_classic_sdp(self.ADDR)))
+
     def _live_descriptor_host(self, sdp_result, cached=False, is_phone=False):
         """A host poised at _handle_classic_connection with SDP stubbed."""
         host = self.make_host()

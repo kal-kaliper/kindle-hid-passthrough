@@ -659,17 +659,20 @@ class ClassicMixin:
             # descriptor, on a link with no HID channels.
             live = await self._query_classic_sdp()
             if not live:
+                # May be None if the link died during the SDP await: the
+                # disconnection handler clears it, and every cache accessor
+                # goes through normalize_addr, which raises on None.
                 address = self.current_device_address
                 if live is False:
                     # The device told us it has no HID service. That is proof,
                     # not a hiccup, and a cached descriptor contradicts it.
                     refusal = "device answered SDP with no HID record"
-                elif self.device_cache.get_is_phone(address) is True:
+                elif address and self.device_cache.get_is_phone(address) is True:
                     # A phone's HID record exists only while its app is
                     # registered, so an unreachable SDP server on a phone is
                     # far more likely to mean "app closed" than "bad moment".
                     refusal = "SDP unreachable on a phone (its app registers the HID record)"
-                elif self._load_cached_descriptor():
+                elif address and self._load_cached_descriptor():
                     # Only here is falling back defensible: a non-phone whose
                     # SDP query failed to complete. Dropping instead would
                     # flap a physical keyboard on a transient timeout.
@@ -941,6 +944,20 @@ class ClassicMixin:
                 })
                 log.success(f"[Classic] Cached descriptor ({len(self.report_map)} bytes)")
                 return True
+
+            # False is reserved for "the device answered and has no HID service
+            # at all", because callers treat it as proof the keyboard is gone
+            # and drop the link on it. Records that came back but yielded no
+            # descriptor are NOT that: _parse_hid_descriptor_list swallows
+            # malformed input, and bumble returns [] when the outer element is
+            # not a SEQUENCE. Both would otherwise convict a device that does
+            # have a HID record of not having one.
+            if result:
+                log.warning(
+                    "[Classic] SDP returned records but no usable HID "
+                    "descriptor; treating as an incomplete query"
+                )
+                return None
             return False
         except Exception as e:
             log.warning(f"[Classic] SDP query failed: {e!r}")
