@@ -194,6 +194,7 @@ def install_bumble_stubs():
 install_bumble_stubs()
 
 from bumble.hci import Address  # noqa: E402
+from classic import FALLBACK_HID_DESCRIPTOR  # noqa: E402
 from config import Protocol, config  # noqa: E402
 from controller import DaemonController  # noqa: E402
 from daemon import HIDDaemon  # noqa: E402
@@ -1978,6 +1979,202 @@ class PhoneHidBehaviorTests(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertFalse(host.connection.is_disconnected)
+
+    def _pairing_flow_host(self, sdp_search_result, cached=False, is_phone=False):
+        """A host driven through the REAL _pair_classic and
+        _continue_classic_after_pairing, with only the SDP transport, the
+        BumbleHIDHost channel setup, and UHID creation faked. Proves the
+        pairing gate against what _pair_classic actually found, not a
+        tri-state value the test injected directly -- a fake device fed
+        this same `sdp_search_result` is the only source of truth."""
+        import classic as classic_module
+
+        addr = self.ADDR
+        host = self.make_host()
+        # Real make_host() keystore is the bumble-stub JsonKeyStore, which
+        # has no get() -- irrelevant to the descriptor gate under test, and
+        # _pair_classic's own try/except would otherwise turn that
+        # AttributeError into a spurious pairing failure.
+        host.keystore = None
+        if is_phone:
+            host.device_cache.set_class(addr, True)
+        if cached:
+            host.device_cache.save(addr, {
+                'report_map': '0501', 'device_name': 'Cached Keyboard',
+            })
+
+        connection = FakeConnection(peer_address=addr)
+        # Skips _pair_classic's encrypt() branch entirely; that branch is
+        # unrelated to the descriptor gate this test drives.
+        connection.is_encrypted = True
+
+        async def authenticate():
+            return None
+        connection.authenticate = authenticate
+
+        class FakeHostEvents:
+            def on(self, event, callback):
+                if event == 'link_key':
+                    # Real hardware fires this during authenticate(); this
+                    # fake never will. Firing it synchronously here avoids
+                    # burning the real 5s of
+                    # wait_for(link_key_received.wait(), 5.0) in the test.
+                    callback(addr, object(), 0)
+
+            def remove_listener(self, event, callback):
+                pass
+
+        class FakeDevice:
+            def __init__(self):
+                self.host = FakeHostEvents()
+
+            async def connect(self, target_address, transport=None, timeout=None):
+                return connection
+
+        host.device = FakeDevice()
+
+        class FakeSDPClient:
+            def __init__(self, _connection):
+                pass
+
+            async def connect(self):
+                pass
+
+            async def disconnect(self):
+                pass
+
+            async def search_attributes(self, uuids, attribute_ids):
+                return sdp_search_result
+
+        old_sdp_client = classic_module.SDPClient
+        classic_module.SDPClient = FakeSDPClient
+        self.addCleanup(setattr, classic_module, 'SDPClient', old_sdp_client)
+
+        class FakeClassicHidHost:
+            EVENT_INTERRUPT_DATA = "interrupt"
+            EVENT_VIRTUAL_CABLE_UNPLUG = "unplug"
+
+            def __init__(self, device):
+                self.l2cap_intr_channel = object()
+                self.l2cap_ctrl_channel = object()
+
+            def on(self, event, callback):
+                pass
+
+            def on_device_connection(self, connection):
+                pass
+
+            async def connect_control_channel(self):
+                pass
+
+            async def connect_interrupt_channel(self):
+                pass
+
+            def set_protocol(self, mode):
+                pass
+
+        old_hid_host = classic_module.BumbleHIDHost
+        classic_module.BumbleHIDHost = FakeClassicHidHost
+        self.addCleanup(setattr, classic_module, 'BumbleHIDHost', old_hid_host)
+
+        created = []
+        host._create_uhid_device = lambda: created.append(True)
+        host._created_uhid_calls = created
+
+        return host
+
+    def test_pairing_reuses_pair_classics_live_descriptor_without_requerying(self):
+        # Item C: _continue_classic_after_pairing used to call
+        # _finalize_classic_hid() directly, so classic_require_live_descriptor
+        # never applied on the pairing path. This drives the REAL
+        # _pair_classic (which already queries SDP live) followed by the
+        # REAL _continue_classic_after_pairing, and proves the gate reuses
+        # that result -- SDP is asked exactly once across both calls, not
+        # re-queried by the gate.
+        #
+        # is_phone=True is load-bearing, not decoration: _query_classic_sdp
+        # writes any descriptor it finds straight into the cache as a side
+        # effect, so a non-phone host would pass this test even if the gate
+        # merely fell through to its "SDP incomplete, but cached" branch --
+        # incidentally right for the wrong reason. On a phone that branch is
+        # refused outright regardless of cache, so only a gate that actually
+        # consumed _pair_classic's True result (not a forgotten/None one)
+        # can let this succeed.
+        descriptor = types.SimpleNamespace(
+            id=0x0206,
+            value=[[types.SimpleNamespace(value=0x22), b"\x05\x01\x09\x06"]],
+        )
+        host = self._pairing_flow_host(
+            sdp_search_result=[[descriptor]], is_phone=True)
+
+        import classic as classic_module
+        unbound_query = classic_module.ClassicMixin._query_classic_sdp
+        call_count = {"n": 0}
+
+        async def counting_query(self, address=None):
+            call_count["n"] += 1
+            return await unbound_query(self, address)
+        host._query_classic_sdp = types.MethodType(counting_query, host)
+
+        self.assertTrue(asyncio.run(host._pair_classic(self.ADDR)))
+        asyncio.run(host._continue_classic_after_pairing())
+
+        self.assertEqual(1, call_count["n"])
+        self.assertEqual(b"\x05\x01\x09\x06", host.report_map)
+        self.assertEqual([True], host._created_uhid_calls)
+        self.assertFalse(host.connection.is_disconnected)
+
+    def test_pairing_refused_when_device_confirms_no_hid_service(self):
+        # False from _query_classic_sdp is proof the device has no HID
+        # service, not a hiccup -- the exact case the defect let slip
+        # through: FALLBACK_HID_DESCRIPTOR must not paper over that proof
+        # on the pairing path either.
+        host = self._pairing_flow_host(sdp_search_result=[])
+
+        self.assertTrue(asyncio.run(host._pair_classic(self.ADDR)))
+        asyncio.run(host._continue_classic_after_pairing())
+
+        self.assertTrue(host.connection.is_disconnected)
+        self.assertEqual([], host._created_uhid_calls)
+        self.assertIsNone(host.report_map)
+        # The literal regression: _finalize_classic_hid (and the fallback
+        # descriptor it installs) must never run on a refused pairing link.
+        self.assertNotEqual(FALLBACK_HID_DESCRIPTOR, host.report_map)
+
+    def test_pairing_refused_when_sdp_incomplete_and_nothing_cached(self):
+        # None (query did not complete) plus no cache plus not a phone:
+        # no descriptor exists anywhere, so the gate must refuse and
+        # _finalize_classic_hid (and its fallback descriptor) must never
+        # be reached.
+        unusable = types.SimpleNamespace(id=0x0206, value="not-a-sequence")
+        host = self._pairing_flow_host(
+            sdp_search_result=[[unusable]], cached=False, is_phone=False)
+
+        self.assertTrue(asyncio.run(host._pair_classic(self.ADDR)))
+        asyncio.run(host._continue_classic_after_pairing())
+
+        self.assertTrue(host.connection.is_disconnected)
+        self.assertEqual([], host._created_uhid_calls)
+        self.assertIsNone(host.report_map)
+        self.assertNotEqual(FALLBACK_HID_DESCRIPTOR, host.report_map)
+
+    def test_pairing_falls_back_to_cache_when_sdp_incomplete_on_a_keyboard(self):
+        # The one defensible fallback, reachable from pairing too: a
+        # non-phone whose SDP query did not complete, but a real descriptor
+        # is cached from a previous session.
+        unusable = types.SimpleNamespace(id=0x0206, value="not-a-sequence")
+        host = self._pairing_flow_host(
+            sdp_search_result=[[unusable]], cached=True, is_phone=False)
+
+        self.assertTrue(asyncio.run(host._pair_classic(self.ADDR)))
+        self.assertIsNone(host.report_map)
+
+        asyncio.run(host._continue_classic_after_pairing())
+
+        self.assertFalse(host.connection.is_disconnected)
+        self.assertEqual([True], host._created_uhid_calls)
+        self.assertEqual(b"\x05\x01", host.report_map)
+        self.assertNotEqual(FALLBACK_HID_DESCRIPTOR, host.report_map)
 
     def test_restore_does_not_rebuild_handler_when_all_devices_passive(self):
         # Regression, and the one that would have bricked a real device.

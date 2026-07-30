@@ -688,6 +688,50 @@ class ClassicMixin:
             log.warning("[Classic] Using fallback descriptor")
         self._create_uhid_device()
 
+    def _classic_descriptor_gate_refusal(self, live, address):
+        """Decide whether classic_require_live_descriptor refuses this link,
+        given a COMPLETED tri-state SDP result, and why.
+
+        `live` is `_query_classic_sdp`'s tri-state return: True = a live HID
+        record (self.report_map is already set), False = the device
+        answered SDP and offered no HID service, None = the query did not
+        complete at all. Collapsing these to falsy is what made
+        classic_require_live_descriptor a misnomer before this method
+        existed — it fell back to the cache in every case, so a phone whose
+        keyboard app had exited still got a UHID node built from a stale
+        descriptor, on a link with no HID channels.
+
+        Returns None if the connection may proceed, or a string reason if
+        it must be refused. Shared by the run-mode gate
+        (_handle_classic_connection, which queries SDP itself) and the
+        pairing gate (_continue_classic_after_pairing, which instead
+        consumes _pair_classic's already-completed query) so the two entry
+        points that must enforce classic_require_live_descriptor cannot
+        drift into different decisions — a second, duplicated copy of this
+        exact logic is what let pairing bypass the gate in the first place.
+        """
+        if live:
+            return None
+        if live is False:
+            # The device told us it has no HID service. That is proof, not
+            # a hiccup, and a cached descriptor contradicts it.
+            return "device answered SDP with no HID record"
+        if address and self.device_cache.get_is_phone(address) is True:
+            # A phone's HID record exists only while its app is registered,
+            # so an unreachable SDP server on a phone is far more likely to
+            # mean "app closed" than "bad moment".
+            return "SDP unreachable on a phone (its app registers the HID record)"
+        if address and self._load_cached_descriptor():
+            # Only here is falling back defensible: a non-phone whose SDP
+            # query failed to complete. Dropping instead would flap a
+            # physical keyboard on a transient timeout.
+            log.warning(
+                "[Classic] SDP query did not complete; using the cached "
+                "descriptor for this non-phone device"
+            )
+            return None
+        return "SDP query did not complete and no descriptor is cached"
+
     async def _handle_classic_connection(self, create_uhid=True):
         """Prepare Classic HID metadata and optionally create UHID."""
         if not self.hid_host.l2cap_intr_channel:
@@ -695,49 +739,21 @@ class ClassicMixin:
 
         if config.classic_require_live_descriptor:
             self.report_map = None
-            # `_query_classic_sdp` is tri-state and the distinction carries the
-            # decision: True = a live HID record, False = the device answered
-            # SDP and offered no HID service, None = we could not ask at all.
-            # Collapsing these to falsy is what made this flag a misnomer — it
-            # fell back to the cache in every case, so a phone whose keyboard
-            # app had exited still got a UHID node built from a stale
-            # descriptor, on a link with no HID channels.
             live = await self._query_classic_sdp()
-            if not live:
-                # May be None if the link died during the SDP await: the
-                # disconnection handler clears it, and every cache accessor
-                # goes through normalize_addr, which raises on None.
-                address = self.current_device_address
-                if live is False:
-                    # The device told us it has no HID service. That is proof,
-                    # not a hiccup, and a cached descriptor contradicts it.
-                    refusal = "device answered SDP with no HID record"
-                elif address and self.device_cache.get_is_phone(address) is True:
-                    # A phone's HID record exists only while its app is
-                    # registered, so an unreachable SDP server on a phone is
-                    # far more likely to mean "app closed" than "bad moment".
-                    refusal = "SDP unreachable on a phone (its app registers the HID record)"
-                elif address and self._load_cached_descriptor():
-                    # Only here is falling back defensible: a non-phone whose
-                    # SDP query failed to complete. Dropping instead would
-                    # flap a physical keyboard on a transient timeout.
-                    refusal = None
-                    log.warning(
-                        "[Classic] SDP query did not complete; using the cached "
-                        "descriptor for this non-phone device"
-                    )
-                else:
-                    refusal = "SDP query did not complete and no descriptor is cached"
-
-                if refusal is not None:
-                    log.warning(
-                        f"[Classic] No live HID descriptor ({refusal}); dropping link"
-                    )
-                    try:
-                        await self.connection.disconnect()
-                    except Exception:
-                        pass
-                    return False
+            # current_device_address, not a value captured before the
+            # await: the link may have died during the SDP await, and the
+            # disconnection handler clears it there.
+            refusal = self._classic_descriptor_gate_refusal(
+                live, self.current_device_address)
+            if refusal is not None:
+                log.warning(
+                    f"[Classic] No live HID descriptor ({refusal}); dropping link"
+                )
+                try:
+                    await self.connection.disconnect()
+                except Exception:
+                    pass
+                return False
         elif not self._load_cached_descriptor():
             await self._query_classic_sdp()
 
@@ -882,13 +898,16 @@ class ClassicMixin:
                 except Exception as e:
                     log.warning(f"[Classic] Encryption: {e!r}")
 
-            await self._query_classic_sdp(address)
+            # Captured (not discarded) so _continue_classic_after_pairing's
+            # descriptor gate can judge this link on what this query
+            # actually found, instead of re-querying SDP a third time on a
+            # link that has been up for mere seconds. Whether a missing
+            # descriptor here ends up refused or papered over with the
+            # fallback is that gate's decision, not this method's.
+            self._classic_pairing_sdp_live = await self._query_classic_sdp(address)
 
             if not self.report_map:
-                log.warning(
-                    "[Classic] No HID descriptor in SDP; "
-                    "using fallback keyboard descriptor"
-                )
+                log.warning("[Classic] No HID descriptor in SDP")
 
             if self.keystore:
                 keys = await self.keystore.get(address)
@@ -1036,4 +1055,26 @@ class ClassicMixin:
             return
 
         self._classic_set_report_protocol()
+
+        if config.classic_require_live_descriptor:
+            # _pair_classic (above, ~line 885) already ran this same query
+            # live, seconds ago, on this same link, and left its tri-state
+            # result in self._classic_pairing_sdp_live. Calling
+            # _handle_classic_connection here -- the obvious-looking fix --
+            # would set report_map = None and query SDP again, discarding
+            # that result and betting the pairing outcome on a third SDP
+            # round-trip on a first-contact link, for no benefit: nothing
+            # has changed since _pair_classic asked. Reuse it instead.
+            refusal = self._classic_descriptor_gate_refusal(
+                self._classic_pairing_sdp_live, self.current_device_address)
+            if refusal is not None:
+                log.warning(
+                    f"[Classic] No live HID descriptor ({refusal}); dropping link"
+                )
+                try:
+                    await self.connection.disconnect()
+                except Exception:
+                    pass
+                return
+
         self._finalize_classic_hid()

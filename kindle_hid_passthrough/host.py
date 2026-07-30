@@ -190,6 +190,13 @@ class HIDHost(ClassicMixin, BLEMixin):
         self._classic_channel_origin = None
         self._classic_set_protocol_ok = None
         self._classic_set_protocol_error = None
+        # Tri-state result (True/False/None, see _query_classic_sdp) of the
+        # live SDP query _pair_classic runs during pairing. Consumed by
+        # _continue_classic_after_pairing's descriptor gate so pairing
+        # enforces classic_require_live_descriptor against what that query
+        # actually found instead of asking SDP again on a link that has
+        # been up for mere seconds.
+        self._classic_pairing_sdp_live = None
         self.last_pair_error = None
         self._radio_lock = None
         self._connection_wait_started_at = None
