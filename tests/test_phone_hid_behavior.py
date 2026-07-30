@@ -2628,6 +2628,43 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self.assertEqual("connection", result)
         self.assertEqual(2, len(windows))
 
+    def test_ble_initiate_cancel_returns_as_soon_as_the_controller_answers(self):
+        # The connection/failure listeners are the ONLY things that can resolve
+        # `pending`. Unhooking them before the post-cancel wait made that wait
+        # always burn its full 1.0s timeout instead of returning when the real
+        # failure event landed -- about a second of extra page-scan darkness on
+        # every cancelled initiate, which is the common "no device found" case
+        # and half again the entire page_scan_max_dark budget.
+        class AnsweringDevice(FakeBleDevice):
+            async def send_command(self, command, check_result=False):
+                name = type(command).__name__
+                self.commands.append(name)
+                if name == "HCI_LE_Create_Connection_Cancel_Command":
+                    # A real exception instance, unlike the shared fake's
+                    # SimpleNamespace: that one makes set_exception raise
+                    # TypeError inside send_command, so the wait is skipped for
+                    # the wrong reason and the timing proves nothing.
+                    error = RuntimeError("connection failed")
+                    error.transport = 2  # BT_LE_TRANSPORT in the bumble stub
+                    for cb in list(self.listeners.get("connection_failure", [])):
+                        cb(error)
+
+        async def scenario():
+            host = self.make_host()
+            host.device = AnsweringDevice()
+            host._radio_lock = asyncio.Lock()
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            await host._ble_initiate(0.05)
+            return loop.time() - started
+
+        elapsed = asyncio.run(scenario())
+
+        self.assertLess(
+            elapsed, 0.5,
+            f"post-cancel wait burned its full timeout ({elapsed:.2f}s); the "
+            "failure listener must stay hooked until after the wait")
+
     def test_ble_initiate_clamps_window_when_it_blanks_page_scan(self):
         # The real dark bound. _ble_sliced decides whether to slice before
         # taking the radio lock, and Classic can drop while we wait on it, so
@@ -2663,17 +2700,12 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         writes, elapsed = asyncio.run(scenario())
 
         self.assertEqual([False, True], writes)
-        # The clamp still bounds the *window*; it no longer bounds total
-        # elapsed to under a second. A1's cancellation fix (ble.py) removes
-        # the connection/failure listeners before the create-connection
-        # cancel is sent -- unconditionally, so a cancel landing on that send
-        # can never skip `le_connecting = False` -- which means `pending` can
-        # never resolve again for this call, and the follow-up
-        # `wait_for(shield(pending), timeout=1.0)` always burns its full 1.0s
-        # instead of returning early once bumble's real connection-failure
-        # event lands. That is a real ~1s of *additional* page-scan darkness
-        # on every cancelled initiate now, not a test artifact.
-        self.assertLess(elapsed, 1.2, f"stayed dark {elapsed:.2f}s")
+        # Back under a second: only `le_connecting = False` has to precede the
+        # cancel awaits. The listeners are unhooked in a nested finally after
+        # the wait, so they are still no less protected against cancellation
+        # while remaining able to resolve `pending` early. See
+        # test_ble_initiate_cancel_returns_as_soon_as_the_controller_answers.
+        self.assertLess(elapsed, 1.0, f"stayed dark {elapsed:.2f}s")
 
     def test_ble_initiate_does_not_clamp_when_page_scan_is_already_down(self):
         # Complement of the clamp test. If page scan is already down, blanking

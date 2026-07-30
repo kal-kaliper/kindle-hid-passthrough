@@ -509,16 +509,31 @@ class BLEMixin:
                 # on le_connecting forever (classic.py), a second permanent
                 # degradation traded for the first.
                 self.device.le_connecting = False
-                self.device.remove_listener(Device.EVENT_CONNECTION, on_connection)
-                self.device.remove_listener(Device.EVENT_CONNECTION_FAILURE, on_failure)
                 try:
-                    if initiated and not pending.done():
-                        try:
-                            await self.device.send_command(
-                                HCI_LE_Create_Connection_Cancel_Command())
-                            await asyncio.wait_for(asyncio.shield(pending), timeout=1.0)
-                        except Exception:
-                            pass
+                    try:
+                        if initiated and not pending.done():
+                            try:
+                                await self.device.send_command(
+                                    HCI_LE_Create_Connection_Cancel_Command())
+                                await asyncio.wait_for(
+                                    asyncio.shield(pending), timeout=1.0)
+                            except Exception:
+                                pass
+                    finally:
+                        # Removed AFTER the wait, not before it. These are the
+                        # only things that can resolve `pending`, so unhooking
+                        # them first made the wait above always burn its full
+                        # timeout instead of returning as soon as the real
+                        # connection-failure event landed -- roughly a second of
+                        # extra page-scan darkness on every cancelled initiate,
+                        # which is the common "no device found" case and half
+                        # again the whole page_scan_max_dark budget. Sync
+                        # statements in a finally still run during cancellation,
+                        # so they are no less protected here.
+                        self.device.remove_listener(
+                            Device.EVENT_CONNECTION, on_connection)
+                        self.device.remove_listener(
+                            Device.EVENT_CONNECTION_FAILURE, on_failure)
                 finally:
                     # Own nested finally: a cancel arriving in the cancel-command
                     # await above must not skip this restore either, or Classic
