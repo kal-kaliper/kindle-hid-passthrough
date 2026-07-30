@@ -1455,6 +1455,71 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self.assertIn(Protocol.BLE, host.sessions)
         self.assertFalse(ble.uhid_device.destroyed)
 
+    def test_setup_failure_before_any_session_does_not_request_host_teardown(self):
+        # A link that dies during setup records no session. Asking for a host
+        # rebuild there is wrong, and specifically dangerous: the global event is
+        # latched and never cleared, so run() would tear down the NEXT successful
+        # session the instant it resolved _connection_future. Observed on a PW5 as
+        # a session torn down 90ms after "Session ready".
+        host = self.make_host()
+        self.assertNotIn(Protocol.CLASSIC, host.sessions)
+
+        host._on_protocol_disconnection(Protocol.CLASSIC, self.ADDR, 0x16)
+
+        self.assertTrue(
+            host._protocol_disconnection_events[Protocol.CLASSIC].is_set(),
+            "the per-protocol event should still fire so the handler loop retries")
+        self.assertFalse(
+            host._disconnection_event.is_set(),
+            "a pre-session failure must not latch a host-teardown request")
+
+    def test_session_after_a_setup_failure_is_not_torn_down(self):
+        # End-to-end shape of the PW5 failure: attempt 1 dies during setup,
+        # attempt 2 succeeds. The successful session must survive.
+        host = self.make_host()
+        host._on_protocol_disconnection(Protocol.CLASSIC, self.ADDR, 0x16)
+
+        host.current_device_address = self.ADDR
+        host.connection = FakeConnection(peer_address=self.ADDR)
+        host.uhid_device = FakeUhidDevice()
+        host.connected_protocol = Protocol.CLASSIC
+        host._record_current_session(Protocol.CLASSIC)
+
+        self.assertIn(Protocol.CLASSIC, host.sessions)
+        self.assertFalse(
+            host._disconnection_event.is_set(),
+            "run() would return immediately and tear the new session down")
+
+    def test_pairing_mode_setup_failure_still_requests_teardown(self):
+        # continue_after_pairing() records no session and its only disconnect exit
+        # is the same branch, while pair_device() populates the device lists. A
+        # keep-alive gated on configured devices alone would swallow the set() that
+        # pairing mode is waiting on and hang the daemon forever. Pairing mode is
+        # distinguished by _protocol_disconnection_events being empty: only run()
+        # populates it.
+        host = self.make_host()
+        host._protocol_disconnection_events = {}      # pairing mode
+        host._disconnection_event = asyncio.Event()
+        host.classic_devices = [
+            DeviceConfig(self.ADDR, Protocol.CLASSIC, "Pairing target")
+        ]
+
+        host._on_protocol_disconnection(Protocol.CLASSIC, self.ADDR, 0x16)
+
+        self.assertTrue(
+            host._disconnection_event.is_set(),
+            "pairing mode would wait forever without this")
+
+    def test_teardown_still_requested_when_protocol_has_no_configured_devices(self):
+        # The branch must keep working when the device really is gone, e.g. after
+        # a virtual-cable unplug removed it from devices.conf.
+        host = self.make_host()
+        host.classic_devices = []
+
+        host._on_protocol_disconnection(Protocol.CLASSIC, self.ADDR, 0x16)
+
+        self.assertTrue(host._disconnection_event.is_set())
+
     def test_idle_classic_drop_restores_when_ble_configured_but_not_live(self):
         host = self.make_host()
         host.ble_devices = [

@@ -402,7 +402,23 @@ class HIDHost(ClassicMixin, BLEMixin):
             # and caused the daemon to issue a fresh HCI Reset every minute.
             await self._connection_future
             log.success("\nReceiving HID reports. Press Ctrl+C to exit.")
-            await self._disconnection_event.wait()
+            # Re-derive on wake rather than trusting the flag. The event is a
+            # latch that nothing clears, so a teardown requested while no session
+            # existed would otherwise fire the moment one appears. Any legitimate
+            # setter only runs when no session is live, so a live session here
+            # means the request is stale: drop it and keep waiting. This makes a
+            # future mis-set harmless instead of fatal.
+            while True:
+                await self._disconnection_event.wait()
+                if not any(
+                    self._is_session_alive(s) for s in self.sessions.values()
+                ):
+                    break
+                log.info(
+                    "Host teardown requested while a session is live; "
+                    "treating it as stale"
+                )
+                self._disconnection_event.clear()
         finally:
             for task in tasks:
                 if not task.done():
@@ -611,7 +627,31 @@ class HIDHost(ClassicMixin, BLEMixin):
                     log.info(f"[{proto}] Restarting host to restore configured device")
                     self._disconnection_event.set()
             elif not live_sessions:
-                self._disconnection_event.set()
+                # No session was ever recorded, so this is a link that failed
+                # during setup rather than a session that ended. Asking for a
+                # host rebuild here is wrong while the protocol still has
+                # configured devices: the event is latched and never cleared, so
+                # a failed attempt would tear down the NEXT successful session
+                # the moment it resolves _connection_future, 90ms after it came
+                # up. Stay alive and let the device try again, as the parked-link
+                # branch above already does.
+                # Gated on _protocol_disconnection_events, not just on configured
+                # devices: that dict is populated only by run(), so it is the
+                # signal for "daemon mode". continue_after_pairing() also ends up
+                # here with no session, and pair_device() populates the device
+                # lists, so gating on those alone would swallow the set() that
+                # pairing mode waits on and hang it forever.
+                if (
+                    protocol in self._protocol_disconnection_events
+                    and self._has_configured_devices(protocol)
+                ):
+                    log.info(
+                        f"[{proto}] Link dropped before a session was recorded; "
+                        "keeping host alive"
+                    )
+                else:
+                    log.info(f"[{proto}] Link dropped; requesting host teardown")
+                    self._disconnection_event.set()
         if protocol == self.connected_protocol and protocol not in self.sessions:
             self.connection = None
             self.peer = None
