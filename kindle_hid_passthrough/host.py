@@ -213,6 +213,11 @@ class HIDHost(ClassicMixin, BLEMixin):
             "protocol": session.protocol.value,
             "name": session.device_name,
         }
+        # controller.STATUS_CONNECTION_KEYS has always whitelisted hid_ready, but
+        # this method never emitted it, so API consumers saw the key promised and
+        # never delivered. It is per-session here: a session has HID if it owns a
+        # UHID device.
+        state["hid_ready"] = session.uhid_device is not None
         if session.uhid_device:
             state["uhid_name"] = session.uhid_device.name
             if session.uhid_device.input_paths:

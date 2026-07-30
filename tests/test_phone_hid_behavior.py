@@ -880,6 +880,32 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         cache = host.device_cache.load(self.ADDR)
         self.assertEqual("0501", cache["report_map"])
 
+    def test_status_payload_delivers_the_keys_the_whitelist_promises(self):
+        # controller.STATUS_CONNECTION_KEYS is the contract the HTTP /status
+        # endpoint publishes. Two halves of it were broken in opposite directions:
+        # hid_ready was whitelisted but never emitted, and is_phone was emitted but
+        # stripped, which is why the KOReader plugin's is_phone gate silently
+        # treated every Classic device as a phone.
+        from controller import STATUS_CONNECTION_KEYS
+        host = self.make_host()
+        session = self.make_session(Protocol.CLASSIC)
+        session.is_phone = True
+        state = host._session_state(session)
+
+        self.assertIn("hid_ready", state, "whitelisted but never emitted")
+        self.assertTrue(state["hid_ready"], "session owns a UHID device")
+        self.assertIn("is_phone", STATUS_CONNECTION_KEYS, "emitted but stripped")
+
+        survives = {k: v for k, v in state.items() if k in STATUS_CONNECTION_KEYS}
+        self.assertTrue(survives.get("is_phone"))
+        self.assertTrue(survives.get("hid_ready"))
+
+    def test_hid_ready_is_false_for_a_session_without_uhid(self):
+        host = self.make_host()
+        session = self.make_session(Protocol.CLASSIC)
+        session.uhid_device = None
+        self.assertFalse(host._session_state(session)["hid_ready"])
+
     def test_status_exposes_is_phone_only_when_known(self):
         host = self.make_host()
         session = self.make_session(Protocol.CLASSIC)

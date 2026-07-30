@@ -25,6 +25,7 @@ STATUS_CONNECTION_KEYS = (
     "protocol",
     "name",
     "hid_ready",
+    "is_phone",
     "uhid_name",
     "input_paths",
     "descriptor_size",
