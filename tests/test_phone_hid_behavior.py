@@ -2347,6 +2347,33 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self.assertEqual("connection", result)
         self.assertEqual(2, len(windows))
 
+    def test_ble_sliced_yields_immediately_when_classic_setup_starts(self):
+        # Regression: _ble_initiate returns instantly while Classic is setting
+        # up, so a naive slicing loop would re-enter it once per slice and burn
+        # the whole window rather than yielding once as it did before slicing.
+        config.classic_page_scan_max_dark = 0.02
+
+        async def scenario():
+            host = self.make_host()
+            calls = []
+
+            async def run(window):
+                calls.append(window)
+                # Classic setup begins during the first slice.
+                host.connected_protocol = Protocol.CLASSIC
+                host.connection = FakeConnection()
+                await asyncio.sleep(window)
+                return None
+
+            result = await host._ble_sliced(1.0, run)
+            return host, calls, result
+
+        host, calls, result = asyncio.run(scenario())
+
+        self.assertIsNone(result)
+        self.assertTrue(host._ble_has_classic_setup_activity())
+        self.assertEqual(1, len(calls))
+
     def test_ble_sliced_does_not_slice_when_page_scan_stays_up(self):
         # Nothing is being blanked, so one long window is strictly better for
         # BLE. The yield-to-classic cap must still apply to that window.

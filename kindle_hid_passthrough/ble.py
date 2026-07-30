@@ -298,6 +298,12 @@ class BLEMixin:
             if remaining <= 0:
                 return None
 
+            # `run` bails instantly while Classic is mid-setup, so without
+            # this the loop would burn the whole window re-entering it once
+            # per slice instead of yielding to Classic as it did before.
+            if self._ble_has_classic_setup_activity():
+                return None
+
             if not first and dwell > 0:
                 # `run` restored page scan in its finally before returning, so
                 # the host is pageable for the whole of this sleep.
