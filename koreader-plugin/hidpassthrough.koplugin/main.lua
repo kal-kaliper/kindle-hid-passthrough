@@ -187,7 +187,20 @@ end
 
 HIDPassthrough.WATCHER_INTERVAL = 3 -- seconds
 HIDPassthrough.KEYBOARD_ATTACH_STABLE_SECONDS = 0 -- seconds
-HIDPassthrough.PHONE_KEYBOARD_ATTACH_STABLE_SECONDS = 12 -- seconds
+
+-- Was 12. The kernel does not buffer evdev events for a reader that isn't
+-- open yet, so every second we delay attaching is a second of keystrokes
+-- silently dropped between the daemon creating the uhid node and us opening
+-- it (measured: 530 lost reports on one connection). Holding off attachment
+-- only ever made that worse; it protected nothing the daemon doesn't already
+-- guard elsewhere (classic.py drops links whose HID interrupt channel won't
+-- open), and its "already stable" fast path required the user to have
+-- already typed into a still-unattached device, which is circular. 0 does
+-- not close the loss window, it only shrinks it to the WATCHER_INTERVAL poll
+-- gap (~3s worst case) instead of ~7-12s. See commit message for the full
+-- writeup; the fix that actually closes the window is the native hot-plug
+-- path on the koreader-2026.07-align branch, not this constant.
+HIDPassthrough.PHONE_KEYBOARD_ATTACH_STABLE_SECONDS = 0 -- seconds
 HIDPassthrough.RESUME_WATCHER_INTERVAL = 5 -- seconds
 HIDPassthrough.RESUME_WATCHER_TIMEOUT = 75 -- seconds
 HIDPassthrough.RESUME_WATCHER_SLOW_INTERVAL = 30 -- seconds
