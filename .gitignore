@@ -36,3 +36,21 @@ pr-24-*.md
 
 # Planning docs (local only)
 .plans/
+
+# Device data pulled off a Kindle. None of this is tracked today, but copying a
+# cache dir or devices.conf into the tree to debug is a normal thing to do, and
+# it carries Bluetooth addresses, cached HID descriptors and link keys. Ignore
+# it by default so it cannot be committed by accident.
+cache/
+devices.conf
+pairing_keys.json
+pairing_keys.json.*
+*.log
+
+# Local build output and tool caches
+output-local/
+artifacts/
+.ci-artifacts/
+.docker-cache/
+.pytest_cache/
+.ruff_cache/
