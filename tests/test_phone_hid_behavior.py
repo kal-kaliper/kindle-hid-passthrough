@@ -2663,7 +2663,17 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         writes, elapsed = asyncio.run(scenario())
 
         self.assertEqual([False, True], writes)
-        self.assertLess(elapsed, 1.0, f"stayed dark {elapsed:.2f}s")
+        # The clamp still bounds the *window*; it no longer bounds total
+        # elapsed to under a second. A1's cancellation fix (ble.py) removes
+        # the connection/failure listeners before the create-connection
+        # cancel is sent -- unconditionally, so a cancel landing on that send
+        # can never skip `le_connecting = False` -- which means `pending` can
+        # never resolve again for this call, and the follow-up
+        # `wait_for(shield(pending), timeout=1.0)` always burns its full 1.0s
+        # instead of returning early once bumble's real connection-failure
+        # event lands. That is a real ~1s of *additional* page-scan darkness
+        # on every cancelled initiate now, not a test artifact.
+        self.assertLess(elapsed, 1.2, f"stayed dark {elapsed:.2f}s")
 
     def test_ble_initiate_does_not_clamp_when_page_scan_is_already_down(self):
         # Complement of the clamp test. If page scan is already down, blanking
@@ -2838,6 +2848,302 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self.assertEqual([0x00, 0x02], host.device.scan_enable_writes)
         self.assertTrue(host._classic_page_scan_enabled)
         self.assertTrue(host.device.connectable)
+
+    def test_ble_initiate_cancel_during_cancel_command_still_releases_lock(self):
+        # Regression (Item A1): a cancel landing while awaiting the
+        # create-connection cancel command used to leave le_connecting stuck
+        # True, the listeners still registered, page scan un-restored, and
+        # the radio lock held forever, since `except Exception` at that
+        # await does not catch CancelledError and everything downstream of
+        # it (in the old, flat finally) was simply skipped.
+        async def scenario():
+            host = self.make_host()
+            host.device = FakeBleDevice()
+            host._radio_lock = asyncio.Lock()
+            host._classic_page_scan_enabled = True
+
+            real_send_command = host.device.send_command
+
+            async def send_command(command, check_result=False):
+                if type(command).__name__ == "HCI_LE_Create_Connection_Cancel_Command":
+                    raise asyncio.CancelledError()
+                return await real_send_command(command, check_result=check_result)
+
+            host.device.send_command = send_command
+
+            with self.assertRaises(asyncio.CancelledError):
+                await host._ble_initiate(0.05)
+
+            return host
+
+        host = asyncio.run(scenario())
+
+        self.assertFalse(host.device.le_connecting)
+        self.assertEqual([], host.device.listeners.get("connection", []))
+        self.assertEqual([], host.device.listeners.get("connection_failure", []))
+        self.assertFalse(host._radio_lock.locked())
+        # force=True restore still ran despite the cancel, so page scan
+        # actually got re-enabled rather than being left dark.
+        self.assertTrue(host._classic_page_scan_enabled)
+        self.assertTrue(host.device.connectable)
+
+    def test_ble_scan_for_rotated_cancel_during_stop_scanning_still_releases_lock(self):
+        # Regression (Item A1b): _ble_scan_for_rotated has the identical
+        # shape of bug as _ble_initiate -- a cancel during stop_scanning is
+        # not caught by `except Exception`, so the log+release after it used
+        # to be skipped, wedging the radio lock forever.
+        async def scenario():
+            host = self.make_host()
+            host.device = FakeBleDevice()
+            host._radio_lock = asyncio.Lock()
+
+            async def start_scanning(**kwargs):
+                return None
+
+            async def stop_scanning(legacy=True):
+                raise asyncio.CancelledError()
+
+            host.device.start_scanning = start_scanning
+            host.device.stop_scanning = stop_scanning
+
+            with self.assertRaises(asyncio.CancelledError):
+                await host._ble_scan_for_rotated(set(), 0.05)
+
+            return host
+
+        host = asyncio.run(scenario())
+
+        self.assertFalse(host._radio_lock.locked())
+
+    def test_classic_active_connect_loop_propagates_parent_cancel(self):
+        # Regression (Item A1c): a parent cancel (host teardown cancelling
+        # this loop's own task) arriving while the per-attempt cleanup awaits
+        # connect_task's own cancellation used to be swallowed by
+        # `except (asyncio.CancelledError, Exception): pass`, so the loop
+        # kept dialing -- uncancellable -- and cleanup()'s untimed
+        # `gather(*pending, return_exceptions=True)` (host.py) would hang the
+        # daemon waiting on a task that could never finish.
+        async def scenario():
+            host = self.make_host()
+            host.ACTIVE_DELAY = 0
+            # >=1: with 0 the for-loop body never runs, so connect_task is
+            # cancelled before the event loop has ever stepped it even once
+            # (a task cancelled pre-first-step never enters its own
+            # try/except), which would race this test's own hook instead of
+            # landing where a real teardown cancel actually lands.
+            host.ACTIVE_CONNECT_TIMEOUT = 1
+            host.device = FakeClassicDevice()
+            host._radio_lock = asyncio.Lock()
+
+            connect_calls = 0
+            cancel_started = asyncio.Event()
+
+            async def hanging_connect(*args, **kwargs):
+                nonlocal connect_calls
+                connect_calls += 1
+                try:
+                    await asyncio.sleep(100)
+                except asyncio.CancelledError:
+                    # Still "cancelling" (not done) when the parent cancel
+                    # below lands, mirroring a slow real disconnect/teardown.
+                    cancel_started.set()
+                    await asyncio.sleep(100)
+                    raise
+
+            host.device.connect = hanging_connect
+
+            outer = asyncio.create_task(
+                host._classic_active_connect_loop([self.ADDR]))
+            await asyncio.wait_for(cancel_started.wait(), timeout=2.0)
+            # The loop is now suspended awaiting connect_task's own
+            # cancellation inside its per-attempt cleanup -- exactly where a
+            # real host teardown cancel lands.
+            outer.cancel()
+
+            propagated = True
+            try:
+                await asyncio.wait_for(outer, timeout=2.0)
+                propagated = False
+            except asyncio.CancelledError:
+                propagated = True
+            except asyncio.TimeoutError:
+                propagated = False
+            finally:
+                if not outer.done():
+                    outer.cancel()
+                    try:
+                        await outer
+                    except asyncio.CancelledError:
+                        pass
+
+            return propagated, connect_calls
+
+        propagated, connect_calls = asyncio.run(scenario())
+
+        self.assertTrue(
+            propagated, "parent cancel did not propagate out of the loop within 2s")
+        self.assertEqual(
+            1, connect_calls, "loop kept dialing after the parent cancel")
+
+    def test_ble_initiate_failed_disable_still_forces_a_restore_write(self):
+        # Regression (Item A3): the original fix (moving
+        # classic_page_scan_paused = True earlier) is a no-op on its own. If
+        # the disable raises, _classic_page_scan_enabled is never updated
+        # (only set on success), so a restore call without force=True sees
+        # enabled == True already and issues nothing -- identical to the bug.
+        # force=True is what makes the restore actually write.
+        async def scenario():
+            host = self.make_host()
+            host.device = FakeBleDevice()
+            host._radio_lock = asyncio.Lock()
+            host._classic_page_scan_enabled = True
+
+            real_set_connectable = host.device.set_connectable
+            calls = []
+
+            async def flaky_set_connectable(connectable=True):
+                calls.append(connectable)
+                if len(calls) == 1:
+                    # Mirrors bumble's Device.set_connectable, which flips
+                    # `connectable` before awaiting the HCI write -- so a
+                    # write failure still leaves the flag at the new value.
+                    host.device.connectable = connectable
+                    raise RuntimeError("simulated HCI write failure")
+                return await real_set_connectable(connectable=connectable)
+
+            host.device.set_connectable = flaky_set_connectable
+
+            # The disable's own RuntimeError propagates out of _ble_initiate
+            # uncaught (it happens before any create-connection attempt, so
+            # `initiated` is still False and nothing wraps this in a broad
+            # except) -- the finally's cleanup still has to run first, which
+            # is exactly what this test verifies.
+            with self.assertRaises(RuntimeError):
+                await host._ble_initiate(0.05)
+            return host, calls
+
+        host, calls = asyncio.run(scenario())
+
+        # Both the failed disable and the forced restore were issued.
+        self.assertEqual([False, True], calls)
+        # Only the second (successful) call reaches the real fake and
+        # actually appends a write -- proof the forced restore issued a real
+        # command rather than short-circuiting on the stale tracked flag.
+        self.assertEqual([0x02], host.device.scan_enable_writes)
+        self.assertTrue(host._classic_page_scan_enabled)
+        self.assertTrue(host.device.connectable)
+
+    def test_set_classic_page_scan_marks_dark_before_a_failing_disable(self):
+        # Regression (Item A4): _classic_page_scan_dark_since must be set
+        # BEFORE the awaited disable, not after -- a disable that raises
+        # (mirroring bumble's own flag flipping ahead of a failed HCI write)
+        # still needs the keeper to know page scan may be down, or a stuck
+        # radio lock combined with a failed disable would leave the keeper
+        # believing everything is fine forever.
+        async def scenario():
+            host = self.make_host()
+            host.device = FakeClassicDevice()
+            host._classic_page_scan_enabled = True
+
+            async def failing_set_connectable(connectable=True):
+                raise RuntimeError("simulated HCI write failure")
+
+            host.device.set_connectable = failing_set_connectable
+
+            with self.assertRaises(RuntimeError):
+                await host._set_classic_page_scan(False)
+
+            return host._classic_page_scan_dark_since
+
+        dark_since = asyncio.run(scenario())
+
+        self.assertIsNotNone(dark_since)
+
+    def test_set_classic_page_scan_clears_dark_since_on_successful_enable(self):
+        async def scenario():
+            host = self.make_host()
+            host.device = FakeClassicDevice()
+            host._classic_page_scan_enabled = True
+
+            await host._set_classic_page_scan(False)
+            after_disable = host._classic_page_scan_dark_since
+
+            await host._set_classic_page_scan(True, force=True)
+            after_enable = host._classic_page_scan_dark_since
+
+            return after_disable, after_enable
+
+        after_disable, after_enable = asyncio.run(scenario())
+
+        self.assertIsNotNone(after_disable)
+        self.assertIsNone(after_enable)
+
+    def test_page_scan_keeper_defers_within_dark_ceiling_while_lock_held(self):
+        # Regression (Item A4): the keeper's predicate must be page-scan
+        # darkness, not lock tenure. Within the ceiling, a held lock is
+        # legitimate (a BLE initiate in progress) and must not be disturbed.
+        async def scenario():
+            host = self.make_host()
+            host.CLASSIC_PAGE_SCAN_REASSERT_INTERVAL = 0.01
+            host._radio_lock = asyncio.Lock()
+            await host._radio_lock.acquire()
+            host._classic_page_scan_enabled = False
+            host._classic_page_scan_dark_since = time.monotonic() - 5.0
+
+            calls = []
+
+            async def fake_set(enabled, force=False):
+                calls.append((enabled, force))
+
+            host._set_classic_page_scan = fake_set
+
+            task = asyncio.create_task(host._classic_page_scan_keeper())
+            await asyncio.sleep(0.1)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return calls
+
+        calls = asyncio.run(scenario())
+
+        self.assertEqual(
+            [], calls,
+            "keeper must not touch page scan while the lock is legitimately held")
+
+    def test_page_scan_keeper_force_asserts_past_dark_ceiling_despite_held_lock(self):
+        # Complement: once dark-for exceeds the ceiling, the keeper must
+        # force-assert despite the held lock -- the harm is deafness to
+        # inbound pages, and a stuck lock cannot be fixed by staying quiet.
+        async def scenario():
+            host = self.make_host()
+            host.CLASSIC_PAGE_SCAN_REASSERT_INTERVAL = 0.01
+            host.CLASSIC_PAGE_SCAN_DARK_CEILING = 0.05
+            host._radio_lock = asyncio.Lock()
+            await host._radio_lock.acquire()
+            host._classic_page_scan_enabled = False
+            host._classic_page_scan_dark_since = time.monotonic() - 1.0
+
+            calls = []
+
+            async def fake_set(enabled, force=False):
+                calls.append((enabled, force))
+
+            host._set_classic_page_scan = fake_set
+
+            task = asyncio.create_task(host._classic_page_scan_keeper())
+            await asyncio.sleep(0.1)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return calls
+
+        calls = asyncio.run(scenario())
+
+        self.assertIn((True, True), calls)
 
     def test_ble_restore_disconnect_does_not_fall_through_to_pair(self):
         async def scenario():

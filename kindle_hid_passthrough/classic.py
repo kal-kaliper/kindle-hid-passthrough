@@ -481,10 +481,19 @@ class ClassicMixin:
                     finally:
                         if not connect_task.done():
                             connect_task.cancel()
-                        try:
-                            await connect_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
+                        # Not `try: await connect_task except (CancelledError,
+                        # Exception): pass` -- that catches a *parent* cancel
+                        # (host teardown cancelling this whole loop's task)
+                        # delivered during this exact await, indistinguishable
+                        # here from connect_task's own cancellation. Swallowed,
+                        # the loop kept dialing forever, uncancellable, and
+                        # cleanup()'s untimed `gather(*pending,
+                        # return_exceptions=True)` (host.py) hung waiting on a
+                        # task that would never finish. gather() absorbs only
+                        # connect_task's own outcome into its (discarded)
+                        # result list; a cancel of the awaiter itself still
+                        # propagates out of the gather call.
+                        await asyncio.gather(connect_task, return_exceptions=True)
                         log.info(
                             f"[Radio] Classic connect ({self._format_device(addr)}): "
                             f"held lock for {time.monotonic() - radio_started:.2f}s"
@@ -531,14 +540,37 @@ class ClassicMixin:
         which is exactly the phone-as-keyboard case.
 
         Skipped while the radio lock is held, so this cannot re-enable page scan
-        inside a BLE initiate window that deliberately paused it.
+        inside a BLE initiate window that deliberately paused it -- *unless*
+        page scan has been tracked dark for longer than
+        CLASSIC_PAGE_SCAN_DARK_CEILING, in which case it force-asserts despite
+        the lock. The predicate is darkness, not lock tenure: the harm is
+        deafness to inbound pages, and legitimate darkness (bounded by
+        classic_page_scan_max_dark plus command latency) is nowhere near the
+        ceiling, so crossing it means something -- a stuck lock, most likely
+        the very bug this ceiling exists to survive -- has left page scan off
+        for far longer than any real BLE initiate would. Lock tenure was
+        rejected as the predicate: there are manual release sites this class
+        does not track a start time for (ble.py, and the dial loop above), so
+        a missed one would falsely force-assert on every tick.
         """
         while True:
             await asyncio.sleep(self.CLASSIC_PAGE_SCAN_REASSERT_INTERVAL)
             if self._is_protocol_connected(Protocol.CLASSIC):
                 continue
             if self._radio_lock is not None and self._radio_lock.locked():
-                continue
+                dark_since = self._classic_page_scan_dark_since
+                dark_for = (
+                    time.monotonic() - dark_since if dark_since is not None else 0.0
+                )
+                if (self._classic_page_scan_enabled
+                        or dark_for <= self.CLASSIC_PAGE_SCAN_DARK_CEILING):
+                    continue
+                log.warning(
+                    f"[Classic] Page scan dark for {dark_for:.0f}s with the "
+                    "radio lock held; force-asserting past the "
+                    f"{self.CLASSIC_PAGE_SCAN_DARK_CEILING:.0f}s ceiling rather "
+                    "than staying deaf indefinitely"
+                )
             try:
                 await self._set_classic_page_scan(True, force=True)
             except Exception as e:
@@ -554,12 +586,25 @@ class ClassicMixin:
             return
         action = "Enabling" if enabled else "Disabling"
         log.info(f"[Classic] {action} Page Scan...")
+        if not enabled:
+            # Set BEFORE the await, pessimistically, and only if not already
+            # dark (a repeated disable must not push the clock forward): if
+            # this call never completes -- cancelled, or raises after bumble's
+            # own set_connectable has already flipped its internal flag -- the
+            # keeper still needs to know page scan may be down so it can judge
+            # dark-for against the ceiling instead of trusting a flag that a
+            # failed call never got to update.
+            self._classic_page_scan_dark_since = (
+                self._classic_page_scan_dark_since or time.monotonic()
+            )
         # set_connectable keeps device.connectable in step and recomputes the
         # register from it plus device.discoverable, so bumble's view and the
         # controller cannot drift apart. Writing the raw command here instead left
         # bumble believing something different from what the controller held.
         await self.device.set_connectable(enabled)
         self._classic_page_scan_enabled = enabled
+        if enabled:
+            self._classic_page_scan_dark_since = None
 
     async def _classic_disable_low_power(self, connection):
         handle = getattr(connection, "handle", None)

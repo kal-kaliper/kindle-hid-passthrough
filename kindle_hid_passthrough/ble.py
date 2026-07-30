@@ -390,123 +390,164 @@ class BLEMixin:
         classic_page_scan_paused = False
 
         try:
-            if self._ble_has_classic_setup_activity():
-                log.info("[BLE] Initiate window skipped: Classic setup active")
-                return None
-
-            # `self._classic_page_scan_enabled` guard: if page scan is already
-            # down, this call blanks nothing, so clamping the window would
-            # surrender BLE scanning time to buy no inbound responsiveness.
-            if (self._ble_should_pause_classic_page_scan()
-                    and self._classic_page_scan_enabled):
-                # Bound the dark window HERE, where the blanking happens.
-                # _ble_sliced decides whether to slice *before* taking the
-                # radio lock, and Classic can drop while we wait on it, so
-                # that decision is stale by the time we arrive: the unsliced
-                # path would then blank page scan for a full uncapped window.
-                # Clamping at the point of truth makes the bound hold on
-                # every path into here, sliced or not. _ble_sliced keeps
-                # looping, so the window this gives up is not lost.
-                max_dark = max(0.01, config.classic_page_scan_max_dark)
-                if window > max_dark:
-                    log.info(
-                        f"[BLE] Window clamped {window:.1f}s -> {max_dark:.1f}s "
-                        "to bound page-scan darkness"
-                    )
-                    window = max_dark
-                await self._set_classic_page_scan(False)
-                classic_page_scan_paused = True
-
-            # Measured from here, not from function entry: the radio lock wait
-            # above can exceed a 2s slice outright (a Classic dial holds it up
-            # to 5s), which would otherwise produce a slice that blanks page
-            # scan and issues create/cancel for zero seconds of scanning.
-            window_started = loop.time()
-
-            self.device.connect_own_address_type = OwnAddressType.PUBLIC
-            self.device.le_connecting = True
-
             try:
-                await self.device.send_command(
-                    HCI_LE_Create_Connection_Command(
-                        le_scan_interval=96,
-                        le_scan_window=96,
-                        initiator_filter_policy=0 if peer is not None else 1,
-                        peer_address_type=peer.address_type if peer is not None else 0,
-                        peer_address=peer if peer is not None else Address.ANY,
-                        own_address_type=OwnAddressType.PUBLIC,
-                        connection_interval_min=12,
-                        connection_interval_max=24,
-                        max_latency=0,
-                        supervision_timeout=72,
-                        min_ce_length=0,
-                        max_ce_length=0,
-                    ), check_result=True)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.info(f"[BLE] Initiate command failed: {e}")
-                return None
-            initiated = True
-
-            deadline = window_started + window
-            while True:
                 if self._ble_has_classic_setup_activity():
-                    elapsed = loop.time() - started
-                    log.info(
-                        "[BLE] Initiate window aborted for Classic setup: "
-                        f"mode={mode}, elapsed={elapsed:.2f}s"
-                    )
+                    log.info("[BLE] Initiate window skipped: Classic setup active")
                     return None
 
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    elapsed = loop.time() - started
-                    log.info(
-                        f"[BLE] Initiate window timeout: mode={mode}, "
-                        f"elapsed={elapsed:.2f}s"
-                    )
-                    return None
+                # `self._classic_page_scan_enabled` guard: if page scan is already
+                # down, this call blanks nothing, so clamping the window would
+                # surrender BLE scanning time to buy no inbound responsiveness.
+                if (self._ble_should_pause_classic_page_scan()
+                        and self._classic_page_scan_enabled):
+                    # Bound the dark window HERE, where the blanking happens.
+                    # _ble_sliced decides whether to slice *before* taking the
+                    # radio lock, and Classic can drop while we wait on it, so
+                    # that decision is stale by the time we arrive: the unsliced
+                    # path would then blank page scan for a full uncapped window.
+                    # Clamping at the point of truth makes the bound hold on
+                    # every path into here, sliced or not. _ble_sliced keeps
+                    # looping, so the window this gives up is not lost.
+                    max_dark = max(0.01, config.classic_page_scan_max_dark)
+                    if window > max_dark:
+                        log.info(
+                            f"[BLE] Window clamped {window:.1f}s -> {max_dark:.1f}s "
+                            "to bound page-scan darkness"
+                        )
+                        window = max_dark
+                    # Set BEFORE the await, not after: bumble's set_connectable
+                    # assigns Device.connectable ahead of awaiting the HCI write,
+                    # so a disable that raises (including CancelledError) can
+                    # still have left bumble's own flag at False. If this flag
+                    # were set only on success, that failure would skip the
+                    # finally's restore entirely and leave the controller
+                    # page-scan-dark with nothing tracking it.
+                    classic_page_scan_paused = True
+                    await self._set_classic_page_scan(False)
+
+                # Measured from here, not from function entry: the radio lock wait
+                # above can exceed a 2s slice outright (a Classic dial holds it up
+                # to 5s), which would otherwise produce a slice that blanks page
+                # scan and issues create/cancel for zero seconds of scanning.
+                window_started = loop.time()
+
+                self.device.connect_own_address_type = OwnAddressType.PUBLIC
+                self.device.le_connecting = True
 
                 try:
-                    connection = await asyncio.wait_for(
-                        asyncio.shield(pending),
-                        timeout=min(0.1, remaining),
-                    )
-                except asyncio.TimeoutError:
-                    continue
+                    await self.device.send_command(
+                        HCI_LE_Create_Connection_Command(
+                            le_scan_interval=96,
+                            le_scan_window=96,
+                            initiator_filter_policy=0 if peer is not None else 1,
+                            peer_address_type=peer.address_type if peer is not None else 0,
+                            peer_address=peer if peer is not None else Address.ANY,
+                            own_address_type=OwnAddressType.PUBLIC,
+                            connection_interval_min=12,
+                            connection_interval_max=24,
+                            max_latency=0,
+                            supervision_timeout=72,
+                            min_ce_length=0,
+                            max_ce_length=0,
+                        ), check_result=True)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
+                    log.info(f"[BLE] Initiate command failed: {e}")
+                    return None
+                initiated = True
+
+                deadline = window_started + window
+                while True:
+                    if self._ble_has_classic_setup_activity():
+                        elapsed = loop.time() - started
+                        log.info(
+                            "[BLE] Initiate window aborted for Classic setup: "
+                            f"mode={mode}, elapsed={elapsed:.2f}s"
+                        )
+                        return None
+
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        elapsed = loop.time() - started
+                        log.info(
+                            f"[BLE] Initiate window timeout: mode={mode}, "
+                            f"elapsed={elapsed:.2f}s"
+                        )
+                        return None
+
+                    try:
+                        connection = await asyncio.wait_for(
+                            asyncio.shield(pending),
+                            timeout=min(0.1, remaining),
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        elapsed = loop.time() - started
+                        log.info(
+                            f"[BLE] Initiate window failed: mode={mode}, "
+                            f"elapsed={elapsed:.2f}s, error={e}"
+                        )
+                        return None
                     elapsed = loop.time() - started
                     log.info(
-                        f"[BLE] Initiate window failed: mode={mode}, "
-                        f"elapsed={elapsed:.2f}s, error={e}"
+                        f"[BLE] Initiate window connected: "
+                        f"peer={connection.peer_address}, elapsed={elapsed:.2f}s"
                     )
-                    return None
-                elapsed = loop.time() - started
-                log.info(
-                    f"[BLE] Initiate window connected: "
-                    f"peer={connection.peer_address}, elapsed={elapsed:.2f}s"
-                )
-                return connection
+                    return connection
 
+            finally:
+                # SYNC ONLY, before any await below, and never skipped: a
+                # cancel landing in either await further down (the cancel
+                # command itself, or its own wait_for) used to leave
+                # le_connecting stuck True forever, since `except Exception`
+                # does not catch CancelledError and these three statements sat
+                # *after* that await. _classic_active_connect_loop then spins
+                # on le_connecting forever (classic.py), a second permanent
+                # degradation traded for the first.
+                self.device.le_connecting = False
+                self.device.remove_listener(Device.EVENT_CONNECTION, on_connection)
+                self.device.remove_listener(Device.EVENT_CONNECTION_FAILURE, on_failure)
+                try:
+                    if initiated and not pending.done():
+                        try:
+                            await self.device.send_command(
+                                HCI_LE_Create_Connection_Cancel_Command())
+                            await asyncio.wait_for(asyncio.shield(pending), timeout=1.0)
+                        except Exception:
+                            pass
+                finally:
+                    # Own nested finally: a cancel arriving in the cancel-command
+                    # await above must not skip this restore either, or Classic
+                    # stays page-scan-dark until the keeper's next tick (or,
+                    # pre-A4, forever if the lock never frees).
+                    if classic_page_scan_paused:
+                        try:
+                            # force=True: a failed disable can leave bumble
+                            # believing connectable=False (it flips that flag
+                            # before awaiting the HCI write) while our own
+                            # _classic_page_scan_enabled is still True from
+                            # before the failed call. Without force, this
+                            # restore would see enabled==True already and
+                            # issue nothing -- identical to the bug, just one
+                            # level removed.
+                            await self._set_classic_page_scan(True, force=True)
+                        except Exception as e:
+                            log.warning(f"[BLE] Could not restore Classic Page Scan: {e}")
         finally:
-            if initiated and not pending.done():
-                try:
-                    await self.device.send_command(
-                        HCI_LE_Create_Connection_Cancel_Command())
-                    await asyncio.wait_for(asyncio.shield(pending), timeout=1.0)
-                except Exception:
-                    pass
-            self.device.le_connecting = False
-            self.device.remove_listener(Device.EVENT_CONNECTION, on_connection)
-            self.device.remove_listener(Device.EVENT_CONNECTION_FAILURE, on_failure)
-            if classic_page_scan_paused:
-                try:
-                    await self._set_classic_page_scan(True)
-                except Exception as e:
-                    log.warning(f"[BLE] Could not restore Classic Page Scan: {e}")
+            # No asyncio.shield here: awaiting a shielded future still raises
+            # CancelledError immediately when the awaiter is cancelled, so a
+            # shield would not have protected the awaits above anyway -- it
+            # would only have (a) let the shielded command keep running
+            # unobserved and (b) invited a catch-and-reawait that could stall
+            # shutdown up to 10s per command on a dead controller. Releasing
+            # the lock with an HCI cancel possibly still in flight is
+            # acceptable: bumble writes the packet synchronously before
+            # awaiting, and every caller that cancels this function is host
+            # teardown, followed by transport close and a fresh HCI Reset.
             log.info(
                 f"[Radio] BLE initiate ({mode}): held lock for "
                 f"{asyncio.get_running_loop().time() - radio_started:.2f}s"
@@ -560,17 +601,25 @@ class BLEMixin:
             log.warning(f"[BLE] Rotation scan failed: {e}")
             return None
         finally:
+            # Same shape as _ble_initiate's finally, and the same reason: a
+            # cancel landing in the stop_scanning await is not caught by
+            # `except Exception`, so the log+release below must live in their
+            # own nested finally or a cancel there wedges this lock forever
+            # exactly as it did for the create-connection cancel in
+            # _ble_initiate.
             self.device.remove_listener('advertisement', on_advertisement)
-            if scanning:
-                try:
-                    await self.device.stop_scanning(legacy=True)
-                except Exception:
-                    pass
-            log.info(
-                "[Radio] BLE rotation scan: held lock for "
-                f"{asyncio.get_running_loop().time() - radio_started:.2f}s"
-            )
-            self._radio_lock.release()
+            try:
+                if scanning:
+                    try:
+                        await self.device.stop_scanning(legacy=True)
+                    except Exception:
+                        pass
+            finally:
+                log.info(
+                    "[Radio] BLE rotation scan: held lock for "
+                    f"{asyncio.get_running_loop().time() - radio_started:.2f}s"
+                )
+                self._radio_lock.release()
 
     def _match_rotated_ble_device(self, advertisement, known: set):
         """Match an advertisement by known address, IRK resolution, or

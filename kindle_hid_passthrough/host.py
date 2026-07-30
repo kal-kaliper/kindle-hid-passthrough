@@ -96,6 +96,16 @@ class HIDHost(ClassicMixin, BLEMixin):
     # One HCI command per interval; cheap enough to be frequent, and the ceiling
     # on how long an inbound-only device stays unreachable if page scan is lost.
     CLASSIC_PAGE_SCAN_REASSERT_INTERVAL = 30.0
+    # How long page scan may be tracked as deliberately dark (radio lock held
+    # for a BLE initiate that blanked it) before the keeper forces it back on
+    # despite the lock. Legitimate darkness is bounded by
+    # classic_page_scan_max_dark (2.0s) plus command latency -- typically <3s,
+    # pathologically ~22s -- so 30s is far above legitimate use and still far
+    # tighter than any lock-hold-based ceiling could be (the legitimate
+    # worst-case *hold* is ~53s). The predicate is darkness, not lock tenure:
+    # the harm here is deafness to inbound pages, and force-asserting page
+    # scan cannot fix a stuck lock anyway.
+    CLASSIC_PAGE_SCAN_DARK_CEILING = 30.0
     ACTIVE_CONNECT_TIMEOUT = 10
     CLASSIC_AUTH_RETRY_DELAY = 8.0
     CLASSIC_AUTH_RETRY_DELAY_WITH_PENDING_BLE = 20.0
@@ -165,6 +175,15 @@ class HIDHost(ClassicMixin, BLEMixin):
         self._classic_pending_session: Optional[DeviceSession] = None
         self._classic_active_connect_task = None
         self._classic_page_scan_enabled = False
+        # Monotonic timestamp (time.monotonic()) of when page scan was last
+        # known (or assumed) to have gone dark, or None while it is believed
+        # up. Set pessimistically before the awaited disable in
+        # _set_classic_page_scan and cleared only on a successful enable, so
+        # the keeper can tell "dark, and for how long" apart from "radio lock
+        # held" -- the two are not the same thing and a lock-tenure-based
+        # ceiling cannot be tightened enough to matter (see
+        # CLASSIC_PAGE_SCAN_DARK_CEILING).
+        self._classic_page_scan_dark_since = None
         self._classic_setup_started_at = None
         self._classic_channels_opened_at = None
         self._classic_hid_ready_at = None
