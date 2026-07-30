@@ -201,6 +201,11 @@ run:
 # Deploy KOReader plugin to Kindle
 deploy-koreader:
     @echo "Deploying KOReader plugin..."
+    # Remove the old plugin dir first, as upstream does. Extracting over the top
+    # leaves files the plugin no longer ships: this device had accumulated a
+    # nested hidpassthrough.koplugin/ and a main.lua.bak-*, and a stale
+    # event_map_keyboard.lua would linger the moment that file is retired.
+    ssh {{host}} "rm -rf /mnt/us/koreader/plugins/hidpassthrough.koplugin"
     ssh {{host}} "mkdir -p /mnt/us/koreader/plugins"
     (cd {{src_dir}}/koreader-plugin && tar cf - hidpassthrough.koplugin) \
         | ssh {{host}} "tar xf - -C /mnt/us/koreader/plugins"
