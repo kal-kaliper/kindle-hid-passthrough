@@ -18,7 +18,7 @@ class DeviceCache:
     # device class, SDP service attributes — and on their own schedule. A
     # descriptor re-cache passes only report_map/device_name, so without
     # carrying these across they would be dropped on every reconnect.
-    STICKY_KEYS = ('is_phone', 'reconnect_initiate')
+    STICKY_KEYS = ('is_phone', 'reconnect_initiate', 'seen_inbound')
 
     def __init__(self, cache_dir: str):
         """Initialize cache manager
@@ -156,6 +156,24 @@ class DeviceCache:
     def get_reconnect_initiate(self, address: str) -> Optional[bool]:
         """Return cached reconnect_initiate, or None if never read."""
         return self._read_raw(address).get('reconnect_initiate')
+
+    def set_seen_inbound(self, address: str, value: bool) -> bool:
+        """Record that this device has been observed paging us.
+
+        Written from the inbound HCI connection-request handler only, so it
+        is evidence rather than a claim: it is the counterweight to
+        HIDReconnectInitiate, which a device can declare true without
+        implementing.
+        """
+        data = self._read_raw(address)
+        if data.get('seen_inbound') == value:
+            return True
+        data['seen_inbound'] = value
+        return self.save(address, data)
+
+    def get_seen_inbound(self, address: str) -> Optional[bool]:
+        """Return whether this device has ever been seen connecting inbound."""
+        return self._read_raw(address).get('seen_inbound')
 
     def clear(self, address: Optional[str] = None) -> int:
         """Clear cache for specific device or all devices.

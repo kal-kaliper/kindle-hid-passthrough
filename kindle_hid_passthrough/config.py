@@ -133,15 +133,17 @@ class Config:
             'classic', 'passive_names', [])
         self.classic_trust_reconnect_initiate = self._getbool(
             'classic', 'trust_reconnect_initiate', True)
-        # Longest the shared radio may be held continuously while a Classic
-        # device is configured but not connected. A keyboard wakes on a
-        # keypress and pages for only a few seconds, so a hold longer than
-        # that burst loses the whole burst, not just part of it.
+        # Longest a BLE initiate may keep page scan dark before restoring it
+        # (plus up to ~1s while the create-connection cancel is awaited). A
+        # keyboard wakes on a keypress and pages for only a few seconds, so a
+        # dark stretch longer than that burst loses the whole burst. This
+        # bounds darkness, not radio-lock hold time: the radio is still held
+        # for a full window when page scan is not being blanked.
         self.classic_page_scan_max_dark = float(
             self._get('classic', 'page_scan_max_dark', '2.0'))
-        # How long page scan is left up between radio slices. One full page
-        # scan interval is 1.28s, so anything shorter risks a page landing
-        # entirely inside a gap.
+        # How long page scan is left up between radio slices. The controller
+        # default page scan interval is 1.28s, so a shorter dwell can elapse
+        # entirely between two scan windows and catch nothing.
         self.classic_page_scan_dwell = float(
             self._get('classic', 'page_scan_dwell', '1.5'))
         # Whether a BLE radio hold blanks Classic page scan. Kept on by

@@ -175,6 +175,15 @@ class ClassicMixin:
                         "devices.conf and not in the keystore"
                     )
                     return
+                # Proof, as opposed to the device's own claim, that this peer
+                # really does page us. Recorded before the phone check because
+                # it is what makes a keyboard's HIDReconnectInitiate=true
+                # declaration safe to act on: a device that declares it but
+                # never pages would otherwise be dropped from the dial list
+                # forever, and the only way to discover the mistake is the
+                # very inbound connection it is failing to make.
+                if self.device_cache.get_seen_inbound(addr_str) is not True:
+                    self.device_cache.set_seen_inbound(addr_str, True)
                 if not is_phone:
                     return
                 if self.device_cache.get_is_phone(addr_str) is True:

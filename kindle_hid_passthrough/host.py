@@ -1006,14 +1006,25 @@ class HIDHost(ClassicMixin, BLEMixin):
             f"address={session.address}, name={session.device_name}, "
             f"has_uhid={bool(session.uhid_device)}, live={self._live_protocols()}"
         )
-        # Stated once per session because it is otherwise unanswerable from a
-        # log: report counts are 1:1 whether serialization is on or off for a
-        # device that sends clean press/release pairs, so the counters cannot
-        # be used to infer it after the fact.
+        # Stated once per session because inferring it from the report
+        # counters is unreliable: a device sending clean press/release pairs
+        # gives exactly 1:1 either way (a new key emits press+release, an
+        # all-released report emits nothing). Counts only diverge once
+        # modifiers, auto-repeat or rollover appear, so a short lowercase
+        # sample proves nothing.
+        mode = self._serialize_mode(session)
+        serialized = self._serialize_keyboard_reports(session)
+        detail = f"mode={mode}"
+        if mode == 'auto':
+            # Only reported for auto. always/never return before
+            # _session_is_phone runs, leaving session.is_phone at its
+            # pre-resolution snapshot — a value that took no part in the
+            # decision and would misrepresent why.
+            detail += f", is_phone={session.is_phone}"
         log.info(
             f"[{protocol.value.upper()}] Keyboard reports "
-            f"{'serialized into taps' if self._serialize_keyboard_reports(session) else 'forwarded unmodified'}"
-            f" (mode={self._serialize_mode(session)}, is_phone={session.is_phone})"
+            f"{'serialized into taps' if serialized else 'forwarded unmodified'}"
+            f" ({detail})"
         )
         if self._connection_future and not self._connection_future.done():
             self._connection_future.set_result(session)
@@ -1089,11 +1100,20 @@ class HIDHost(ClassicMixin, BLEMixin):
         The device's own SDP declaration is the authoritative one:
         HIDReconnectInitiate (0x0205) true means it re-establishes the link
         itself, so dialing it is wasted radio time that also blanks page scan
-        during the very window it is trying to page us in. It is only known
-        after the first successful SDP query, so a device is dialed until it
-        tells us not to, which is the safe bootstrap order. Set
-        `classic.trust_reconnect_initiate = false` to ignore it for firmware
-        that declares true but never actually reconnects.
+        so dialing it wastes radio-lock time and HCI churn on a link the peer
+        would have established itself. (It does NOT blank page scan — the
+        Classic dial only ever turns page scan on; the sole caller of
+        `_set_classic_page_scan(False)` is `_ble_initiate`.)
+
+        The declaration alone is not enough to act on: firmware can claim it
+        without implementing it, and dropping such a device from the dial list
+        would strand it, since the only evidence of the mistake is the inbound
+        connection it is failing to make. So it must ALSO have been observed
+        paging us at least once (`seen_inbound`, written only from the inbound
+        connection-request handler). First contact is normally a dial, so a
+        device converges to connect-on-demand after its first self-initiated
+        reconnect, not before. `classic.trust_reconnect_initiate = false`
+        ignores the declaration entirely.
 
         Then the configured `classic.passive_names` list (matched by this
         device's own name or address), which works as a manual override.
@@ -1117,6 +1137,7 @@ class HIDHost(ClassicMixin, BLEMixin):
         if (
             config.classic_trust_reconnect_initiate
             and self.device_cache.get_reconnect_initiate(address) is True
+            and self.device_cache.get_seen_inbound(address) is True
         ):
             return True
         names = config.classic_passive_names
@@ -1212,7 +1233,22 @@ class HIDHost(ClassicMixin, BLEMixin):
                 dev.address for dev in self.classic_devices
                 if dev.address != '*' and not self._classic_is_passive(dev.address, dev.name)
             ]
-            if has_classic_listener and active_addresses:
+            if has_classic_listener:
+                if not active_addresses:
+                    # Every configured device is connect-on-demand, so there
+                    # is nothing to dial — and the inbound path is already
+                    # live: page scan is up and the connection listener is
+                    # registered. Re-running _run_classic_handler here would
+                    # construct a second BumbleHIDHost on the same Device,
+                    # which raises 'PSM already in use' from L2CAP *after*
+                    # that function has already cleared both listeners,
+                    # leaving Classic permanently deaf while the daemon still
+                    # reports healthy.
+                    log.info(
+                        "[Classic] Nothing to restore: all configured devices "
+                        "are connect-on-demand and page scan is already up"
+                    )
+                    return
                 coro = self._classic_active_connect_loop(active_addresses)
             else:
                 coro = self._run_classic_handler()
