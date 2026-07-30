@@ -159,9 +159,15 @@ devices:
 edit-devices:
     ssh {{host}} "vi {{remote_dir}}/devices.conf"
 
+# The device has no python3 on PATH, so the old pipe through `python3 -m json.tool`
+# always fell through to "No pairing keys". Pretty-print with the bundled
+# interpreter the daemon itself runs under.
+#
 # Show pairing keys
 keys:
-    @ssh {{host}} "cat {{remote_dir}}/cache/pairing_keys.json 2>/dev/null | python3 -m json.tool || echo 'No pairing keys'"
+    @ssh {{host}} '{{remote_python}}; [ -f {{remote_dir}}/cache/pairing_keys.json ] \
+        && "$PY" -m json.tool {{remote_dir}}/cache/pairing_keys.json \
+        || echo "No pairing keys"'
 
 # SSH into Kindle
 ssh:
