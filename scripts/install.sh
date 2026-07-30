@@ -90,6 +90,7 @@ installKOReaderPlugin()
     return
   fi
   echo " -> Installing KOReader plugin"
+  rm -rf /mnt/us/koreader/plugins/hidpassthrough.koplugin
   cp -r koreader-plugin/hidpassthrough.koplugin /mnt/us/koreader/plugins/hidpassthrough.koplugin
   echo " -> Ready."
 }
