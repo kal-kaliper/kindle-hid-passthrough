@@ -186,6 +186,11 @@ class ClassicMixin:
         self._classic_connection_request_listener = on_connection_request
         self.device.host.on('connection_request', on_connection_request)
 
+        keeper = asyncio.create_task(
+            self._classic_page_scan_keeper(), name="classic_page_scan_keeper")
+        self._connection_tasks.add(keeper)
+        keeper.add_done_callback(self._connection_tasks.discard)
+
         configured_addresses = [d.address for d in self.classic_devices if d.address != '*']
         passive_addresses = [
             d.address for d in self.classic_devices
@@ -476,9 +481,14 @@ class ClassicMixin:
                         await asyncio.sleep(backoff)
 
                 if not self._is_protocol_connected(Protocol.CLASSIC):
-                    # Leave page scan on while idle so a keyboard that
-                    # reconnects by itself is accepted without another dial.
-                    await self._set_classic_page_scan(True)
+                    # Re-assert page scan on every idle cycle, forced. This used
+                    # to happen for free: before the idle-probe backoff, a host
+                    # with no device was torn down and rebuilt every 60s, which
+                    # re-issued this command constantly. Removing that churn left
+                    # page scan asserted once at startup, and an inbound-only
+                    # device then became permanently unreachable once anything
+                    # clobbered the register.
+                    await self._set_classic_page_scan(True, force=True)
                     await asyncio.sleep(
                         self._next_idle_probe_delay(Protocol.CLASSIC)
                     )
@@ -495,8 +505,38 @@ class ClassicMixin:
             delays.append(delay)
         return min(delays) if delays else 0.0
 
-    async def _set_classic_page_scan(self, enabled: bool):
-        if self._classic_page_scan_enabled == enabled:
+    async def _classic_page_scan_keeper(self):
+        """Periodically re-assert page scan while no Classic session is live.
+
+        Page scan is the only route in for a connect-on-demand device, and a
+        single assertion at host start is not durable: bumble owns this register
+        too, and there is no read-back to detect divergence. Until the idle-probe
+        backoff landed, a host with no device was rebuilt every 60s and re-issued
+        the command constantly, which hid this. The active-connect loop also
+        re-asserts, but it never starts when every configured device is passive,
+        which is exactly the phone-as-keyboard case.
+
+        Skipped while the radio lock is held, so this cannot re-enable page scan
+        inside a BLE initiate window that deliberately paused it.
+        """
+        while True:
+            await asyncio.sleep(self.CLASSIC_PAGE_SCAN_REASSERT_INTERVAL)
+            if self._is_protocol_connected(Protocol.CLASSIC):
+                continue
+            if self._radio_lock is not None and self._radio_lock.locked():
+                continue
+            try:
+                await self._set_classic_page_scan(True, force=True)
+            except Exception as e:
+                log.debug(f"[Classic] Page scan re-assert failed: {e!r}")
+
+    async def _set_classic_page_scan(self, enabled: bool, force: bool = False):
+        # force=True re-issues the command even when our tracked flag already
+        # agrees. The flag is an assumption, not a measurement: bumble also owns
+        # this register (set_discoverable/set_connectable recompute the whole byte
+        # from its own flags) and there is no HCI_Read_Scan_Enable to check with,
+        # so a single assertion at startup is not durable.
+        if not force and self._classic_page_scan_enabled == enabled:
             return
         scan_enable = 0x02 if enabled else 0x00
         action = "Enabling" if enabled else "Disabling"

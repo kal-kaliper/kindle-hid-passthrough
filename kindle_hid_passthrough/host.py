@@ -93,6 +93,9 @@ class HIDHost(ClassicMixin, BLEMixin):
     IDLE_PROBE_INITIAL_DELAY = 60.0
     IDLE_PROBE_MAX_DELAY = 300.0
     CLASSIC_BACKOFF_POLL_INTERVAL = 30.0
+    # One HCI command per interval; cheap enough to be frequent, and the ceiling
+    # on how long an inbound-only device stays unreachable if page scan is lost.
+    CLASSIC_PAGE_SCAN_REASSERT_INTERVAL = 30.0
     ACTIVE_CONNECT_TIMEOUT = 10
     CLASSIC_AUTH_RETRY_DELAY = 8.0
     CLASSIC_AUTH_RETRY_DELAY_WITH_PENDING_BLE = 20.0
