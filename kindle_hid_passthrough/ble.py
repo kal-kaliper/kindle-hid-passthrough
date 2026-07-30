@@ -560,9 +560,13 @@ class BLEMixin:
             # unobserved and (b) invited a catch-and-reawait that could stall
             # shutdown up to 10s per command on a dead controller. Releasing
             # the lock with an HCI cancel possibly still in flight is
-            # acceptable: bumble writes the packet synchronously before
-            # awaiting, and every caller that cancels this function is host
-            # teardown, followed by transport close and a fresh HCI Reset.
+            # acceptable, but NOT because the write already happened: bumble
+            # awaits command_semaphore.acquire() before send_hci_packet, so a
+            # cancel on a contended semaphore means the cancel command never
+            # reaches the controller at all. What makes it safe is that every
+            # caller which cancels this function is host teardown, followed by
+            # transport close and a fresh HCI Reset, which clears any orphaned
+            # create-connection regardless.
             log.info(
                 f"[Radio] BLE initiate ({mode}): held lock for "
                 f"{asyncio.get_running_loop().time() - radio_started:.2f}s"

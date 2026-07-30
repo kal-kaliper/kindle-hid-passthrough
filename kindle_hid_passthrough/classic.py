@@ -385,6 +385,12 @@ class ClassicMixin:
             log.info("[Classic] Active connect loop already running")
             return
         self._classic_active_connect_task = current_task
+        # Recorded so the keeper's re-evaluation can tell whether a running
+        # loop already covers a device whose evidence has since expired. A
+        # loop dials only the list it was started with, for its whole run.
+        self._classic_active_connect_addresses = [
+            normalize_addr(a) for a in addresses
+        ]
         log.info(f"[Classic] Active: {len(addresses)} device(s)")
 
         try:
@@ -568,9 +574,6 @@ class ClassicMixin:
         second device's evidence expires after an unrelated device is
         already being actively dialed.
         """
-        existing = getattr(self, "_classic_active_connect_task", None)
-        if existing and not existing.done():
-            return
         if not self.classic_devices:
             return
         active_addresses = [
@@ -579,11 +582,32 @@ class ClassicMixin:
         ]
         if not active_addresses:
             return
-        log.info(
-            "[Classic] Seen-inbound evidence expired for a previously "
-            "passive device; resuming active dialing for: "
-            f"{[self._format_device(a) for a in active_addresses]}"
-        )
+
+        existing = getattr(self, "_classic_active_connect_task", None)
+        if existing and not existing.done():
+            # A loop is running, but it dials only the fixed list it started
+            # with. If a device has since become active — its seen-inbound
+            # evidence expired — that loop will never reach it, and because it
+            # runs until a Classic session exists, an absent device keeps it
+            # alive indefinitely. So the newly-active device would never be
+            # dialed at all, not merely dialed late. Restart with the wider
+            # list when, and only when, the set has actually grown.
+            covered = set(getattr(self, "_classic_active_connect_addresses", []))
+            wanted = {normalize_addr(a) for a in active_addresses}
+            if wanted <= covered:
+                return
+            log.info(
+                "[Classic] Active device set grew to "
+                f"{[self._format_device(a) for a in active_addresses]}; "
+                "restarting the dial loop to cover it"
+            )
+            existing.cancel()
+        else:
+            log.info(
+                "[Classic] Nothing dialing and "
+                f"{[self._format_device(a) for a in active_addresses]} "
+                "is no longer connect-on-demand; starting the dial loop"
+            )
         task = asyncio.create_task(
             self._classic_active_connect_loop(active_addresses),
             name="classic_active_connect_loop_reeval",
@@ -1124,7 +1148,7 @@ class ClassicMixin:
         self._classic_set_report_protocol()
 
         if config.classic_require_live_descriptor:
-            # _pair_classic (above, ~line 885) already ran this same query
+            # _pair_classic (above, in this same file) already ran this same query
             # live, seconds ago, on this same link, and left its tri-state
             # result in self._classic_pairing_sdp_live. Calling
             # _handle_classic_connection here -- the obvious-looking fix --

@@ -195,7 +195,7 @@ install_bumble_stubs()
 
 from bumble.hci import Address  # noqa: E402
 from classic import FALLBACK_HID_DESCRIPTOR  # noqa: E402
-from config import Protocol, config  # noqa: E402
+from config import Protocol, config, normalize_addr  # noqa: E402
 from controller import DaemonController  # noqa: E402
 from daemon import HIDDaemon  # noqa: E402
 from host import DeviceConfig, DeviceSession, HIDHost  # noqa: E402
@@ -2444,6 +2444,64 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         called = asyncio.run(scenario())
 
         self.assertEqual([], called)
+
+    def test_expiry_widens_a_dial_loop_that_is_already_running_for_another_device(self):
+        # The partial-dial gap. A running loop dials only the fixed list it
+        # started with, and it exits only once a Classic session exists -- so
+        # an absent active device keeps it alive forever. A second device whose
+        # seen-inbound evidence expires later would therefore never be dialed
+        # at all, not merely dialed late. The hook must widen the loop, and
+        # must NOT churn it when the set has not actually grown.
+        other = "AA:BB:CC:DD:EE:FF"
+
+        async def scenario():
+            host = self.make_host()
+            host.classic_devices = [
+                DeviceConfig(other, Protocol.CLASSIC, "Absent Keyboard"),
+                DeviceConfig(self.ADDR, Protocol.CLASSIC, "Paging Keyboard"),
+            ]
+            # self.ADDR is passive on fresh evidence.
+            host.device_cache.set_reconnect_initiate(self.ADDR, True)
+            host.device_cache.set_seen_inbound(self.ADDR, True)
+
+            started = []
+
+            async def fake_loop(addresses):
+                started.append(list(addresses))
+                await asyncio.sleep(3600)
+
+            host._classic_active_connect_loop = fake_loop
+
+            # A loop is already running for the absent device only.
+            running = asyncio.create_task(fake_loop([other]))
+            host._classic_active_connect_task = running
+            host._classic_active_connect_addresses = [normalize_addr(other)]
+            await asyncio.sleep(0)
+
+            # Set has not grown: must be left alone.
+            host._classic_maybe_start_active_dialing()
+            await asyncio.sleep(0)
+            unchanged = (len(started), running.cancelled())
+
+            # Now age the evidence so self.ADDR becomes active too.
+            stale = time.time() - host.CLASSIC_SEEN_INBOUND_TTL_SECONDS - 60
+            host.device_cache.set_seen_inbound_at(self.ADDR, stale)
+            self.assertFalse(host._classic_is_passive(self.ADDR))
+
+            host._classic_maybe_start_active_dialing()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return unchanged, started, running
+
+        unchanged, started, running = asyncio.run(scenario())
+
+        self.assertEqual((1, False), unchanged, "loop churned with no new device")
+        self.assertEqual(2, len(started), "loop was not widened for the new device")
+        self.assertEqual(
+            {normalize_addr(other), normalize_addr(self.ADDR)},
+            {normalize_addr(a) for a in started[-1]},
+        )
+        self.assertTrue(running.cancelled() or running.done())
 
     def test_keeper_starts_dialing_when_seen_inbound_evidence_expires_on_a_live_host(self):
         # Item B (hole 1), the fatal one: the passive/active split is
