@@ -845,12 +845,18 @@ class HIDHost(ClassicMixin, BLEMixin):
             reports.append(release)
         return tuple(reports)
 
-    def _serialize_keyboard_reports(self, session: DeviceSession) -> bool:
+    def _serialize_mode(self, session: DeviceSession) -> Optional[str]:
+        """This session's configured serialization mode, or None if the
+        protocol has no such setting."""
         if session.protocol == Protocol.BLE:
-            mode = config.ble_serialize_keyboard_reports_mode
-        elif session.protocol == Protocol.CLASSIC:
-            mode = config.classic_serialize_keyboard_reports_mode
-        else:
+            return config.ble_serialize_keyboard_reports_mode
+        if session.protocol == Protocol.CLASSIC:
+            return config.classic_serialize_keyboard_reports_mode
+        return None
+
+    def _serialize_keyboard_reports(self, session: DeviceSession) -> bool:
+        mode = self._serialize_mode(session)
+        if mode is None:
             return False
         if mode == 'always':
             return True
@@ -1000,6 +1006,15 @@ class HIDHost(ClassicMixin, BLEMixin):
             f"address={session.address}, name={session.device_name}, "
             f"has_uhid={bool(session.uhid_device)}, live={self._live_protocols()}"
         )
+        # Stated once per session because it is otherwise unanswerable from a
+        # log: report counts are 1:1 whether serialization is on or off for a
+        # device that sends clean press/release pairs, so the counters cannot
+        # be used to infer it after the fact.
+        log.info(
+            f"[{protocol.value.upper()}] Keyboard reports "
+            f"{'serialized into taps' if self._serialize_keyboard_reports(session) else 'forwarded unmodified'}"
+            f" (mode={self._serialize_mode(session)}, is_phone={session.is_phone})"
+        )
         if self._connection_future and not self._connection_future.done():
             self._connection_future.set_result(session)
 
@@ -1069,10 +1084,21 @@ class HIDHost(ClassicMixin, BLEMixin):
         dialed and never auto-restored after an idle drop, but still
         accepted whenever it initiates the connection (page-scan stays on).
 
-        Primary signal is the configured `classic.passive_names` list
-        (matched by this device's own name or address), which still works as
-        a manual override. Belt-and-suspenders: also treat a device as
-        passive if the device-class cache has resolved it as a phone.
+        Three signals, any of which is sufficient.
+
+        The device's own SDP declaration is the authoritative one:
+        HIDReconnectInitiate (0x0205) true means it re-establishes the link
+        itself, so dialing it is wasted radio time that also blanks page scan
+        during the very window it is trying to page us in. It is only known
+        after the first successful SDP query, so a device is dialed until it
+        tells us not to, which is the safe bootstrap order. Set
+        `classic.trust_reconnect_initiate = false` to ignore it for firmware
+        that declares true but never actually reconnects.
+
+        Then the configured `classic.passive_names` list (matched by this
+        device's own name or address), which works as a manual override.
+        Belt-and-suspenders: also treat a device as passive if the
+        device-class cache has resolved it as a phone.
         `is_phone` is populated by the manual-scan flow
         (`device_cache.set_class()` in controller.py) and, live, by
         `classic.py`'s `on_connection_request` handler, which reads the
@@ -1088,6 +1114,11 @@ class HIDHost(ClassicMixin, BLEMixin):
         onto another in the multi-device dial loop, silently making a real
         keyboard passive. The match is scoped to this address's identifiers.
         """
+        if (
+            config.classic_trust_reconnect_initiate
+            and self.device_cache.get_reconnect_initiate(address) is True
+        ):
+            return True
         names = config.classic_passive_names
         if names:
             normalized = {

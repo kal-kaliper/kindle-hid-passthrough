@@ -20,6 +20,11 @@ from config import Protocol, config, normalize_addr
 from logging_utils import log
 from scanner import classic_cod_is_phone
 
+# HID SDP service attribute: the device's own declaration of whether it
+# re-establishes the link after an idle disconnect. True means it pages the
+# host, so the host only has to stay page-scannable rather than dial out.
+SDP_HID_RECONNECT_INITIATE = 0x0205
+
 FALLBACK_HID_DESCRIPTOR = bytes([
     0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x01,
     0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35,
@@ -652,6 +657,23 @@ class ClassicMixin:
             self._finalize_classic_hid()
         return True
 
+    @staticmethod
+    def _parse_sdp_boolean(data_element):
+        """Unwrap an SDP boolean attribute, or None if it is not one.
+
+        Returns None rather than False for anything unrecognised: "the device
+        did not tell us" and "the device told us no" lead to opposite dial
+        decisions, so they must not collapse into the same value.
+        """
+        value = getattr(data_element, 'value', data_element)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return value != 0
+        if isinstance(value, (bytes, bytearray)):
+            return any(value) if value else None
+        return None
+
     def _parse_hid_descriptor_list(self, data_element):
         """Parse HID Descriptor List from SDP."""
         try:
@@ -817,7 +839,7 @@ class ClassicMixin:
                 result = await asyncio.wait_for(
                     sdp_client.search_attributes(
                         [BT_HUMAN_INTERFACE_DEVICE_SERVICE],
-                        [0x0100, 0x0206]
+                        [0x0100, SDP_HID_RECONNECT_INITIATE, 0x0206]
                     ),
                     timeout=10.0
                 )
@@ -827,11 +849,17 @@ class ClassicMixin:
                 except Exception:
                     pass
 
+            reconnect_initiate = None
             if result:
                 for record in result:
                     for attr in record:
                         if hasattr(attr, 'id') and attr.id == 0x0206:
                             self._parse_hid_descriptor_list(attr.value)
+                        elif (hasattr(attr, 'id')
+                                and attr.id == SDP_HID_RECONNECT_INITIATE):
+                            parsed = self._parse_sdp_boolean(attr.value)
+                            if parsed is not None:
+                                reconnect_initiate = parsed
                         elif hasattr(attr, 'id') and attr.id == 0x0100:
                             try:
                                 name = attr.value.value
@@ -840,6 +868,19 @@ class ClassicMixin:
                                 self.device_name = str(name)
                             except Exception:
                                 pass
+
+            # Recorded before the descriptor check: a device that answers SDP
+            # but offers no usable report map has still told us who dials, and
+            # that answer is what keeps us off the radio next time.
+            if reconnect_initiate is not None:
+                self.device_cache.set_reconnect_initiate(
+                    address, reconnect_initiate)
+                log.info(
+                    f"[Classic] {self._format_device(address)} declares "
+                    f"reconnect_initiate={reconnect_initiate}"
+                    + ("; it will page us, so we will not dial it"
+                       if reconnect_initiate else "; we must dial it")
+                )
 
             if self.report_map:
                 self.device_cache.save(address, {

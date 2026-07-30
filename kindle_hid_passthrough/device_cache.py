@@ -14,6 +14,12 @@ logger = logging.getLogger(__name__)
 class DeviceCache:
     """Manages caching of device data for fast reconnection"""
 
+    # Facts learned from a different source than the report map — inquiry
+    # device class, SDP service attributes — and on their own schedule. A
+    # descriptor re-cache passes only report_map/device_name, so without
+    # carrying these across they would be dropped on every reconnect.
+    STICKY_KEYS = ('is_phone', 'reconnect_initiate')
+
     def __init__(self, cache_dir: str):
         """Initialize cache manager
 
@@ -84,10 +90,14 @@ class DeviceCache:
             True if saved successfully, False otherwise
         """
         try:
-            if 'is_phone' not in cache_data:
-                existing = self._read_raw(address)
-                if 'is_phone' in existing:
-                    cache_data = {**cache_data, 'is_phone': existing['is_phone']}
+            existing = None
+            for key in self.STICKY_KEYS:
+                if key in cache_data:
+                    continue
+                if existing is None:
+                    existing = self._read_raw(address)
+                if key in existing:
+                    cache_data = {**cache_data, key: existing[key]}
 
             cache_path = self._get_cache_path(address)
             with open(cache_path, 'w') as f:
@@ -128,6 +138,24 @@ class DeviceCache:
     def get_is_phone(self, address: str) -> Optional[bool]:
         """Return cached is_phone for a device, or None if unknown."""
         return self._read_raw(address).get('is_phone')
+
+    def set_reconnect_initiate(self, address: str, value: bool) -> bool:
+        """Record whether a device reconnects to the host on its own.
+
+        Read from the HID SDP record (HIDReconnectInitiate, 0x0205), which is
+        the device's own declaration of who re-establishes the link after an
+        idle disconnect. Persisted because SDP is only queried during setup,
+        while the dial decision has to be made when nothing is connected.
+        """
+        data = self._read_raw(address)
+        if data.get('reconnect_initiate') == value:
+            return True
+        data['reconnect_initiate'] = value
+        return self.save(address, data)
+
+    def get_reconnect_initiate(self, address: str) -> Optional[bool]:
+        """Return cached reconnect_initiate, or None if never read."""
+        return self._read_raw(address).get('reconnect_initiate')
 
     def clear(self, address: Optional[str] = None) -> int:
         """Clear cache for specific device or all devices.

@@ -817,6 +817,16 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self._old_passive_names = config.classic_passive_names
         self._old_include_reports = config.diagnostics_include_reports
         self._old_ble_remap_home = config.ble_remap_consumer_home_to_escape
+        self._old_trust_reconnect = config.classic_trust_reconnect_initiate
+        self._old_max_dark = config.classic_page_scan_max_dark
+        self._old_dwell = config.classic_page_scan_dwell
+        self._old_pause_page_scan = config.ble_pause_classic_page_scan
+        config.classic_trust_reconnect_initiate = True
+        config.classic_page_scan_max_dark = 2.0
+        # Zero so slicing tests exercise the loop without real sleeps; the
+        # dwell length itself is asserted by overriding this per test.
+        config.classic_page_scan_dwell = 0.0
+        config.ble_pause_classic_page_scan = True
         config.classic_serialize_keyboard_reports_mode = 'always'
         config.classic_serialized_report_delay_ms = 0
         config.classic_keyboard_modifier_mask = 0xff
@@ -843,6 +853,10 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         config.classic_passive_names = self._old_passive_names
         config.diagnostics_include_reports = self._old_include_reports
         config.ble_remap_consumer_home_to_escape = self._old_ble_remap_home
+        config.classic_trust_reconnect_initiate = self._old_trust_reconnect
+        config.classic_page_scan_max_dark = self._old_max_dark
+        config.classic_page_scan_dwell = self._old_dwell
+        config.ble_pause_classic_page_scan = self._old_pause_page_scan
 
     def make_host(self):
         cache_dir = tempfile.mkdtemp(prefix="hid-host-test-")
@@ -1734,6 +1748,66 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         self.assertFalse(host._classic_is_passive(self.ADDR))
         self.assertFalse(host._classic_is_passive("AA:BB:CC:DD:EE:FF"))
 
+    def test_classic_is_passive_when_device_declares_reconnect_initiate(self):
+        # The device's own SDP declaration: it pages the host, so dialing it
+        # is wasted radio time during the window it is trying to reach us in.
+        host = self.make_host()
+        host.device_cache.set_reconnect_initiate(self.ADDR, True)
+
+        self.assertTrue(host._classic_is_passive(self.ADDR))
+
+    def test_classic_still_dialed_when_reconnect_initiate_is_false(self):
+        host = self.make_host()
+        host.device_cache.set_reconnect_initiate(self.ADDR, False)
+
+        self.assertFalse(host._classic_is_passive(self.ADDR))
+
+    def test_classic_still_dialed_when_reconnect_initiate_unknown(self):
+        # Bootstrap order: SDP is only readable once connected, so a device is
+        # dialed until it has told us not to.
+        host = self.make_host()
+
+        self.assertIsNone(host.device_cache.get_reconnect_initiate(self.ADDR))
+        self.assertFalse(host._classic_is_passive(self.ADDR))
+
+    def test_reconnect_initiate_can_be_distrusted(self):
+        # Escape hatch for firmware that declares true but never reconnects.
+        config.classic_trust_reconnect_initiate = False
+        host = self.make_host()
+        host.device_cache.set_reconnect_initiate(self.ADDR, True)
+
+        self.assertFalse(host._classic_is_passive(self.ADDR))
+
+    def test_reconnect_initiate_survives_a_descriptor_recache(self):
+        # Regression: a descriptor re-cache passes only report_map/device_name.
+        # Without sticky-key preservation the dial decision would silently
+        # revert to "dial it" on every reconnect.
+        host = self.make_host()
+        host.device_cache.set_reconnect_initiate(self.ADDR, True)
+        host.device_cache.set_class(self.ADDR, True)
+
+        host.device_cache.save(self.ADDR, {
+            'report_map': 'aabb',
+            'device_name': 'Example Keyboard',
+        })
+
+        self.assertTrue(host.device_cache.get_reconnect_initiate(self.ADDR))
+        self.assertTrue(host.device_cache.get_is_phone(self.ADDR))
+
+    def test_parse_sdp_boolean_distinguishes_false_from_absent(self):
+        # "did not tell us" and "told us no" drive opposite dial decisions and
+        # must not collapse to the same value.
+        host = self.make_host()
+
+        self.assertIs(True, host._parse_sdp_boolean(types.SimpleNamespace(value=True)))
+        self.assertIs(False, host._parse_sdp_boolean(types.SimpleNamespace(value=False)))
+        self.assertIs(True, host._parse_sdp_boolean(types.SimpleNamespace(value=1)))
+        self.assertIs(False, host._parse_sdp_boolean(types.SimpleNamespace(value=0)))
+        self.assertIs(True, host._parse_sdp_boolean(types.SimpleNamespace(value=b'\x01')))
+        self.assertIs(False, host._parse_sdp_boolean(types.SimpleNamespace(value=b'\x00')))
+        self.assertIsNone(host._parse_sdp_boolean(types.SimpleNamespace(value='yes')))
+        self.assertIsNone(host._parse_sdp_boolean(types.SimpleNamespace(value=None)))
+
     def test_classic_is_passive_ignores_stale_global_device_name(self):
         # Regression: _classic_is_passive must not consult the global
         # self.device_name (the last-connected device's name). Otherwise, once
@@ -2199,6 +2273,107 @@ class PhoneHidBehaviorTests(unittest.TestCase):
             host.device.commands,
         )
         self.assertFalse(host.device.le_connecting)
+
+    def test_ble_sliced_bounds_how_long_page_scan_stays_dark(self):
+        # A keyboard wakes on a keypress and pages for a few seconds at most,
+        # so one long dark window loses the entire burst, not part of it.
+        config.classic_page_scan_max_dark = 0.02
+
+        async def scenario():
+            host = self.make_host()
+            windows = []
+
+            async def run(window):
+                windows.append(window)
+                await asyncio.sleep(window)
+                return None
+
+            result = await host._ble_sliced(0.1, run)
+            return host, windows, result
+
+        host, windows, result = asyncio.run(scenario())
+
+        self.assertIsNone(result)
+        self.assertTrue(host._ble_should_pause_classic_page_scan())
+        self.assertGreater(len(windows), 1)
+        self.assertTrue(all(w <= 0.02 + 1e-9 for w in windows), windows)
+        self.assertLessEqual(sum(windows), 0.1 + 1e-6)
+
+    def test_ble_sliced_leaves_page_scan_up_between_slices(self):
+        # The dwell is the whole point: page scan being restored for a moment
+        # is what gives an inbound page somewhere to land.
+        config.classic_page_scan_max_dark = 0.02
+        config.classic_page_scan_dwell = 0.05
+
+        async def scenario():
+            host = self.make_host()
+            gaps = []
+            last_end = None
+
+            async def run(window):
+                nonlocal last_end
+                loop = asyncio.get_running_loop()
+                if last_end is not None:
+                    gaps.append(loop.time() - last_end)
+                await asyncio.sleep(window)
+                last_end = loop.time()
+                return None
+
+            await host._ble_sliced(0.2, run)
+            return gaps
+
+        gaps = asyncio.run(scenario())
+
+        self.assertTrue(gaps)
+        self.assertTrue(all(g >= 0.04 for g in gaps), gaps)
+
+    def test_ble_sliced_returns_as_soon_as_a_slice_connects(self):
+        config.classic_page_scan_max_dark = 0.02
+
+        async def scenario():
+            host = self.make_host()
+            windows = []
+
+            async def run(window):
+                windows.append(window)
+                await asyncio.sleep(window)
+                return "connection" if len(windows) == 2 else None
+
+            result = await host._ble_sliced(1.0, run)
+            return windows, result
+
+        windows, result = asyncio.run(scenario())
+
+        self.assertEqual("connection", result)
+        self.assertEqual(2, len(windows))
+
+    def test_ble_sliced_does_not_slice_when_page_scan_stays_up(self):
+        # Nothing is being blanked, so one long window is strictly better for
+        # BLE. The yield-to-classic cap must still apply to that window.
+        config.ble_pause_classic_page_scan = False
+
+        async def scenario():
+            host = self.make_host()
+            windows = []
+
+            async def run(window):
+                windows.append(window)
+                return "connection"
+
+            result = await host._ble_sliced(host.BLE_INIT_WINDOW, run)
+            return host, windows, result
+
+        host, windows, result = asyncio.run(scenario())
+
+        self.assertEqual("connection", result)
+        self.assertEqual([host.BLE_CLASSIC_IDLE_WINDOW], windows)
+
+    def test_page_scan_pause_can_be_disabled(self):
+        host = self.make_host()
+        self.assertTrue(host._ble_should_pause_classic_page_scan())
+
+        config.ble_pause_classic_page_scan = False
+        self.assertFalse(host._ble_should_pause_classic_page_scan())
 
     def test_ble_uses_frequent_windows_when_classic_is_only_configured(self):
         host = self.make_host()

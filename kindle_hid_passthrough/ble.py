@@ -80,7 +80,10 @@ class BLEMixin:
                 matched_dev = None
                 match_kind = None
 
-                connection = await self._ble_initiate(self.BLE_INIT_WINDOW)
+                connection = await self._ble_sliced(
+                    self.BLE_INIT_WINDOW,
+                    lambda w: self._ble_initiate(w),
+                )
                 if connection is not None:
                     if await self._reject_unconfigured_ble_connection(
                         connection, matched_dev
@@ -90,11 +93,16 @@ class BLEMixin:
                         continue
                     break
 
+                # Not sliced: rotation scan never blanks page scan (the only
+                # _set_classic_page_scan(False) is in _ble_initiate), so
+                # slicing it would buy nothing and churn start/stop_scanning.
                 match = await self._ble_scan_for_rotated(known, self.BLE_SCAN_WINDOW)
                 if match:
                     target_address, matched_dev, match_kind = match
-                    connection = await self._ble_initiate(
-                        config.connect_timeout, peer=target_address)
+                    connection = await self._ble_sliced(
+                        config.connect_timeout,
+                        lambda w, p=target_address: self._ble_initiate(w, peer=p),
+                    )
                     if (
                         connection is not None
                         and await self._reject_unconfigured_ble_connection(
@@ -225,6 +233,16 @@ class BLEMixin:
         return 0.0
 
     def _ble_should_pause_classic_page_scan(self) -> bool:
+        """Whether this radio hold should blank Classic page scan.
+
+        Note the shape of the condition: it is true precisely when a Classic
+        device is configured and NOT connected — which is the state in which
+        that device may be paging us. Blanking page scan then is the worst
+        possible timing, so callers must bound how long they stay dark
+        (`_ble_radio_slice`) rather than holding for a whole window.
+        """
+        if not config.ble_pause_classic_page_scan:
+            return False
         return bool(
             self.classic_devices
             and not self._is_protocol_connected(Protocol.CLASSIC)
@@ -249,6 +267,49 @@ class BLEMixin:
                 return
             if updated_delay < remaining:
                 deadline = loop.time() + updated_delay
+
+    async def _ble_sliced(self, total_window: float, run):
+        """Run `run(window)` in slices so Classic page scan is never dark for
+        more than one slice, restoring it between them.
+
+        A keyboard wakes on a keypress and pages for a few seconds at most.
+        Holding the radio for a whole window means an inbound page burst is
+        lost in its entirety, and the user sees a dead keyboard; slicing costs
+        one extra create-connection/cancel per slice and bounds that loss to a
+        single slice instead.
+
+        Skipped entirely when page scan is not being blanked anyway — one long
+        window is strictly better for BLE when nothing is waiting to page us.
+        """
+        total_window = self._ble_window_for_radio_state(total_window)
+        if not self._ble_should_pause_classic_page_scan():
+            return await run(total_window)
+
+        # Floor only guards against a zero/negative config value spinning this
+        # loop; it must stay well below any sane page_scan_max_dark.
+        slice_window = max(0.01, config.classic_page_scan_max_dark)
+        dwell = max(0.0, config.classic_page_scan_dwell)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + total_window
+        first = True
+
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None
+
+            if not first and dwell > 0:
+                # `run` restored page scan in its finally before returning, so
+                # the host is pageable for the whole of this sleep.
+                await asyncio.sleep(min(dwell, remaining))
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return None
+            first = False
+
+            result = await run(min(slice_window, remaining))
+            if result is not None:
+                return result
 
     async def _ble_initiate(self, window: float, peer: Address = None):
         """Legacy create-connection to `peer`, or to the accept list when
