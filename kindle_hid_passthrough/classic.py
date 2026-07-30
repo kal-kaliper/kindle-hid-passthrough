@@ -11,7 +11,6 @@ from bumble.hci import (
     Address,
     HCI_Exit_Sniff_Mode_Command,
     HCI_Write_Link_Policy_Settings_Command,
-    HCI_Write_Scan_Enable_Command,
 )
 from bumble.hid import HID_CONTROL_PSM, HID_INTERRUPT_PSM, Message
 from bumble.hid import Host as BumbleHIDHost
@@ -538,13 +537,13 @@ class ClassicMixin:
         # so a single assertion at startup is not durable.
         if not force and self._classic_page_scan_enabled == enabled:
             return
-        scan_enable = 0x02 if enabled else 0x00
         action = "Enabling" if enabled else "Disabling"
         log.info(f"[Classic] {action} Page Scan...")
-        await self.device.host.send_command(
-            HCI_Write_Scan_Enable_Command(scan_enable=scan_enable),
-            check_result=True
-        )
+        # set_connectable keeps device.connectable in step and recomputes the
+        # register from it plus device.discoverable, so bumble's view and the
+        # controller cannot drift apart. Writing the raw command here instead left
+        # bumble believing something different from what the controller held.
+        await self.device.set_connectable(enabled)
         self._classic_page_scan_enabled = enabled
 
     async def _classic_disable_low_power(self, connection):

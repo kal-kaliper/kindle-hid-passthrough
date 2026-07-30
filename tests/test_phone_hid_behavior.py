@@ -275,7 +275,14 @@ class FakeUhidDevice:
 
 
 class FakeBleDevice:
+    async def set_connectable(self, connectable=True):
+        self.connectable = connectable
+        self.scan_enable_writes.append(0x02 if connectable else 0x00)
+
     def __init__(self, on_create=None):
+        self.connectable = True
+        self.discoverable = False
+        self.scan_enable_writes = []
         self.commands = []
         self.listeners = {}
         self.le_connecting = False
@@ -339,6 +346,23 @@ class FakeClassicDevice:
         self.host = FakeClassicController()
         self.le_connecting = False
         self._listeners = {}
+        # Mirrors bumble: set_connectable keeps `connectable` in step and the
+        # scan-enable byte is derived from it plus `discoverable`.
+        self.connectable = True
+        self.discoverable = False
+        self.scan_enable_writes = []
+
+    async def set_connectable(self, connectable=True):
+        self.connectable = connectable
+        if self.discoverable and self.connectable:
+            byte = 0x03
+        elif self.connectable:
+            byte = 0x02
+        elif self.discoverable:
+            byte = 0x01
+        else:
+            byte = 0x00
+        self.scan_enable_writes.append(byte)
 
     def on(self, event, handler):
         self._listeners[event] = handler
@@ -2123,11 +2147,11 @@ class PhoneHidBehaviorTests(unittest.TestCase):
                 await task
             except asyncio.CancelledError:
                 pass
-            return host.device.host.commands
+            return host.device.scan_enable_writes
 
-        commands = asyncio.run(scenario())
+        writes = asyncio.run(scenario())
 
-        self.assertEqual(0x02, commands[0].kwargs["scan_enable"])
+        self.assertEqual(0x02, writes[0])
 
     def test_classic_active_loop_waits_for_ble_initiate(self):
         async def scenario():
@@ -2236,14 +2260,12 @@ class PhoneHidBehaviorTests(unittest.TestCase):
         host, result = asyncio.run(scenario())
 
         self.assertIsNone(result)
-        self.assertEqual(
-            [0x00, 0x02],
-            [
-                command.kwargs["scan_enable"]
-                for command in host.device.host.commands
-            ],
-        )
+        # Paused then restored. Asserted on the resulting scan-enable byte rather
+        # than on raw HCI writes: the register is owned through bumble's
+        # set_connectable now, so bumble's own state stays in step with it.
+        self.assertEqual([0x00, 0x02], host.device.scan_enable_writes)
         self.assertTrue(host._classic_page_scan_enabled)
+        self.assertTrue(host.device.connectable)
 
     def test_ble_restore_disconnect_does_not_fall_through_to_pair(self):
         async def scenario():

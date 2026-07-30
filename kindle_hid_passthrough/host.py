@@ -281,6 +281,16 @@ class HIDHost(ClassicMixin, BLEMixin):
             if self.classic_devices:
                 device.classic_ssp_enabled = True
                 device.classic_sc_enabled = True
+                # Own the scan-enable register through bumble's own state rather
+                # than writing HCI_Write_Scan_Enable behind its back. bumble
+                # recomputes the whole byte from these two flags whenever
+                # set_connectable/set_discoverable is called, including during
+                # power_on, and it defaults both to True — which made us
+                # discoverable (0x03) and then relied on a side-channel write to
+                # narrow it. Setting them here means power_on already writes the
+                # value we want, and any later recompute produces the same byte.
+                device.connectable = True     # page scan: accept inbound links
+                device.discoverable = False   # inquiry scan: not advertised
 
         self.transport, self.device = await create_bumble_device(
             self.transport_spec, configure=configure)
