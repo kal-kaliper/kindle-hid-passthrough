@@ -10,6 +10,9 @@ log_file := "/var/log/hid_passthrough.log"
 # Target Kindle SSH host (override: `just host=mykindle deploy`, or set KINDLE_HOST)
 host := env_var_or_default("KINDLE_HOST", "kindle")
 
+# Set to 1 to have `just deploy` open BTManager when it finishes.
+launch_waf := env_var_or_default("LAUNCH_WAF", "0")
+
 # Pin the bundled interpreter (override: set KINDLE_PYTHON to a wrapper path).
 # Empty means discover it on the device. The version is deliberately not
 # hardcoded here: which CPython a dev device has under /mnt/us depends on how
@@ -54,10 +57,25 @@ deploy:
     @echo "Clearing WAF cache..."
     -ssh {{host}} "rm -rf /var/local/mesquite/com.lzampier.btmanager /var/local/mesquite/BTManager" 2>/dev/null
     @just host={{host}} register-waf
+    @echo "Restoring root to read-only..."
+    -ssh {{host}} "/usr/sbin/mntroot ro"
     @echo "Starting API server..."
     @just host={{host}} server
-    ssh {{host}} 'lipc-set-prop com.lab126.appmgrd start app://com.lzampier.btmanager'
+    @just host={{host}} launch-waf-if-requested
     @echo "Deployment complete!"
+
+# Deploy no longer opens BTManager on its own: it covers whatever launcher you
+# were on, and a code deploy has no business taking over the screen. Set
+# LAUNCH_WAF=1 to restore the old behaviour.
+#
+# Open BTManager on the Kindle
+launch-waf:
+    ssh {{host}} 'lipc-set-prop com.lab126.appmgrd start app://com.lzampier.btmanager'
+
+[private]
+launch-waf-if-requested:
+    @if [ "{{launch_waf}}" = "1" ]; then just host={{host}} launch-waf; \
+     else echo "BTManager left closed (LAUNCH_WAF=1 to open it, or: just launch-waf)"; fi
 
 # Register BTManager WAF app in appreg.db and install scriptlet (idempotent)
 register-waf:
@@ -76,10 +94,15 @@ register-waf:
 
 # Kill daemon and close WAF app
 kill:
+    # Switching the foreground away from BTManager does not end its mesquite
+    # process, so it has to be killed explicitly. Otherwise deploy goes on to
+    # delete /var/local/mesquite/<app id> from under a live app and relaunch it,
+    # which wedges the WAF UI and reads as a frozen Kindle.
     -ssh {{host}} 'lipc-set-prop com.lab126.appmgrd start app://com.lab126.booklet.home 2>/dev/null; \
         /sbin/initctl stop hid-passthrough 2>/dev/null; \
         pkill -9 -f "main.py --daemon" 2>/dev/null; \
         pkill -9 -f daemon.py 2>/dev/null; \
+        pkill -f "mesquite -l com.lzampier.btmanager" 2>/dev/null; \
         true'
     @echo "All processes stopped."
 
